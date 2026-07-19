@@ -55,6 +55,8 @@ stats = {
     "symbol_stats": {s: 0 for s in SYMBOLS},
     "depth_fail":   {"Binance": 0, "KuCoin": 0, "HTX": 0},  # счётчик отказов стакана
     "insufficient_liquidity": 0,  # сколько раз стакана не хватило на объём
+    "hourly_signals": defaultdict(int),
+    "hourly_profit":  defaultdict(float),
 }
 trade_history: List[dict] = []
 last_signal_time: Dict[str, float] = {}
@@ -281,6 +283,7 @@ async def scan_all(session) -> Tuple[List[dict], List[str]]:
     ex_map = {"Binance": bn, "KuCoin": kc, "HTX": hx}
     signals = []
 
+    hour = datetime.now().hour
     for sym in SYMBOLS:
         for buy_ex, sell_ex in PAIRS:
             bob = ex_map.get(buy_ex, {}).get(sym)
@@ -293,6 +296,7 @@ async def scan_all(session) -> Tuple[List[dict], List[str]]:
                 key = f"{buy_ex}→{sell_ex}"
                 stats["pair_stats"][key] = stats["pair_stats"].get(key, 0) + 1
                 stats["symbol_stats"][sym] = stats["symbol_stats"].get(sym, 0) + 1
+                stats["hourly_signals"][hour] += 1
 
     signals.sort(key=lambda x: x["net_pct"], reverse=True)
     if signals:
@@ -349,6 +353,8 @@ async def execute_trade(opp: dict):
     if not check_rate() or not can_trade():
         return
     profit = opp["profit_usdt"]
+    hour = datetime.now().hour
+    stats["hourly_profit"][hour] += profit
     trade_history.append({
         "id": len(trade_history) + 1,
         "date": datetime.now().strftime("%Y-%m-%d"), "time": opp["time"],
@@ -452,11 +458,15 @@ async def handle_command(session, text, chat_id):
             f"Цена берётся не с first bid/ask, а честно "
             f"считается через walk-the-book по реальной глубине.\n\n"
             f"*Команды:*\n"
-            f"/scan — скан прямо сейчас\n"
+            f"/scan — скан сейчас | /top — все пары без порога\n"
             f"/depthcheck SYMBOL — сырой стакан + проскальзывание\n"
-            f"/stats — статистика (включая отказы API по биржам)\n"
-            f"/pause /go — пауза/возобновление\n"
-            f"/csv — экспорт сделок\n"
+            f"/stats — статистика | /balances — балансы\n"
+            f"/rebalance — что перебалансировать\n"
+            f"/hours — активность по часам | /report — отчёт за день\n"
+            f"/history — последние сделки | /csv — экспорт\n"
+            f"/howtoread — как читать отчёты | /guide — инструкция\n"
+            f"/pause /go /resume — управление торговлей\n"
+            f"/mode — переключить режим (реальный пока заблокирован)\n"
             f"/setlot 20 /setprofit 0.3 /setstop 10"
         )
 
@@ -528,11 +538,192 @@ async def handle_command(session, text, chat_id):
 
     elif cmd == "/pause":
         config["paused"] = True
-        await send_tg(session, "⏸ Пауза активирована.")
+        await send_tg(session,
+            "⏸ *ПАУЗА АКТИВИРОВАНА*\n\n"
+            "Можешь спокойно переводить деньги между биржами,\n"
+            "покупать/продавать вручную, делать ребаланс.\n\n"
+            "Когда закончишь — /go"
+        )
 
     elif cmd == "/go":
         config["paused"] = False
-        await send_tg(session, "▶️ Торговля возобновлена.")
+        await send_tg(session, f"▶️ Торговля возобновлена. Следующий скан через {config['scan_interval']} сек.")
+
+    elif cmd == "/resume":
+        config["trading_active"] = True
+        config["daily_loss"] = 0.0
+        await send_tg(session, "✅ Стоп-лосс снят. Торговля возобновлена.")
+
+    elif cmd == "/balances":
+        total = get_balance_usdt()
+        msg = "💰 *БАЛАНСЫ СИМУЛЯЦИИ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for ex, assets in sim_balances.items():
+            ex_total = sum(assets.values())
+            msg += f"🏦 *{ex}:* ${round(ex_total, 2)}\n"
+            for asset, val in assets.items():
+                icon = "🟢" if val >= 20 else "🔴"
+                msg += f"   {icon} {asset}: ${round(val, 2)}\n"
+            msg += "\n"
+        pnl = round(total - SIM_START, 2)
+        sign = "+" if pnl >= 0 else ""
+        msg += f"💵 *Итого: ${total}*\nСтарт: ${SIM_START} | P&L: {sign}{pnl}"
+        await send_tg(session, msg)
+
+    elif cmd == "/rebalance":
+        target = {
+            "KuCoin":  {"USDT": 125, "BONK": 62.5, "SEI": 31.25, "FET": 15.62, "INJ": 15.63},
+            "HTX":     {"USDT": 125, "BONK": 62.5, "SEI": 31.25, "FET": 15.62, "INJ": 15.63},
+            "Binance": {"USDT": 125},
+        }
+        msg = "⚖️ *РЕБАЛАНСИРОВКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n*(суммы в USD-эквиваленте)*\n\n"
+        actions = []
+        for ex, tgt in target.items():
+            cur = sim_balances.get(ex, {})
+            ex_act = []
+            for asset, tgt_val in tgt.items():
+                diff = tgt_val - cur.get(asset, 0)
+                if diff > 2:
+                    ex_act.append(f"   ➕ Докупить {asset}: +${round(diff, 1)}")
+                elif diff < -2:
+                    ex_act.append(f"   ➖ Продать {asset}: ${round(abs(diff), 1)}")
+            if ex_act:
+                actions.append(f"*{ex}:*\n" + "\n".join(ex_act))
+        if not actions:
+            msg += "✅ Все балансы в норме! Ребалансировка не нужна."
+        else:
+            msg += "\n\n".join(actions)
+            msg += ("\n\n⚠️ *Перед ребалансировкой:*\n1. /pause\n2. Сделай операции на биржах\n3. /go\n\n"
+                    "💡 Перевод USDT через TRC-20 = ~$1")
+        await send_tg(session, msg)
+
+    elif cmd == "/mode":
+        config["simulation_mode"] = not config["simulation_mode"]
+        if config["simulation_mode"]:
+            await send_tg(session, "🔵 Режим: СИМУЛЯЦИЯ")
+        else:
+            # ВНИМАНИЕ: реальное исполнение ордеров в этой версии НЕ реализовано.
+            # Переключение режима меняет только метку в логах/сообщениях,
+            # реальные ордера бот пока не размещает — это следующий этап (Этап 6).
+            config["simulation_mode"] = True
+            await send_tg(session,
+                "❌ *Реальное исполнение ордеров ещё не реализовано в этой версии.*\n\n"
+                "Этот бот сейчас умеет честно СЧИТАТЬ возможности (реальная глубина "
+                "стакана, walk-the-book), но не размещает реальные ордера на биржах.\n\n"
+                "Включать реальный режим преждевременно — сначала нужен Этап 6 "
+                "(исполнение + проверка обеих ног сделки + аварийное закрытие).\n\n"
+                "Режим остаётся: 🔵 СИМУЛЯЦИЯ"
+            )
+
+    elif cmd == "/report":
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_trades = [t for t in trade_history if t.get("date") == today]
+        if not today_trades:
+            await send_tg(session, "📋 Нет сделок за сегодня.")
+            return
+        total = sum(t["profit_usdt"] for t in today_trades)
+        wins = sum(1 for t in today_trades if t["profit_usdt"] > 0)
+        sym_profit, pair_profit = defaultdict(float), defaultdict(float)
+        for t in today_trades:
+            sym_profit[t["symbol"]] += t["profit_usdt"]
+            pair_profit[f"{t['buy_ex']}→{t['sell_ex']}"] += t["profit_usdt"]
+        msg = (
+            f"📋 *ОТЧЁТ — {today}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"✅ Сделок: {len(today_trades)}\n"
+            f"💰 Прибыль (сим.): {round(total, 4)} USDT\n"
+            f"💡 Реалистично (×{config['derating_factor']}): {round(total*config['derating_factor'], 4)} USDT\n"
+            f"📈 Прибыльных: {wins}/{len(today_trades)}\n\n💱 *По монетам:*\n"
+        )
+        for sym, p in sorted(sym_profit.items(), key=lambda x: x[1], reverse=True):
+            msg += f"   {sym}: {'+' if p>=0 else ''}{round(p, 4)} USDT\n"
+        msg += "\n🔀 *По парам:*\n"
+        for pair, p in sorted(pair_profit.items(), key=lambda x: x[1], reverse=True):
+            msg += f"   {pair}: {'+' if p>=0 else ''}{round(p, 4)} USDT\n"
+        await send_tg(session, msg)
+
+    elif cmd == "/hours":
+        msg = "⏰ *СИГНАЛЫ ПО ЧАСАМ (UTC)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        hour_data = [(h, stats["hourly_signals"].get(h, 0), stats["hourly_profit"].get(h, 0.0))
+                     for h in range(24) if stats["hourly_signals"].get(h, 0) > 0]
+        if not hour_data:
+            msg += "Нет данных пока."
+        else:
+            hour_data.sort(key=lambda x: x[1], reverse=True)
+            for h, sigs, profit in hour_data[:10]:
+                bar = "█" * min(10, sigs // 5 + 1)
+                msg += f"*{h:02d}:00* {bar}\n   Сигналов: {sigs} | Прибыль: {round(profit,2)} USDT\n\n"
+            best = max(hour_data, key=lambda x: x[1])
+            msg += f"🏆 Лучший час: *{best[0]:02d}:00 UTC*"
+        await send_tg(session, msg)
+
+    elif cmd == "/history":
+        if not trade_history:
+            await send_tg(session, "📋 Нет сделок.")
+            return
+        msg = "📋 *ПОСЛЕДНИЕ СДЕЛКИ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for t in trade_history[-10:][::-1]:
+            sign = "+" if t["profit_usdt"] > 0 else ""
+            msg += (f"#{t['id']} *{t['symbol']}* {t['buy_ex']}→{t['sell_ex']}\n"
+                    f"   {sign}{t['net_pct']}% | {sign}{t['profit_usdt']} USDT | {t['time']}\n\n")
+        await send_tg(session, msg)
+
+    elif cmd == "/top":
+        await send_tg(session, "📊 Сканирую без порога (реальная глубина)...")
+        bn, kc, hx, active = await fetch_all_orderbooks(session)
+        ex_map = {"Binance": bn, "KuCoin": kc, "HTX": hx}
+        saved = config["min_profit_pct"]
+        config["min_profit_pct"] = -999
+        all_opps = []
+        for sym in SYMBOLS:
+            for buy_ex, sell_ex in PAIRS:
+                bob = ex_map.get(buy_ex, {}).get(sym)
+                sob = ex_map.get(sell_ex, {}).get(sym)
+                if bob and sob:
+                    opp = calc_arb_real(sym, buy_ex, bob, sell_ex, sob, config["trade_usdt"])
+                    if opp:
+                        all_opps.append(opp)
+        config["min_profit_pct"] = saved
+        all_opps.sort(key=lambda x: x["net_pct"], reverse=True)
+        msg = f"📊 *ВСЕ ПАРЫ (реальная глубина) — {datetime.now().strftime('%H:%M:%S')}*\n"
+        msg += f"Бирж: {', '.join(active)}\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        if not all_opps:
+            msg += "Нет данных (либо стакана не хватает на объём — см. /depthcheck)"
+        for i, o in enumerate(all_opps, 1):
+            icon = "🟢" if o["net_pct"] >= saved else "🔴"
+            msg += f"{icon} *{i}. {o['symbol']}* {o['buy_ex']}→{o['sell_ex']}\n   Чистая: `{o['net_pct']}%`\n\n"
+        msg += f"_Порог: {saved}%_"
+        await send_tg(session, msg)
+
+    elif cmd == "/howtoread":
+        await send_tg(session,
+            "📖 *КАК ЧИТАТЬ ОТЧЁТЫ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "*slippage_impact_pct / проскальзывание* — насколько наивный расчёт "
+            "по первой цене стакана завысил бы спред. Чем выше — тем важнее, что "
+            "мы теперь считаем честно.\n\n"
+            "*Реалистичная оценка (×0.25)* — по вашему опыту, реальная торговля "
+            "даёт примерно четверть от симулированной прибыли из-за конкуренции "
+            "и остаточного проскальзывания сверх того, что уже учтено.\n\n"
+            "*Отказы API стакана* — если растут, конкретная биржа нестабильна, "
+            "проверьте вручную её endpoint.\n\n"
+            "*Недостаточно ликвидности* — сколько раз стакана не хватило на "
+            "заявленный объём; такие сигналы не считаются валидными и не торгуются."
+        )
+
+    elif cmd == "/guide":
+        await send_tg(session,
+            "📖 *ИНСТРУКЦИЯ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Этот бот на Этапе 3.1: честный расчёт цены через реальную "
+            "глубину стакана (walk-the-book), а не наивный top-of-book.\n\n"
+            "Реальное исполнение ордеров (Этап 6) ещё НЕ реализовано — "
+            "переключение /mode в реальный режим заблокировано намеренно, "
+            "пока не построены: проверка исполнения обеих ног сделки и "
+            "аварийное закрытие позиции при частичном исполнении.\n\n"
+            "*Порядок работы:*\n"
+            "1. /depthcheck SYMBOL — проверить качество данных по монете\n"
+            "2. /scan или дождаться авто-скана\n"
+            "3. /stats — следить за отказами API и insufficient_liquidity\n"
+            "4. /report /hours — вечерний разбор\n"
+            "5. /rebalance при необходимости"
+        )
 
     elif cmd == "/csv":
         output = io.StringIO()
@@ -571,8 +762,13 @@ async def handle_command(session, text, chat_id):
                 pass
 
     else:
-        await send_tg(session, "/start /scan /depthcheck BONK /stats /pause /go /csv "
-                                "/setlot /setprofit /setstop")
+        await send_tg(session,
+            "/start /scan /top /depthcheck BONK\n"
+            "/stats /balances /rebalance\n"
+            "/hours /report /history /csv\n"
+            "/howtoread /guide /mode\n"
+            "/pause /go /resume\n"
+            "/setlot /setprofit /setstop")
 
 
 async def polling_loop(session):
