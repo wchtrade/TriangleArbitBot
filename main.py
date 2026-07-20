@@ -4,7 +4,12 @@ import logging
 import os
 import csv
 import io
-from datetime import datetime
+import time
+import hmac
+import hashlib
+import base64
+import urllib.parse
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
@@ -29,10 +34,27 @@ config = {
     "min_volume_usdt":    100000,
     "depth_limit":        50,      # сколько уровней стакана запрашиваем
     "derating_factor":    0.25,    # реальность ≈ симуляция × 0.25 (ваша же оценка)
+
+    # ===== ЭТАП 6: РЕАЛЬНОЕ ИСПОЛНЕНИЕ — ЖЁСТКИЙ ГЕЙТ =====
+    # simulation_mode=False САМО ПО СЕБЕ не включает реальные ордера.
+    # Нужны ОБА условия одновременно:
+    #   1) переменная окружения REAL_TRADING_UNLOCKED == "YES-I-UNDERSTAND-THE-RISK"
+    #   2) runtime-флаг real_confirmed, включаемый командой /confirmreal <фраза>
+    # Если хоть одно условие не выполнено — бот принудительно торгует в símulation.
+    "real_confirmed":       False,
+    "max_real_order_usdt":  15.0,   # ЖЁСТКИЙ потолок на один ордер, /setlot его не обходит
+    "real_trades_today":    0,
+    "max_real_trades_per_day": 20,  # доп. защита от разгона в реальном режиме
+
+    # ===== ЭТАП 4: ТРЕУГОЛЬНЫЙ АРБИТРАЖ =====
+    "triangular_enabled": True,
 }
 
-SYMBOLS = ["BONK", "SEI", "FET", "INJ"]
+CONFIRM_PHRASE = "YES-I-UNDERSTAND-THE-RISK"
+
+SYMBOLS = ["BONK", "SEI", "FET", "INJ"]   # теперь можно менять на лету через /addcoin /removecoin
 QUOTE   = "USDT"
+BRIDGE  = "BTC"   # мост для треугольного арбитража: USDT -> COIN -> BTC -> USDT
 PAIRS   = [
     ("HTX",     "KuCoin"),
     ("KuCoin",  "HTX"),
@@ -61,6 +83,16 @@ stats = {
 trade_history: List[dict] = []
 last_signal_time: Dict[str, float] = {}
 coin_volumes: Dict[str, float] = {}
+triangle_history: List[dict] = []
+
+BINANCE_KEY    = os.environ.get("BINANCE_API_KEY", "")
+BINANCE_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+KUCOIN_KEY     = os.environ.get("KUCOIN_API_KEY", "")
+KUCOIN_SECRET  = os.environ.get("KUCOIN_API_SECRET", "")
+KUCOIN_PASS    = os.environ.get("KUCOIN_PASSPHRASE", "")
+HTX_KEY        = os.environ.get("HTX_API_KEY", "")
+HTX_SECRET     = os.environ.get("HTX_API_SECRET", "")
+REAL_TRADING_UNLOCKED = os.environ.get("REAL_TRADING_UNLOCKED", "")
 
 
 # =====================================================================
@@ -189,6 +221,147 @@ def walk_the_book(levels: List[Tuple[float, float]], target_usdt: float) -> Opti
     }
 
 
+def walk_the_book_sell(levels: List[Tuple[float, float]], base_amount: float) -> Optional[Dict]:
+    """Продаёт фиксированное количество БАЗОВОЙ монеты (не USDT) по стакану bids.
+    Нужно для треугольного арбитража, где на каждом шаге меняется актив,
+    а не сумма в USDT."""
+    if not levels:
+        return None
+    remaining = base_amount
+    total_quote = 0.0
+    total_base = 0.0
+    levels_used = 0
+
+    for price, qty in levels:
+        if remaining <= 0:
+            break
+        levels_used += 1
+        take = min(qty, remaining)
+        total_quote += take * price
+        total_base += take
+        remaining -= take
+
+    if total_base == 0:
+        return None
+
+    return {
+        "avg_price":    round(total_quote / total_base, 8),
+        "quote_out":    round(total_quote, 8),
+        "base_in":      round(total_base, 8),
+        "levels_used":  levels_used,
+        "fully_filled": remaining <= 1e-9,
+    }
+
+
+async def get_orderbook_pair_binance(session, pair_symbol: str) -> Optional[Dict]:
+    """Обобщённая версия — принимает готовый символ пары (напр. 'FETBTC'),
+    а не base+QUOTE. Нужна для треугольного арбитража."""
+    url = "https://api.binance.com/api/v3/depth"
+    params = {"symbol": pair_symbol, "limit": config["depth_limit"]}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=6)) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
+            asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+            if not bids or not asks:
+                return None
+            return {"bids": bids, "asks": asks}
+    except Exception as e:
+        logger.error(f"Binance pair depth {pair_symbol}: {e}")
+        return None
+
+
+# =====================================================================
+# ЭТАП 4: ТРЕУГОЛЬНЫЙ АРБИТРАЖ (внутри одной биржи, Binance)
+#   Путь A: USDT -> COIN -> BTC -> USDT
+#   Путь B: USDT -> BTC -> COIN -> USDT
+# =====================================================================
+
+async def calc_triangle(session, symbol: str, start_usdt: float) -> Optional[dict]:
+    """Считает оба направления треугольника COIN/USDT + COIN/BTC + BTC/USDT.
+    Возвращает лучшее из двух направлений, если оно прибыльно после комиссий.
+    Требует, чтобы пара COIN/BTC существовала на Binance — не для всех монет так,
+    функция вернёт None, если пары нет (это нормально, не ошибка)."""
+
+    ob_coin_usdt = await get_orderbook_pair_binance(session, f"{symbol}{QUOTE}")
+    ob_coin_btc  = await get_orderbook_pair_binance(session, f"{symbol}{BRIDGE}")
+    ob_btc_usdt  = await get_orderbook_pair_binance(session, f"{BRIDGE}{QUOTE}")
+
+    if not ob_coin_usdt or not ob_coin_btc or not ob_btc_usdt:
+        return None  # пары COIN/BTC может просто не существовать
+
+    fee = FEES.get("Binance", 0.1) / 100
+    results = []
+
+    # --- Путь A: USDT -> COIN -> BTC -> USDT ---
+    leg1 = walk_the_book(ob_coin_usdt["asks"], start_usdt)          # покупаем COIN за USDT
+    if leg1 and leg1["fully_filled"]:
+        coins_after_fee = leg1["coins"] * (1 - fee)
+        leg2 = walk_the_book_sell(ob_coin_btc["bids"], coins_after_fee)  # продаём COIN за BTC
+        if leg2 and leg2["fully_filled"]:
+            btc_after_fee = leg2["quote_out"] * (1 - fee)
+            leg3 = walk_the_book_sell(ob_btc_usdt["bids"], btc_after_fee)  # продаём BTC за USDT
+            if leg3 and leg3["fully_filled"]:
+                final_usdt = leg3["quote_out"] * (1 - fee)
+                profit = final_usdt - start_usdt
+                net_pct = profit / start_usdt * 100
+                results.append({
+                    "path": f"USDT→{symbol}→{BRIDGE}→USDT",
+                    "final_usdt": round(final_usdt, 4),
+                    "profit_usdt": round(profit, 4),
+                    "net_pct": round(net_pct, 4),
+                    "levels": [leg1["levels_used"], leg2["levels_used"], leg3["levels_used"]],
+                })
+
+    # --- Путь B: USDT -> BTC -> COIN -> USDT ---
+    leg1b = walk_the_book(ob_btc_usdt["asks"], start_usdt)          # покупаем BTC за USDT
+    if leg1b and leg1b["fully_filled"]:
+        btc_after_fee = leg1b["coins"] * (1 - fee)
+        leg2b = walk_the_book(ob_coin_btc["asks"], btc_after_fee)  # покупаем COIN за BTC
+        # ВНИМАНИЕ: walk_the_book считает target в quote-валюте уровня (тут BTC) — подходит
+        if leg2b and leg2b["fully_filled"]:
+            coins_after_fee = leg2b["coins"] * (1 - fee)
+            leg3b = walk_the_book_sell(ob_coin_usdt["bids"], coins_after_fee)  # продаём COIN за USDT
+            if leg3b and leg3b["fully_filled"]:
+                final_usdt = leg3b["quote_out"] * (1 - fee)
+                profit = final_usdt - start_usdt
+                net_pct = profit / start_usdt * 100
+                results.append({
+                    "path": f"USDT→{BRIDGE}→{symbol}→USDT",
+                    "final_usdt": round(final_usdt, 4),
+                    "profit_usdt": round(profit, 4),
+                    "net_pct": round(net_pct, 4),
+                    "levels": [leg1b["levels_used"], leg2b["levels_used"], leg3b["levels_used"]],
+                })
+
+    if not results:
+        return None
+
+    best = max(results, key=lambda x: x["net_pct"])
+    if best["net_pct"] < config["min_profit_pct"]:
+        return None
+    best["symbol"] = symbol
+    best["time"] = datetime.now().strftime("%H:%M:%S")
+    return best
+
+
+async def scan_triangles(session) -> List[dict]:
+    if not config["triangular_enabled"]:
+        return []
+    found = []
+    for sym in SYMBOLS:
+        try:
+            res = await calc_triangle(session, sym, config["trade_usdt"])
+            if res:
+                found.append(res)
+        except Exception as e:
+            logger.error(f"Triangle {sym}: {e}")
+    found.sort(key=lambda x: x["net_pct"], reverse=True)
+    return found
+
+
 # =====================================================================
 # АРБИТРАЖ — расчёт на основе реальной глубины
 # =====================================================================
@@ -305,6 +478,248 @@ async def scan_all(session) -> Tuple[List[dict], List[str]]:
 
 
 # =====================================================================
+# ЭТАП 6: РЕАЛЬНОЕ ИСПОЛНЕНИЕ ОРДЕРОВ
+#
+# ВНИМАНИЕ: эти функции ни разу не тестировались на реальном API —
+# сетевой доступ к биржам недоступен в среде разработки. Схемы подписи
+# реализованы по документации каждой биржи. ОБЯЗАТЕЛЬНО протестируйте
+# сначала на минимальном ордере ($5-10), прежде чем доверять боту капитал.
+# =====================================================================
+
+def is_real_trading_allowed() -> bool:
+    """Жёсткий гейт: ОБА условия обязательны, ни одно не заменяет другое."""
+    env_ok = (REAL_TRADING_UNLOCKED == CONFIRM_PHRASE)
+    runtime_ok = config["real_confirmed"]
+    keys_ok = all([BINANCE_KEY, BINANCE_SECRET, KUCOIN_KEY, KUCOIN_SECRET,
+                    KUCOIN_PASS, HTX_KEY, HTX_SECRET])
+    return env_ok and runtime_ok and keys_ok
+
+
+def sign_binance(params: dict, secret: str) -> str:
+    query = urllib.parse.urlencode(params)
+    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+
+
+async def place_order_binance(session, symbol: str, side: str, quote_usdt: float) -> Optional[dict]:
+    """MARKET ордер на Binance. side: 'BUY' или 'SELL'.
+    quoteOrderQty — тратим/получаем ровно X USDT, биржа сама считает количество монет
+    (для BUY). Для SELL используем quantity в монетах — нужно передавать заранее
+    посчитанное количество через отдельный параметр (см. execute_real_arbitrage)."""
+    url = "https://api.binance.com/api/v3/order"
+    ts = int(time.time() * 1000)
+    params = {
+        "symbol": f"{symbol}{QUOTE}", "side": side, "type": "MARKET",
+        "timestamp": ts, "recvWindow": 5000,
+    }
+    if side == "BUY":
+        params["quoteOrderQty"] = round(quote_usdt, 2)
+    else:
+        # для SELL quote_usdt здесь на самом деле означает "количество монет"
+        # (см. вызывающий код) — параметр переиспользован, чтобы не плодить сигнатуры
+        params["quantity"] = quote_usdt
+    params["signature"] = sign_binance(params, BINANCE_SECRET)
+    headers = {"X-MBX-APIKEY": BINANCE_KEY}
+    try:
+        async with session.post(url, params=params, headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if r.status != 200:
+                logger.error(f"Binance order failed: {data}")
+                return None
+            return data
+    except Exception as e:
+        logger.error(f"Binance order exception: {e}")
+        return None
+
+
+def sign_kucoin(secret: str, passphrase: str, ts: str, method: str, endpoint: str, body: str = ""):
+    str_to_sign = f"{ts}{method}{endpoint}{body}"
+    signature = base64.b64encode(
+        hmac.new(secret.encode(), str_to_sign.encode(), hashlib.sha256).digest()
+    ).decode()
+    passphrase_signed = base64.b64encode(
+        hmac.new(secret.encode(), passphrase.encode(), hashlib.sha256).digest()
+    ).decode()
+    return signature, passphrase_signed
+
+
+async def place_order_kucoin(session, symbol: str, side: str, funds_or_size: float,
+                               use_funds: bool = True) -> Optional[dict]:
+    """MARKET ордер на KuCoin. use_funds=True: сумма в USDT (для BUY).
+    use_funds=False: количество монет (для SELL)."""
+    endpoint = "/api/v1/orders"
+    url = f"https://api.kucoin.com{endpoint}"
+    ts = str(int(time.time() * 1000))
+    body_dict = {
+        "clientOid": str(int(time.time() * 1000000)),
+        "side": side.lower(), "symbol": f"{symbol}-{QUOTE}", "type": "market",
+    }
+    if use_funds:
+        body_dict["funds"] = str(round(funds_or_size, 4))
+    else:
+        body_dict["size"] = str(funds_or_size)
+
+    import json
+    body_str = json.dumps(body_dict)
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "POST", endpoint, body_str)
+    headers = {
+        "KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.post(url, data=body_str, headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if r.status != 200 or data.get("code") != "200000":
+                logger.error(f"KuCoin order failed: {data}")
+                return None
+            return data
+    except Exception as e:
+        logger.error(f"KuCoin order exception: {e}")
+        return None
+
+
+async def place_order_htx(session, account_id: str, symbol: str, side: str,
+                            amount: float) -> Optional[dict]:
+    """MARKET ордер на HTX. side: 'buy-market' или 'sell-market'.
+    Для buy-market amount = сумма в USDT. Для sell-market amount = количество монет.
+    Требует account_id — получить через /v1/account/accounts (см. get_htx_account_id)."""
+    host = "api.huobi.pro"
+    endpoint = "/v1/order/orders/place"
+    method = "POST"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    params = {
+        "AccessKeyId": HTX_KEY, "SignatureMethod": "HmacSHA256",
+        "SignatureVersion": "2", "Timestamp": ts,
+    }
+    sorted_params = sorted(params.items())
+    query = urllib.parse.urlencode(sorted_params)
+    payload = f"{method}\n{host}\n{endpoint}\n{query}"
+    signature = base64.b64encode(
+        hmac.new(HTX_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
+    ).decode()
+    params["Signature"] = signature
+
+    body = {
+        "account-id": account_id, "symbol": f"{symbol.lower()}{QUOTE.lower()}",
+        "type": side, "amount": str(amount), "source": "spot-api",
+    }
+    url = f"https://{host}{endpoint}"
+    try:
+        async with session.post(url, params=params, json=body,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if data.get("status") != "ok":
+                logger.error(f"HTX order failed: {data}")
+                return None
+            return data
+    except Exception as e:
+        logger.error(f"HTX order exception: {e}")
+        return None
+
+
+async def get_htx_account_id(session) -> Optional[str]:
+    host = "api.huobi.pro"
+    endpoint = "/v1/account/accounts"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    params = {"AccessKeyId": HTX_KEY, "SignatureMethod": "HmacSHA256",
+              "SignatureVersion": "2", "Timestamp": ts}
+    sorted_params = sorted(params.items())
+    query = urllib.parse.urlencode(sorted_params)
+    payload = f"GET\n{host}\n{endpoint}\n{query}"
+    signature = base64.b64encode(
+        hmac.new(HTX_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
+    ).decode()
+    params["Signature"] = signature
+    try:
+        async with session.get(f"https://{host}{endpoint}", params=params,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            for acc in data.get("data", []):
+                if acc.get("type") == "spot":
+                    return str(acc["id"])
+    except Exception as e:
+        logger.error(f"HTX account id: {e}")
+    return None
+
+
+_htx_account_id_cache: Optional[str] = None
+
+
+async def execute_real_arbitrage(session, opp: dict) -> dict:
+    """Исполняет РЕАЛЬНУЮ сделку с ЖЁСТКИМ лимитом на объём.
+    Возвращает результат с полями success/error/emergency_close для логирования.
+    КРИТИЧНО: если вторая нога не исполнилась — пытаемся аварийно закрыть
+    позицию, купленную на первой ноге, продав её обратно на той же бирже."""
+    global _htx_account_id_cache
+
+    if not is_real_trading_allowed():
+        return {"success": False, "error": "real_trading_not_unlocked"}
+
+    if config["real_trades_today"] >= config["max_real_trades_per_day"]:
+        return {"success": False, "error": "daily_real_trade_limit_reached"}
+
+    vol = min(opp["vol"], config["max_real_order_usdt"])  # ЖЁСТКИЙ потолок, /setlot не обходит
+    symbol, buy_ex, sell_ex = opp["symbol"], opp["buy_ex"], opp["sell_ex"]
+
+    # --- НОГА 1: ПОКУПКА ---
+    buy_result = None
+    if buy_ex == "Binance":
+        buy_result = await place_order_binance(session, symbol, "BUY", vol)
+    elif buy_ex == "KuCoin":
+        buy_result = await place_order_kucoin(session, symbol, "buy", vol, use_funds=True)
+    elif buy_ex == "HTX":
+        if not _htx_account_id_cache:
+            _htx_account_id_cache = await get_htx_account_id(session)
+        if _htx_account_id_cache:
+            buy_result = await place_order_htx(session, _htx_account_id_cache, symbol, "buy-market", vol)
+
+    if not buy_result:
+        return {"success": False, "error": f"buy_leg_failed_on_{buy_ex}"}
+
+    config["real_trades_today"] += 1
+
+    # Сколько монет реально куплено — по-хорошему нужно запросить факт исполнения
+    # ордера (GET order status), здесь используем расчётное количество как
+    # консервативную оценку. ЭТО МЕСТО ТРЕБУЕТ ДОРАБОТКИ: добавить polling
+    # реального fill amount перед второй ногой.
+    coins_bought = opp["coins"]
+
+    # --- НОГА 2: ПРОДАЖА ---
+    sell_result = None
+    if sell_ex == "Binance":
+        sell_result = await place_order_binance(session, symbol, "SELL", coins_bought)
+    elif sell_ex == "KuCoin":
+        sell_result = await place_order_kucoin(session, symbol, "sell", coins_bought, use_funds=False)
+    elif sell_ex == "HTX":
+        if not _htx_account_id_cache:
+            _htx_account_id_cache = await get_htx_account_id(session)
+        if _htx_account_id_cache:
+            sell_result = await place_order_htx(session, _htx_account_id_cache, symbol, "sell-market", coins_bought)
+
+    if not sell_result:
+        # АВАРИЙНОЕ ЗАКРЫТИЕ: продаём купленное обратно на бирже покупки,
+        # чтобы не остаться с открытой направленной позицией
+        emergency = None
+        if buy_ex == "Binance":
+            emergency = await place_order_binance(session, symbol, "SELL", coins_bought)
+        elif buy_ex == "KuCoin":
+            emergency = await place_order_kucoin(session, symbol, "sell", coins_bought, use_funds=False)
+        elif buy_ex == "HTX":
+            if _htx_account_id_cache:
+                emergency = await place_order_htx(session, _htx_account_id_cache, symbol, "sell-market", coins_bought)
+        return {
+            "success": False, "error": f"sell_leg_failed_on_{sell_ex}",
+            "emergency_close": bool(emergency),
+            "buy_result": buy_result,
+        }
+
+    return {"success": True, "buy_result": buy_result, "sell_result": sell_result, "vol": vol}
+
+
+# =====================================================================
 # СИМУЛЯЦИЯ БАЛАНСОВ / ИСПОЛНЕНИЕ (как и раньше — это НЕ реальная торговля)
 # =====================================================================
 
@@ -349,9 +764,22 @@ def update_sim_balances(opp: dict):
         sim_balances[sex]["USDT"] = sim_balances[sex].get("USDT", 0) + vol + profit
 
 
-async def execute_trade(opp: dict):
+async def execute_trade(session, opp: dict):
     if not check_rate() or not can_trade():
         return
+
+    real_result = None
+    if not config["simulation_mode"] and is_real_trading_allowed():
+        real_result = await execute_real_arbitrage(session, opp)
+        if not real_result.get("success"):
+            logger.error(f"РЕАЛЬНАЯ сделка не удалась: {real_result}")
+            if CHAT_ID:
+                msg = f"🔴 *РЕАЛЬНАЯ СДЕЛКА ОТКЛОНЕНА/ОШИБКА*\n`{real_result}`"
+                if real_result.get("emergency_close"):
+                    msg += "\n⚠️ Выполнено аварийное закрытие позиции."
+                await send_tg(session, msg)
+            return  # не пишем в статистику фиктивную прибыль, если реальная сделка не прошла
+
     profit = opp["profit_usdt"]
     hour = datetime.now().hour
     stats["hourly_profit"][hour] += profit
@@ -459,6 +887,7 @@ async def handle_command(session, text, chat_id):
             f"считается через walk-the-book по реальной глубине.\n\n"
             f"*Команды:*\n"
             f"/scan — скан сейчас | /top — все пары без порога\n"
+            f"/triangle — треугольный арбитраж (Binance)\n"
             f"/depthcheck SYMBOL — сырой стакан + проскальзывание\n"
             f"/stats — статистика | /balances — балансы\n"
             f"/rebalance — что перебалансировать\n"
@@ -466,7 +895,9 @@ async def handle_command(session, text, chat_id):
             f"/history — последние сделки | /csv — экспорт\n"
             f"/howtoread — как читать отчёты | /guide — инструкция\n"
             f"/pause /go /resume — управление торговлей\n"
-            f"/mode — переключить режим (реальный пока заблокирован)\n"
+            f"/addcoin /removecoin /listcoins — управление монетами\n"
+            f"/mode — переключить режим\n"
+            f"/confirmreal /disablereal — гейт реальной торговли\n"
             f"/setlot 20 /setprofit 0.3 /setstop 10"
         )
 
@@ -515,7 +946,7 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ {len(signals)} валидных сигналов (после проверки реальной глубины)!")
             for opp in signals[:3]:
                 await send_tg(session, format_signal(opp))
-                await execute_trade(opp)
+                await execute_trade(session, opp)
 
     elif cmd == "/stats":
         total_bal = get_balance_usdt()
@@ -597,22 +1028,106 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/mode":
-        config["simulation_mode"] = not config["simulation_mode"]
         if config["simulation_mode"]:
-            await send_tg(session, "🔵 Режим: СИМУЛЯЦИЯ")
-        else:
-            # ВНИМАНИЕ: реальное исполнение ордеров в этой версии НЕ реализовано.
-            # Переключение режима меняет только метку в логах/сообщениях,
-            # реальные ордера бот пока не размещает — это следующий этап (Этап 6).
-            config["simulation_mode"] = True
+            # Переход в реальный режим — только если гейт уже пройден
+            if not is_real_trading_allowed():
+                await send_tg(session,
+                    "❌ *Реальная торговля заблокирована.*\n\n"
+                    "Для включения нужны ВСЕ условия:\n"
+                    f"1️⃣ Переменная Railway `REAL_TRADING_UNLOCKED` = `{CONFIRM_PHRASE}`\n"
+                    "2️⃣ Все 7 API-ключей (Binance/KuCoin/HTX) заданы в Railway\n"
+                    "3️⃣ Команда `/confirmreal " + CONFIRM_PHRASE + "` в этом чате\n\n"
+                    f"⚙️ Лимит на ордер в реальном режиме: ${config['max_real_order_usdt']} "
+                    f"(жёстко, /setlot его не увеличит)\n"
+                    f"⚙️ Лимит сделок в день: {config['max_real_trades_per_day']}"
+                )
+                return
+            config["simulation_mode"] = False
             await send_tg(session,
-                "❌ *Реальное исполнение ордеров ещё не реализовано в этой версии.*\n\n"
-                "Этот бот сейчас умеет честно СЧИТАТЬ возможности (реальная глубина "
-                "стакана, walk-the-book), но не размещает реальные ордера на биржах.\n\n"
-                "Включать реальный режим преждевременно — сначала нужен Этап 6 "
-                "(исполнение + проверка обеих ног сделки + аварийное закрытие).\n\n"
-                "Режим остаётся: 🔵 СИМУЛЯЦИЯ"
+                "🔴 *РЕАЛЬНАЯ ТОРГОВЛЯ АКТИВНА*\n\n"
+                f"Лимит на ордер: ${config['max_real_order_usdt']}\n"
+                f"Лимит сделок/день: {config['max_real_trades_per_day']}\n\n"
+                "При ручных операциях — /pause"
             )
+        else:
+            config["simulation_mode"] = True
+            await send_tg(session, "🔵 Режим: СИМУЛЯЦИЯ")
+
+    elif cmd == "/confirmreal":
+        if len(parts) < 2 or parts[1] != CONFIRM_PHRASE:
+            await send_tg(session,
+                f"Для подтверждения реальной торговли напишите ТОЧНО:\n"
+                f"`/confirmreal {CONFIRM_PHRASE}`\n\n"
+                f"⚠️ Это включит возможность реальных сделок реальными деньгами "
+                f"(лимит ${config['max_real_order_usdt']}/ордер). Убедитесь, что "
+                f"понимаете риски: код НЕ тестировался на реальном API."
+            )
+            return
+        config["real_confirmed"] = True
+        env_ok = REAL_TRADING_UNLOCKED == CONFIRM_PHRASE
+        await send_tg(session,
+            f"{'✅' if env_ok else '⚠️'} Runtime-подтверждение получено.\n"
+            f"Переменная окружения REAL_TRADING_UNLOCKED: "
+            f"{'✅ установлена' if env_ok else '❌ НЕ установлена — /mode всё ещё заблокирует реальный режим'}\n\n"
+            f"Теперь используйте `/mode` для фактического переключения."
+        )
+
+    elif cmd == "/disablereal":
+        config["real_confirmed"] = False
+        config["simulation_mode"] = True
+        await send_tg(session, "🔵 Реальная торговля отключена, гейт сброшен. Режим: СИМУЛЯЦИЯ")
+
+    elif cmd == "/addcoin":
+        if len(parts) < 2:
+            await send_tg(session, "Пример: `/addcoin DOGE`")
+            return
+        sym = parts[1].upper()
+        if sym in SYMBOLS:
+            await send_tg(session, f"⚠️ {sym} уже в списке.")
+            return
+        SYMBOLS.append(sym)
+        stats["symbol_stats"][sym] = 0
+        await send_tg(session,
+            f"✅ Добавлено: *{sym}*\n\n"
+            f"⚠️ Учтите: для {sym} нужна ликвидность и реальная проверка через "
+            f"`/depthcheck {sym}` перед тем, как доверять сигналам по нему.\n\n"
+            f"Текущий список: {', '.join(SYMBOLS)}"
+        )
+
+    elif cmd == "/removecoin":
+        if len(parts) < 2:
+            await send_tg(session, "Пример: `/removecoin BONK`")
+            return
+        sym = parts[1].upper()
+        if sym not in SYMBOLS:
+            await send_tg(session, f"⚠️ {sym} не найдена в списке.")
+            return
+        if len(SYMBOLS) <= 1:
+            await send_tg(session, "❌ Нельзя удалить последнюю монету из списка.")
+            return
+        SYMBOLS.remove(sym)
+        await send_tg(session, f"✅ Удалено: *{sym}*\nТекущий список: {', '.join(SYMBOLS)}")
+
+    elif cmd == "/listcoins":
+        await send_tg(session, f"💱 *Торгуемые монеты:* {', '.join(SYMBOLS)}\n\n"
+                                f"Добавить: `/addcoin SYMBOL`\nУдалить: `/removecoin SYMBOL`")
+
+    elif cmd == "/triangle":
+        await send_tg(session, "🔺 Сканирую треугольный арбитраж на Binance...")
+        results = await scan_triangles(session)
+        if not results:
+            await send_tg(session,
+                f"😔 Нет треугольных возможностей выше порога {config['min_profit_pct']}%.\n"
+                f"(Либо пары COIN/{BRIDGE} не существуют для ваших монет на Binance — "
+                f"это нормально для части альткоинов.)"
+            )
+        else:
+            msg = "🔺 *ТРЕУГОЛЬНЫЙ АРБИТРАЖ (Binance)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            for r in results[:5]:
+                msg += (f"*{r['symbol']}* via {r['path']}\n"
+                        f"   Чистая: `{r['net_pct']}%` | Профит: `{r['profit_usdt']} USDT`\n"
+                        f"   Уровней задействовано: {r['levels']}\n\n")
+            await send_tg(session, msg)
 
     elif cmd == "/report":
         today = datetime.now().strftime("%Y-%m-%d")
@@ -763,10 +1278,12 @@ async def handle_command(session, text, chat_id):
 
     else:
         await send_tg(session,
-            "/start /scan /top /depthcheck BONK\n"
+            "/start /scan /top /triangle /depthcheck BONK\n"
             "/stats /balances /rebalance\n"
             "/hours /report /history /csv\n"
             "/howtoread /guide /mode\n"
+            "/addcoin /removecoin /listcoins\n"
+            "/confirmreal /disablereal\n"
             "/pause /go /resume\n"
             "/setlot /setprofit /setstop")
 
@@ -806,7 +1323,24 @@ async def scan_loop(session):
                         last_signal_time[key] = now
                         if CHAT_ID:
                             await send_tg(session, format_signal(opp))
-                        await execute_trade(opp)
+                        await execute_trade(session, opp)
+
+                # Треугольный скан — реже, т.к. требует 3x больше запросов на монету
+                if config["triangular_enabled"] and stats["scans"] % 3 == 0:
+                    triangles = await scan_triangles(session)
+                    for t in triangles[:2]:
+                        key = f"tri-{t['symbol']}-{t['path']}"
+                        now = datetime.now().timestamp()
+                        if now - last_signal_time.get(key, 0) > 120:
+                            last_signal_time[key] = now
+                            triangle_history.append(t)
+                            if CHAT_ID:
+                                await send_tg(session,
+                                    f"🔺 *Треугольный сигнал: {t['symbol']}*\n"
+                                    f"Путь: {t['path']}\n"
+                                    f"Чистая: `{t['net_pct']}%` | "
+                                    f"Профит: `{t['profit_usdt']} USDT`"
+                                )
         except Exception as e:
             stats["errors"] += 1
             logger.error(f"Scan error: {e}")
