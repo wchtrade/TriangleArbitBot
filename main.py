@@ -63,11 +63,34 @@ PAIRS   = [
 FEES = {"Binance": 0.10, "KuCoin": 0.10, "HTX": 0.20}
 SIM_START = 500.0
 
-sim_balances = {
-    "KuCoin":  {"USDT": 125.0, "BONK": 62.5, "SEI": 31.25, "FET": 15.62, "INJ": 15.63},
-    "HTX":     {"USDT": 125.0, "BONK": 62.5, "SEI": 31.25, "FET": 15.62, "INJ": 15.63},
-    "Binance": {"USDT": 125.0},
-}
+# Раскладка $500 согласно ролям бирж в PAIRS:
+#   Binance — только покупает (Binance→HTX), монеты там не нужны вообще
+#   KuCoin  — покупает (KuCoin→HTX) И продаёт (HTX→KuCoin) — нужны оба актива
+#   HTX     — покупает (HTX→KuCoin) И продаёт в ДВУХ парах — самая нагруженная по монетам
+ALLOCATION_USDT = {"Binance": 50.0, "KuCoin": 115.0, "HTX": 115.0}
+ALLOCATION_COINS = {"KuCoin": 110.0, "HTX": 110.0}  # делится поровну между текущими SYMBOLS
+
+
+def build_default_sim_balances() -> Dict[str, Dict[str, float]]:
+    """КРИТИЧНО: каждая монета должна получить баланс минимум в несколько
+    лотов (config['trade_usdt']), иначе has_sufficient_sim_balance() будет
+    молча отклонять все сделки по этой монете, а сигналы при этом всё равно
+    будут приходить (расчёт сигнала не знает о балансе кошелька) — именно
+    это и произошло с FET/INJ при неровной ручной аллокации."""
+    n = max(1, len(SYMBOLS))
+    per_coin = round(ALLOCATION_COINS["KuCoin"] / n, 2)
+    balances = {
+        "Binance": {"USDT": ALLOCATION_USDT["Binance"]},
+        "KuCoin":  {"USDT": ALLOCATION_USDT["KuCoin"]},
+        "HTX":     {"USDT": ALLOCATION_USDT["HTX"]},
+    }
+    for sym in SYMBOLS:
+        balances["KuCoin"][sym] = per_coin
+        balances["HTX"][sym] = per_coin
+    return balances
+
+
+sim_balances = build_default_sim_balances()
 
 stats = {
     "scans": 0, "signals": 0, "trades": 0, "profit": 0.0, "errors": 0,
@@ -804,11 +827,7 @@ def reset_simulation():
     """Полный сброс симуляции — нужен после найденного 21.07 бага, т.к. вся
     накопленная статистика/баланс недостоверны."""
     global sim_balances
-    sim_balances = {
-        "KuCoin":  {"USDT": 125.0, "BONK": 62.5, "SEI": 31.25, "FET": 15.62, "INJ": 15.63},
-        "HTX":     {"USDT": 125.0, "BONK": 62.5, "SEI": 31.25, "FET": 15.62, "INJ": 15.63},
-        "Binance": {"USDT": 125.0},
-    }
+    sim_balances = build_default_sim_balances()
     trade_history.clear()
     stats["scans"] = 0
     stats["signals"] = 0
@@ -1089,11 +1108,7 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/rebalance":
-        target = {
-            "KuCoin":  {"USDT": 125, "BONK": 62.5, "SEI": 31.25, "FET": 15.62, "INJ": 15.63},
-            "HTX":     {"USDT": 125, "BONK": 62.5, "SEI": 31.25, "FET": 15.62, "INJ": 15.63},
-            "Binance": {"USDT": 125},
-        }
+        target = build_default_sim_balances()
         msg = "⚖️ *РЕБАЛАНСИРОВКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n*(суммы в USD-эквиваленте)*\n\n"
         actions = []
         for ex, tgt in target.items():
@@ -1175,8 +1190,17 @@ async def handle_command(session, text, chat_id):
             return
         SYMBOLS.append(sym)
         stats["symbol_stats"][sym] = 0
+        # Без начального баланса монета будет получать сигналы, но НИКОГДА не
+        # сможет исполниться в симуляции (has_sufficient_sim_balance всегда
+        # откажет) — та же ситуация, что случилась с FET/INJ. Даём стартовый
+        # виртуальный баланс в 5 лотов на каждой бирже, где монета продаётся.
+        seed = config["trade_usdt"] * 5
+        for ex in ["KuCoin", "HTX"]:
+            sim_balances.setdefault(ex, {})[sym] = seed
         await send_tg(session,
-            f"✅ Добавлено: *{sym}*\n\n"
+            f"✅ Добавлено: *{sym}*\n"
+            f"💰 Выдан стартовый баланс ${seed} на KuCoin и HTX (виртуально, "
+            f"для теста — не забудьте пополнить реально при переходе в реальный режим)\n\n"
             f"⚠️ Учтите: для {sym} нужна ликвидность и реальная проверка через "
             f"`/depthcheck {sym}` перед тем, как доверять сигналам по нему.\n\n"
             f"Текущий список: {', '.join(SYMBOLS)}"
