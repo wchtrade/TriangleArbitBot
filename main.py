@@ -77,6 +77,7 @@ stats = {
     "symbol_stats": {s: 0 for s in SYMBOLS},
     "depth_fail":   {"Binance": 0, "KuCoin": 0, "HTX": 0},  # счётчик отказов стакана
     "insufficient_liquidity": 0,  # сколько раз стакана не хватило на объём
+    "insufficient_balance_skips": 0,  # сколько раз симуляция честно отказала из-за нехватки виртуального баланса
     "hourly_signals": defaultdict(int),
     "hourly_profit":  defaultdict(float),
 }
@@ -753,15 +754,69 @@ def get_balance_usdt() -> float:
     return round(sum(v for assets in sim_balances.values() for v in assets.values()), 2)
 
 
+def has_sufficient_sim_balance(opp: dict) -> bool:
+    """КРИТИЧНАЯ ПРОВЕРКА (добавлена после найденного бага 21.07.2026):
+    раньше update_sim_balances зачисляла полный объём сделки даже если
+    списать USDT/монету удавалось лишь частично (из-за max(0,...)).
+    Это создавало деньги из воздуха, как только баланс биржи истощался.
+    Теперь сделка в симуляции просто не происходит, если реально
+    не хватает баланса — как было бы и на настоящей бирже."""
+    bex, sex, sym, vol = opp["buy_ex"], opp["sell_ex"], opp["symbol"], opp["vol"]
+    buy_usdt  = sim_balances.get(bex, {}).get("USDT", 0)
+    sell_coin = sim_balances.get(sex, {}).get(sym, 0)
+    return buy_usdt >= vol and sell_coin >= vol
+
+
 def update_sim_balances(opp: dict):
+    """Вызывается ТОЛЬКО после has_sufficient_sim_balance() == True."""
     sym, bex, sex, vol, profit = opp["symbol"], opp["buy_ex"], opp["sell_ex"], opp["vol"], opp["profit_usdt"]
     if bex in sim_balances:
-        sim_balances[bex]["USDT"] = max(0, sim_balances[bex].get("USDT", 0) - vol)
+        sim_balances[bex]["USDT"] = sim_balances[bex].get("USDT", 0) - vol
         sim_balances[bex][sym] = sim_balances[bex].get(sym, 0) + vol
     if sex in sim_balances:
-        cur = sim_balances[sex].get(sym, 0)
-        sim_balances[sex][sym] = max(0, cur - vol)
+        sim_balances[sex][sym] = sim_balances[sex].get(sym, 0) - vol
         sim_balances[sex]["USDT"] = sim_balances[sex].get("USDT", 0) + vol + profit
+
+
+def check_balance_warnings() -> List[str]:
+    warns = []
+    min_needed = config["trade_usdt"] * 3  # запас минимум на 3 сделки вперёд
+    for ex, assets in sim_balances.items():
+        usdt = assets.get("USDT", 0)
+        if usdt < min_needed:
+            warns.append(f"⚠️ {ex}: USDT = ${round(usdt,1)} — мало! (нужно от ${min_needed})")
+        for sym in SYMBOLS:
+            val = assets.get(sym, 0)
+            if ex in ["KuCoin", "HTX"] and 0 <= val < min_needed:
+                warns.append(f"⚠️ {ex}: {sym} = ${round(val,1)} — мало!")
+    return warns
+
+
+def suggest_withdrawal() -> dict:
+    """Сколько можно теоретически вывести как прибыль, не трогая рабочий капитал."""
+    total = get_balance_usdt()
+    min_operating = SIM_START * 1.5  # держим минимум 150% старта в обороте для 3 бирж
+    withdrawable = max(0, total - min_operating)
+    return {"total": round(total, 2), "min_operating": min_operating, "withdrawable": round(withdrawable, 2)}
+
+
+def reset_simulation():
+    """Полный сброс симуляции — нужен после найденного 21.07 бага, т.к. вся
+    накопленная статистика/баланс недостоверны."""
+    global sim_balances
+    sim_balances = {
+        "KuCoin":  {"USDT": 125.0, "BONK": 62.5, "SEI": 31.25, "FET": 15.62, "INJ": 15.63},
+        "HTX":     {"USDT": 125.0, "BONK": 62.5, "SEI": 31.25, "FET": 15.62, "INJ": 15.63},
+        "Binance": {"USDT": 125.0},
+    }
+    trade_history.clear()
+    stats["scans"] = 0
+    stats["signals"] = 0
+    stats["trades"] = 0
+    stats["profit"] = 0.0
+    stats["insufficient_balance_skips"] = 0
+    config["daily_loss"] = 0.0
+    config["daily_profit"] = 0.0
 
 
 async def execute_trade(session, opp: dict):
@@ -781,6 +836,12 @@ async def execute_trade(session, opp: dict):
             return  # не пишем в статистику фиктивную прибыль, если реальная сделка не прошла
 
     profit = opp["profit_usdt"]
+
+    if config["simulation_mode"]:
+        if not has_sufficient_sim_balance(opp):
+            stats["insufficient_balance_skips"] = stats.get("insufficient_balance_skips", 0) + 1
+            return  # честный отказ — как было бы и на реальной бирже
+
     hour = datetime.now().hour
     stats["hourly_profit"][hour] += profit
     trade_history.append({
@@ -896,6 +957,8 @@ async def handle_command(session, text, chat_id):
             f"/howtoread — как читать отчёты | /guide — инструкция\n"
             f"/pause /go /resume — управление торговлей\n"
             f"/addcoin /removecoin /listcoins — управление монетами\n"
+            f"/withdraw — сколько можно вывести\n"
+            f"/resetsim CONFIRM — сброс симуляции\n"
             f"/mode — переключить режим\n"
             f"/confirmreal /disablereal — гейт реальной торговли\n"
             f"/setlot 20 /setprofit 0.3 /setstop 10"
@@ -952,6 +1015,7 @@ async def handle_command(session, text, chat_id):
         total_bal = get_balance_usdt()
         pnl = round(total_bal - SIM_START, 2)
         per_trade = round(stats["profit"] / stats["trades"], 4) if stats["trades"] else 0
+        wd = suggest_withdrawal()
         await send_tg(session,
             f"📈 *СТАТИСТИКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"Сканов: {stats['scans']} | Сигналов: {stats['signals']} | Сделок: {stats['trades']}\n"
@@ -962,10 +1026,34 @@ async def handle_command(session, text, chat_id):
             f"   Binance: {stats['depth_fail']['Binance']}\n"
             f"   KuCoin: {stats['depth_fail']['KuCoin']}\n"
             f"   HTX: {stats['depth_fail']['HTX']}\n\n"
-            f"⚠️ Отклонено из-за нехватки ликвидности: {stats['insufficient_liquidity']}\n\n"
+            f"⚠️ Отклонено (нехватка ликвидности стакана): {stats['insufficient_liquidity']}\n"
+            f"⚠️ Отклонено (нехватка виртуального баланса): {stats.get('insufficient_balance_skips', 0)}\n\n"
             f"💵 Баланс: старт ${SIM_START} → сейчас ${total_bal} (P&L {pnl:+.2f})\n"
+            f"💸 Можно вывести (оценка): ${wd['withdrawable']} "
+            f"(держим ${wd['min_operating']} в обороте)\n\n"
             f"⚙️ Лот: ${config['trade_usdt']} | Порог: {config['min_profit_pct']}%"
         )
+
+    elif cmd == "/withdraw":
+        wd = suggest_withdrawal()
+        await send_tg(session,
+            f"💸 *ОЦЕНКА ВЫВОДА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Текущий баланс: ${wd['total']}\n"
+            f"Минимум в обороте (150% старта): ${wd['min_operating']}\n"
+            f"Можно вывести: *${wd['withdrawable']}*\n\n"
+            f"⚠️ Это расчёт по симуляции. Перед реальным выводом обязательно "
+            f"сверьте с фактическими балансами на биржах через /balances."
+        )
+
+    elif cmd == "/resetsim":
+        if len(parts) < 2 or parts[1] != "CONFIRM":
+            await send_tg(session,
+                "⚠️ Это обнулит ВСЮ статистику и балансы симуляции.\n"
+                "Для подтверждения: `/resetsim CONFIRM`"
+            )
+            return
+        reset_simulation()
+        await send_tg(session, "✅ Симуляция сброшена к стартовому состоянию ($500).")
 
     elif cmd == "/pause":
         config["paused"] = True
@@ -1341,6 +1429,18 @@ async def scan_loop(session):
                                     f"Чистая: `{t['net_pct']}%` | "
                                     f"Профит: `{t['profit_usdt']} USDT`"
                                 )
+
+                # Предупреждения о разбалансе + оценка вывода — каждые ~30 мин (180 сканов × 10 сек)
+                if stats["scans"] % 180 == 0:
+                    warns = check_balance_warnings()
+                    if warns and CHAT_ID:
+                        wd = suggest_withdrawal()
+                        await send_tg(session,
+                            "⚠️ *РАЗБАЛАНС ОБНАРУЖЕН:*\n" + "\n".join(warns) +
+                            f"\n\n💸 Можно вывести: ${wd['withdrawable']}\n\n"
+                            "Напиши /pause → сделай /rebalance → потом /go"
+                        )
+
         except Exception as e:
             stats["errors"] += 1
             logger.error(f"Scan error: {e}")
