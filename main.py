@@ -838,9 +838,16 @@ def reset_simulation():
     config["daily_profit"] = 0.0
 
 
-async def execute_trade(session, opp: dict):
-    if not check_rate() or not can_trade():
-        return
+async def execute_trade(session, opp: dict) -> dict:
+    """Возвращает {'executed': bool, 'reason': str|None} — вызывающий код
+    ОБЯЗАН использовать это для формирования сообщения пользователю.
+    Раньше карточка сигнала отправлялась независимо от результата —
+    это создавало иллюзию, что сделка прошла, даже когда она была
+    тихо отклонена (баланс/рейт-лимит/стоп-лосс)."""
+    if not check_rate():
+        return {"executed": False, "reason": "rate_limit_exceeded"}
+    if not can_trade():
+        return {"executed": False, "reason": "paused_or_stoploss"}
 
     real_result = None
     if not config["simulation_mode"] and is_real_trading_allowed():
@@ -852,14 +859,14 @@ async def execute_trade(session, opp: dict):
                 if real_result.get("emergency_close"):
                     msg += "\n⚠️ Выполнено аварийное закрытие позиции."
                 await send_tg(session, msg)
-            return  # не пишем в статистику фиктивную прибыль, если реальная сделка не прошла
+            return {"executed": False, "reason": f"real_execution_failed: {real_result.get('error')}"}
 
     profit = opp["profit_usdt"]
 
     if config["simulation_mode"]:
         if not has_sufficient_sim_balance(opp):
             stats["insufficient_balance_skips"] = stats.get("insufficient_balance_skips", 0) + 1
-            return  # честный отказ — как было бы и на реальной бирже
+            return {"executed": False, "reason": "insufficient_sim_balance"}
 
     hour = datetime.now().hour
     stats["hourly_profit"][hour] += profit
@@ -883,6 +890,16 @@ async def execute_trade(session, opp: dict):
             config["trading_active"] = False
     if config["simulation_mode"]:
         update_sim_balances(opp)
+
+    return {"executed": True, "reason": None}
+
+
+REASON_LABELS = {
+    "rate_limit_exceeded":     "⏱ превышен лимит сделок/мин",
+    "paused_or_stoploss":      "⏸ пауза или сработал стоп-лосс",
+    "insufficient_sim_balance": "💰 не хватает баланса именно этой монеты на бирже — нужен /rebalance",
+    None: "",
+}
 
 
 # =====================================================================
@@ -1027,8 +1044,14 @@ async def handle_command(session, text, chat_id):
         else:
             await send_tg(session, f"✅ {len(signals)} валидных сигналов (после проверки реальной глубины)!")
             for opp in signals[:3]:
-                await send_tg(session, format_signal(opp))
-                await execute_trade(session, opp)
+                result = await execute_trade(session, opp)
+                if result["executed"]:
+                    await send_tg(session, "✅ *ИСПОЛНЕНО*\n\n" + format_signal(opp))
+                else:
+                    reason = REASON_LABELS.get(result["reason"], result["reason"])
+                    await send_tg(session,
+                        f"⛔ {opp['symbol']} {opp['buy_ex']}→{opp['sell_ex']} "
+                        f"пропущено: {reason}")
 
     elif cmd == "/stats":
         total_bal = get_balance_usdt()
@@ -1433,9 +1456,16 @@ async def scan_loop(session):
                     now = datetime.now().timestamp()
                     if now - last_signal_time.get(key, 0) > 120:
                         last_signal_time[key] = now
-                        if CHAT_ID:
-                            await send_tg(session, format_signal(opp))
-                        await execute_trade(session, opp)
+                        result = await execute_trade(session, opp)
+                        if not CHAT_ID:
+                            continue
+                        if result["executed"]:
+                            await send_tg(session, "✅ *ИСПОЛНЕНО*\n\n" + format_signal(opp))
+                        else:
+                            reason = REASON_LABELS.get(result["reason"], result["reason"])
+                            await send_tg(session,
+                                f"⛔ {opp['symbol']} {opp['buy_ex']}→{opp['sell_ex']} "
+                                f"пропущено: {reason}")
 
                 # Треугольный скан — реже, т.к. требует 3x больше запросов на монету
                 if config["triangular_enabled"] and stats["scans"] % 3 == 0:
