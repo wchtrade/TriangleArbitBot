@@ -33,6 +33,7 @@ config = {
     "paused":             False,
     "min_volume_usdt":    100000,
     "depth_limit":        50,      # сколько уровней стакана запрашиваем
+    "rebalance_target_lots": 3,    # сколько лотов держать в резерве на каждую монету/USDT при авто-ребалансе
     "derating_factor":    0.25,    # реальность ≈ симуляция × 0.25 (ваша же оценка)
 
     # ===== ЭТАП 6: РЕАЛЬНОЕ ИСПОЛНЕНИЕ — ЖЁСТКИЙ ГЕЙТ =====
@@ -803,7 +804,7 @@ def update_sim_balances(opp: dict):
 
 def check_balance_warnings() -> List[str]:
     warns = []
-    min_needed = config["trade_usdt"] * 3  # запас минимум на 3 сделки вперёд
+    min_needed = config["trade_usdt"] * config["rebalance_target_lots"]
     for ex, assets in sim_balances.items():
         usdt = assets.get("USDT", 0)
         if usdt < min_needed:
@@ -821,6 +822,101 @@ def suggest_withdrawal() -> dict:
     min_operating = SIM_START * 1.5  # держим минимум 150% старта в обороте для 3 бирж
     withdrawable = max(0, total - min_operating)
     return {"total": round(total, 2), "min_operating": min_operating, "withdrawable": round(withdrawable, 2)}
+
+
+# =====================================================================
+# АВТОМАТИЧЕСКИЙ РЕБАЛАНС
+#
+# Принцип (по вашему запросу):
+#   - ВНУТРИ одной биржи — полностью автоматически: излишек монеты
+#     конвертируется в USDT, дефицит монеты докупается за USDT.
+#     USDT — основная валюта, накапливается сверху цели как резерв
+#     для вывода прибыли.
+#   - МЕЖДУ биржами — НИКОГДА автоматически. Бот останавливает торговлю
+#     и даёт точную инструкцию (откуда, куда, сколько), ждёт ручного
+#     подтверждения.
+# =====================================================================
+
+def exchange_rebalance_plan(ex: str) -> dict:
+    """Считает, хватает ли ОБЩЕЙ суммы на бирже, чтобы держать целевой
+    остаток по каждой отслеживаемой монете + буфер USDT. Не изменяет
+    балансы — только считает."""
+    assets = sim_balances.get(ex, {})
+    coin_target = config["trade_usdt"] * config["rebalance_target_lots"]
+    usdt_target = config["trade_usdt"] * config["rebalance_target_lots"]
+
+    coins_here = [s for s in SYMBOLS if s in assets]  # какие монеты вообще есть на этой бирже
+    needed_total = usdt_target + coin_target * len(coins_here)
+    total = round(sum(assets.values()), 2)
+
+    return {
+        "exchange": ex, "total": total, "needed_total": round(needed_total, 2),
+        "surplus": round(total - needed_total, 2),  # может быть отрицательным (дефицит)
+        "coins_here": coins_here, "coin_target": coin_target, "usdt_target": usdt_target,
+    }
+
+
+def apply_intra_exchange_rebalance(ex: str, plan: dict):
+    """Физически применяет ребаланс ВНУТРИ биржи — вызывать только когда
+    plan['surplus'] >= 0, иначе останется дефицит."""
+    assets = sim_balances[ex]
+    assets["USDT"] = plan["usdt_target"] + plan["surplus"]  # избыток стекает в USDT
+    for sym in plan["coins_here"]:
+        assets[sym] = plan["coin_target"]
+
+
+def auto_rebalance_all() -> dict:
+    """Главная функция. Возвращает:
+    {"fully_rebalanced": bool, "applied": [ex,...], "cross_exchange_needed": {...}|None}
+    Если хотя бы одна биржа в дефиците — НИЧЕГО не меняет на ней и
+    возвращает точную инструкцию по межбиржевому переводу."""
+    plans = {ex: exchange_rebalance_plan(ex) for ex in sim_balances}
+    deficits = {ex: p for ex, p in plans.items() if p["surplus"] < -0.01}
+    surpluses = {ex: p for ex, p in plans.items() if p["surplus"] > 0.01}
+
+    if not deficits:
+        # Всем биржам хватает своих же средств — ребалансируем каждую независимо
+        applied = []
+        for ex, p in plans.items():
+            apply_intra_exchange_rebalance(ex, p)
+            applied.append({"exchange": ex, "surplus_to_usdt": p["surplus"]})
+        return {"fully_rebalanced": True, "applied": applied, "cross_exchange_needed": None}
+
+    # Есть дефицит хотя бы на одной бирже — ребалансируем ТОЛЬКО биржи с
+    # избытком (чтобы явно увидеть, сколько свободных USDT можно перекинуть),
+    # дефицитную биржу не трогаем, торговлю не возобновляем.
+    applied = []
+    for ex, p in surpluses.items():
+        apply_intra_exchange_rebalance(ex, p)
+        applied.append({"exchange": ex, "surplus_to_usdt": p["surplus"]})
+
+    # Формируем инструкцию: для каждой дефицитной биржи ищем биржу-источник
+    # с наибольшим свободным излишком
+    instructions = []
+    remaining_surplus = {ex: p["surplus"] for ex, p in surpluses.items()}
+    for ex, p in sorted(deficits.items(), key=lambda kv: kv[1]["surplus"]):  # сначала самый большой дефицит
+        need = round(-p["surplus"], 2)
+        source = max(remaining_surplus, key=remaining_surplus.get, default=None)
+        if source and remaining_surplus[source] > 0:
+            amount = round(min(need, remaining_surplus[source]), 2)
+            remaining_surplus[source] -= amount
+            instructions.append({"from": source, "to": ex, "amount_usdt": amount, "still_needed": round(need - amount, 2)})
+        else:
+            instructions.append({"from": None, "to": ex, "amount_usdt": 0, "still_needed": need})
+
+    return {"fully_rebalanced": False, "applied": applied, "cross_exchange_needed": instructions}
+
+
+def apply_manual_transfer(from_ex: str, to_ex: str, amount: float) -> bool:
+    """Применяет к симуляции перевод USDT, который вы УЖЕ сделали руками
+    между биржами (TRC-20 и т.п.). Используется после /crosstransfer."""
+    if from_ex not in sim_balances or to_ex not in sim_balances:
+        return False
+    if sim_balances[from_ex].get("USDT", 0) < amount:
+        return False
+    sim_balances[from_ex]["USDT"] -= amount
+    sim_balances[to_ex]["USDT"] = sim_balances[to_ex].get("USDT", 0) + amount
+    return True
 
 
 def reset_simulation():
@@ -942,6 +1038,48 @@ async def get_updates(session, offset=0):
         return []
 
 
+def format_rebalance_result(result: dict) -> str:
+    msg = "⚖️ *АВТО-РЕБАЛАНС*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    if result["applied"]:
+        msg += "✅ *Сделано внутри бирж (авто):*\n"
+        for a in result["applied"]:
+            sign = "+" if a["surplus_to_usdt"] >= 0 else ""
+            msg += f"   {a['exchange']}: излишки → USDT ({sign}{a['surplus_to_usdt']})\n"
+        msg += "\n"
+
+    if result["fully_rebalanced"]:
+        wd = suggest_withdrawal()
+        msg += (
+            f"✅ *Все биржи сбалансированы, торговля продолжается.*\n\n"
+            f"💸 Свободно для вывода: ${wd['withdrawable']}"
+        )
+    else:
+        msg += (
+            "🔴 *ТОРГОВЛЯ ОСТАНОВЛЕНА* — не хватает средств внутри "
+            "отдельных бирж, нужен ручной перевод между биржами:\n\n"
+        )
+        for instr in result["cross_exchange_needed"]:
+            if instr["from"]:
+                msg += (f"➡️ Переведите *${instr['amount_usdt']}* USDT: "
+                        f"*{instr['from']} → {instr['to']}*\n")
+                if instr["still_needed"] > 0.01:
+                    msg += f"   (после этого на {instr['to']} всё ещё не хватит ${instr['still_needed']})\n"
+            else:
+                msg += f"⚠️ На {instr['to']} нужно ещё ${instr['still_needed']}, но свободных излишков на других биржах не найдено — требуется довнесение извне.\n"
+        msg += "\n💡 Перевод USDT через TRC-20 = ~$1 комиссии.\n"
+        first_real = next((i for i in result["cross_exchange_needed"] if i["from"]), None)
+        if first_real:
+            msg += (
+                "После перевода на реальных биржах примените его в симуляции:\n"
+                f"`/crosstransfer {first_real['from']} {first_real['to']} {first_real['amount_usdt']}`\n\n"
+            )
+        else:
+            msg += "После перевода примените его: `/crosstransfer ОТКУДА КУДА СУММА`\n\n"
+        msg += "Затем `/go` для возобновления торговли."
+    return msg
+
+
 def format_signal(opp: dict) -> str:
     mode = "🔵 СИМУЛЯЦИЯ" if config["simulation_mode"] else "🔴 РЕАЛЬНАЯ"
     derated = round(opp["profit_usdt"] * config["derating_factor"], 4)
@@ -987,7 +1125,9 @@ async def handle_command(session, text, chat_id):
             f"/triangle — треугольный арбитраж (Binance)\n"
             f"/depthcheck SYMBOL — сырой стакан + проскальзывание\n"
             f"/stats — статистика | /balances — балансы\n"
-            f"/rebalance — что перебалансировать\n"
+            f"/rebalance — авто-ребаланс внутри бирж (+ инструкция если нужен перевод между биржами)\n"
+            f"/crosstransfer FROM TO СУММА — записать ручной перевод\n"
+            f"/setrebalance N — целевой запас (в лотах) на монету\n"
             f"/hours — активность по часам | /report — отчёт за день\n"
             f"/history — последние сделки | /csv — экспорт\n"
             f"/howtoread — как читать отчёты | /guide — инструкция\n"
@@ -1131,27 +1271,61 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/rebalance":
-        target = build_default_sim_balances()
-        msg = "⚖️ *РЕБАЛАНСИРОВКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n*(суммы в USD-эквиваленте)*\n\n"
-        actions = []
-        for ex, tgt in target.items():
-            cur = sim_balances.get(ex, {})
-            ex_act = []
-            for asset, tgt_val in tgt.items():
-                diff = tgt_val - cur.get(asset, 0)
-                if diff > 2:
-                    ex_act.append(f"   ➕ Докупить {asset}: +${round(diff, 1)}")
-                elif diff < -2:
-                    ex_act.append(f"   ➖ Продать {asset}: ${round(abs(diff), 1)}")
-            if ex_act:
-                actions.append(f"*{ex}:*\n" + "\n".join(ex_act))
-        if not actions:
-            msg += "✅ Все балансы в норме! Ребалансировка не нужна."
+        warns = check_balance_warnings()
+        if not warns:
+            await send_tg(session, "✅ Все балансы в норме! Ребалансировка не нужна.")
+            return
+        config["paused"] = True
+        result = auto_rebalance_all()
+        await send_tg(session, format_rebalance_result(result))
+        if result["fully_rebalanced"]:
+            config["paused"] = False
+
+    elif cmd == "/autorebalance":
+        # Синоним /rebalance — форсирует авто-ребаланс прямо сейчас, даже без warnings
+        config["paused"] = True
+        result = auto_rebalance_all()
+        await send_tg(session, format_rebalance_result(result))
+        if result["fully_rebalanced"]:
+            config["paused"] = False
+
+    elif cmd == "/crosstransfer":
+        if len(parts) < 4:
+            await send_tg(session,
+                "Пример: `/crosstransfer HTX KuCoin 50`\n"
+                "(записывает в симуляцию перевод, который вы УЖЕ сделали "
+                "руками между реальными биржами)")
+            return
+        from_ex, to_ex = parts[1], parts[2]
+        try:
+            amount = float(parts[3])
+        except ValueError:
+            await send_tg(session, "❌ Сумма должна быть числом.")
+            return
+        if apply_manual_transfer(from_ex, to_ex, amount):
+            await send_tg(session,
+                f"✅ Записано: ${amount} USDT перенесено {from_ex} → {to_ex}.\n\n"
+                f"Теперь можно `/autorebalance` (докупить нужные монеты на {to_ex}) "
+                f"или сразу `/go`, если балансов хватает."
+            )
         else:
-            msg += "\n\n".join(actions)
-            msg += ("\n\n⚠️ *Перед ребалансировкой:*\n1. /pause\n2. Сделай операции на биржах\n3. /go\n\n"
-                    "💡 Перевод USDT через TRC-20 = ~$1")
-        await send_tg(session, msg)
+            await send_tg(session,
+                f"❌ Не удалось: либо биржа не найдена, либо на {from_ex} "
+                f"недостаточно USDT (${round(sim_balances.get(from_ex,{}).get('USDT',0),2)})."
+            )
+
+    elif cmd == "/setrebalance":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущая цель: {config['rebalance_target_lots']} лотов на монету/USDT.\n"
+                f"Пример: `/setrebalance 3`")
+            return
+        try:
+            config["rebalance_target_lots"] = int(parts[1])
+            await send_tg(session, f"✅ Цель ребаланса: {config['rebalance_target_lots']} лотов "
+                                    f"(${config['trade_usdt']*config['rebalance_target_lots']} на монету/USDT)")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setrebalance 3`")
 
     elif cmd == "/mode":
         if config["simulation_mode"]:
@@ -1414,7 +1588,7 @@ async def handle_command(session, text, chat_id):
     else:
         await send_tg(session,
             "/start /scan /top /triangle /depthcheck BONK\n"
-            "/stats /balances /rebalance\n"
+            "/stats /balances /rebalance /crosstransfer\n"
             "/hours /report /history /csv\n"
             "/howtoread /guide /mode\n"
             "/addcoin /removecoin /listcoins\n"
@@ -1484,16 +1658,18 @@ async def scan_loop(session):
                                     f"Профит: `{t['profit_usdt']} USDT`"
                                 )
 
-                # Предупреждения о разбалансе + оценка вывода — каждые ~30 мин (180 сканов × 10 сек)
+                # Авто-ребаланс — каждые ~30 мин (180 сканов × 10 сек)
                 if stats["scans"] % 180 == 0:
                     warns = check_balance_warnings()
-                    if warns and CHAT_ID:
-                        wd = suggest_withdrawal()
-                        await send_tg(session,
-                            "⚠️ *РАЗБАЛАНС ОБНАРУЖЕН:*\n" + "\n".join(warns) +
-                            f"\n\n💸 Можно вывести: ${wd['withdrawable']}\n\n"
-                            "Напиши /pause → сделай /rebalance → потом /go"
-                        )
+                    if warns:
+                        config["paused"] = True  # останавливаем торговлю на время ребаланса
+                        result = auto_rebalance_all()
+                        if CHAT_ID:
+                            await send_tg(session, format_rebalance_result(result))
+                        if result["fully_rebalanced"]:
+                            config["paused"] = False  # ребаланс закрыл всё сам — продолжаем
+                        # если fully_rebalanced == False — остаёмся на паузе,
+                        # ждём ручного /crosstransfer + /go
 
         except Exception as e:
             stats["errors"] += 1
