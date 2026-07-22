@@ -671,6 +671,8 @@ async def get_htx_account_id(session) -> Optional[str]:
 
 
 _htx_account_id_cache: Optional[str] = None
+_last_auto_rebalance_attempt: float = 0.0
+AUTO_REBALANCE_COOLDOWN = 30  # сек — не пытаться ребалансить чаще, чем раз в 30 сек
 
 
 async def execute_real_arbitrage(session, opp: dict) -> dict:
@@ -837,6 +839,14 @@ def suggest_withdrawal() -> dict:
 #     подтверждения.
 # =====================================================================
 
+def get_sell_exchanges() -> set:
+    """Биржи, которые хоть раз выступают sell_ex в PAIRS — только им реально
+    нужен запас монет. Binance в текущей конфигурации только покупает
+    (Binance→HTX) и никогда не продаёт — значит ей монеты вообще не нужны,
+    любые монеты, осевшие там после покупки, должны сразу уходить в USDT."""
+    return {sell_ex for _, sell_ex in PAIRS}
+
+
 def exchange_rebalance_plan(ex: str) -> dict:
     """Считает, хватает ли ОБЩЕЙ суммы на бирже, чтобы держать целевой
     остаток по каждой отслеживаемой монете + буфер USDT. Не изменяет
@@ -845,7 +855,16 @@ def exchange_rebalance_plan(ex: str) -> dict:
     coin_target = config["trade_usdt"] * config["rebalance_target_lots"]
     usdt_target = config["trade_usdt"] * config["rebalance_target_lots"]
 
-    coins_here = [s for s in SYMBOLS if s in assets]  # какие монеты вообще есть на этой бирже
+    # Монету держим целенаправленно ТОЛЬКО если: (а) биржа реально продаёт
+    # (фигурирует как sell_ex), И (б) монета всё ещё в активном списке SYMBOLS.
+    # Всё остальное (удалённые монеты, монеты на бирже-покупателе) — считается
+    # "мёртвым" остатком и подлежит полной конвертации в USDT.
+    sell_exchanges = get_sell_exchanges()
+    if ex in sell_exchanges:
+        coins_here = [s for s in SYMBOLS if s in assets]
+    else:
+        coins_here = []
+
     needed_total = usdt_target + coin_target * len(coins_here)
     total = round(sum(assets.values()), 2)
 
@@ -863,6 +882,13 @@ def apply_intra_exchange_rebalance(ex: str, plan: dict):
     assets["USDT"] = plan["usdt_target"] + plan["surplus"]  # избыток стекает в USDT
     for sym in plan["coins_here"]:
         assets[sym] = plan["coin_target"]
+    # КРИТИЧНО: обнуляем все прочие "монетные" ключи, которых нет в
+    # coins_here (удалённые через /removecoin, либо монеты на бирже, которая
+    # не должна их держать вроде Binance). Их стоимость уже учтена в USDT
+    # через surplus выше — если не обнулить сам ключ, баланс задвоится.
+    for key in list(assets.keys()):
+        if key != "USDT" and key not in plan["coins_here"]:
+            assets[key] = 0.0
 
 
 def auto_rebalance_all() -> dict:
@@ -961,8 +987,34 @@ async def execute_trade(session, opp: dict) -> dict:
 
     if config["simulation_mode"]:
         if not has_sufficient_sim_balance(opp):
-            stats["insufficient_balance_skips"] = stats.get("insufficient_balance_skips", 0) + 1
-            return {"executed": False, "reason": "insufficient_sim_balance"}
+            # Раньше это просто тихо отклонялось до следующего планового
+            # ребаланса (раз в ~30 мин). Теперь — мгновенная попытка
+            # авто-ребаланса прямо здесь, с cooldown против спама, если
+            # подряд идёт несколько отказов за секунды.
+            global _last_auto_rebalance_attempt
+            now_ts = time.time()
+            if now_ts - _last_auto_rebalance_attempt > AUTO_REBALANCE_COOLDOWN:
+                _last_auto_rebalance_attempt = now_ts
+                rb_result = auto_rebalance_all()
+                if rb_result["fully_rebalanced"]:
+                    if CHAT_ID:
+                        await send_tg(session, "🔄 Обнаружена нехватка баланса — "
+                                                "авто-ребаланс внутри бирж выполнен:\n\n" +
+                                       format_rebalance_result(rb_result))
+                    if has_sufficient_sim_balance(opp):
+                        pass  # хватило — проваливаемся дальше и исполняем сделку
+                    else:
+                        stats["insufficient_balance_skips"] = stats.get("insufficient_balance_skips", 0) + 1
+                        return {"executed": False, "reason": "insufficient_sim_balance"}
+                else:
+                    config["paused"] = True
+                    if CHAT_ID:
+                        await send_tg(session, format_rebalance_result(rb_result))
+                    stats["insufficient_balance_skips"] = stats.get("insufficient_balance_skips", 0) + 1
+                    return {"executed": False, "reason": "insufficient_sim_balance_cross_exchange"}
+            else:
+                stats["insufficient_balance_skips"] = stats.get("insufficient_balance_skips", 0) + 1
+                return {"executed": False, "reason": "insufficient_sim_balance"}
 
     hour = datetime.now().hour
     stats["hourly_profit"][hour] += profit
@@ -993,7 +1045,8 @@ async def execute_trade(session, opp: dict) -> dict:
 REASON_LABELS = {
     "rate_limit_exceeded":     "⏱ превышен лимит сделок/мин",
     "paused_or_stoploss":      "⏸ пауза или сработал стоп-лосс",
-    "insufficient_sim_balance": "💰 не хватает баланса именно этой монеты на бирже — нужен /rebalance",
+    "insufficient_sim_balance": "💰 не хватает баланса, авто-ребаланс не смог покрыть (см. сообщение выше)",
+    "insufficient_sim_balance_cross_exchange": "🔴 нужен ручной перевод между биржами — торговля на паузе",
     None: "",
 }
 
@@ -1415,7 +1468,22 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Нельзя удалить последнюю монету из списка.")
             return
         SYMBOLS.remove(sym)
-        await send_tg(session, f"✅ Удалено: *{sym}*\nТекущий список: {', '.join(SYMBOLS)}")
+        # Немедленно ликвидируем остаток монеты в USDT на всех биржах —
+        # иначе баланс "зависает" видимым в /balances, но недоступным
+        # для торговли и авто-ребаланса (это и произошло с BONK).
+        liquidated = {}
+        for ex, assets in sim_balances.items():
+            if sym in assets:
+                amount = assets.pop(sym)
+                assets["USDT"] = assets.get("USDT", 0) + amount
+                if amount:
+                    liquidated[ex] = round(amount, 2)
+        liq_lines = "\n".join(f"   {ex}: ${amt} → USDT" for ex, amt in liquidated.items())
+        await send_tg(session,
+            f"✅ Удалено: *{sym}*\n" +
+            (f"💰 Остатки конвертированы в USDT:\n{liq_lines}\n\n" if liquidated else "\n") +
+            f"Текущий список: {', '.join(SYMBOLS)}"
+        )
 
     elif cmd == "/listcoins":
         await send_tg(session, f"💱 *Торгуемые монеты:* {', '.join(SYMBOLS)}\n\n"
