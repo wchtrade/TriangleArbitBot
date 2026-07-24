@@ -44,6 +44,9 @@ config = {
     # Если хоть одно условие не выполнено — бот принудительно торгует в símulation.
     "real_confirmed":       False,
     "max_real_order_usdt":  15.0,   # ЖЁСТКИЙ потолок на один ордер, /setlot его не обходит
+    "real_rebalance_dry_run": True,  # ПО УМОЛЧАНИЮ включено: первый реальный ребаланс
+                                       # только показывает план, не размещает ордера,
+                                       # пока вы явно не отключите через /rebalancelive
     "real_trades_today":    0,
     "max_real_trades_per_day": 20,  # доп. защита от разгона в реальном режиме
 
@@ -747,6 +750,253 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
 
 
 # =====================================================================
+# РЕАЛЬНЫЙ АВТО-РЕБАЛАНС (по вашему запросу от 24.07)
+#
+# ВНИМАНИЕ: как и весь Этап 6, этот код не тестировался на живом API.
+# Комиссия и небольшое проскальзывание за каждую ногу — неизбежная и
+# честная цена ребаланса реальными деньгами, порядка 0.1-0.2% за ногу
+# (Binance/KuCoin) или 0.2% (HTX), т.е. ~0.2-0.4% за цикл продажа+покупка.
+# =====================================================================
+
+async def get_real_balances_binance(session) -> Optional[Dict[str, float]]:
+    url = "https://api.binance.com/api/v3/account"
+    ts = int(time.time() * 1000)
+    params = {"timestamp": ts, "recvWindow": 5000}
+    params["signature"] = sign_binance(params, BINANCE_SECRET)
+    headers = {"X-MBX-APIKEY": BINANCE_KEY}
+    try:
+        async with session.get(url, params=params, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if r.status != 200:
+                logger.error(f"Binance balance fetch failed: {data}")
+                return None
+            return {b["asset"]: float(b["free"]) for b in data.get("balances", [])}
+    except Exception as e:
+        logger.error(f"Binance balance exception: {e}")
+        return None
+
+
+async def get_real_balances_kucoin(session) -> Optional[Dict[str, float]]:
+    endpoint = "/api/v1/accounts"
+    url = f"https://api.kucoin.com{endpoint}"
+    ts = str(int(time.time() * 1000))
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "GET", endpoint, "")
+    headers = {
+        "KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2",
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if r.status != 200 or data.get("code") != "200000":
+                logger.error(f"KuCoin balance fetch failed: {data}")
+                return None
+            result = {}
+            for acc in data.get("data", []):
+                if acc.get("type") == "trade":
+                    result[acc["currency"]] = float(acc["available"])
+            return result
+    except Exception as e:
+        logger.error(f"KuCoin balance exception: {e}")
+        return None
+
+
+async def get_real_balances_htx(session) -> Optional[Dict[str, float]]:
+    global _htx_account_id_cache
+    if not _htx_account_id_cache:
+        _htx_account_id_cache = await get_htx_account_id(session)
+    if not _htx_account_id_cache:
+        return None
+    host = "api.huobi.pro"
+    endpoint = f"/v1/account/accounts/{_htx_account_id_cache}/balance"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    params = {"AccessKeyId": HTX_KEY, "SignatureMethod": "HmacSHA256",
+              "SignatureVersion": "2", "Timestamp": ts}
+    sorted_params = sorted(params.items())
+    query = urllib.parse.urlencode(sorted_params)
+    payload = f"GET\n{host}\n{endpoint}\n{query}"
+    signature = base64.b64encode(
+        hmac.new(HTX_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
+    ).decode()
+    params["Signature"] = signature
+    try:
+        async with session.get(f"https://{host}{endpoint}", params=params,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if data.get("status") != "ok":
+                logger.error(f"HTX balance fetch failed: {data}")
+                return None
+            result = {}
+            for item in data.get("data", {}).get("list", []):
+                if item.get("type") == "trade":
+                    cur = item["currency"].upper()
+                    result[cur] = result.get(cur, 0.0) + float(item["balance"])
+            return result
+    except Exception as e:
+        logger.error(f"HTX balance exception: {e}")
+        return None
+
+
+async def get_real_balances(session, ex: str) -> Optional[Dict[str, float]]:
+    if ex == "Binance":
+        return await get_real_balances_binance(session)
+    elif ex == "KuCoin":
+        return await get_real_balances_kucoin(session)
+    elif ex == "HTX":
+        return await get_real_balances_htx(session)
+    return None
+
+
+async def get_valuation_price(session, ex: str, symbol: str) -> Optional[float]:
+    """Best bid как консервативная оценка стоимости позиции (если продавать)."""
+    if ex == "Binance":
+        ob = await get_orderbook_binance(session, symbol)
+    elif ex == "KuCoin":
+        ob = await get_orderbook_kucoin(session, symbol)
+    elif ex == "HTX":
+        ob = await get_orderbook_htx(session, symbol)
+    else:
+        return None
+    if not ob or not ob.get("bids"):
+        return None
+    return ob["bids"][0][0]
+
+
+async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
+    """Реальный аналог exchange_rebalance_plan — читает ФАКТИЧЕСКИЕ балансы
+    с биржи через API, а не виртуальный sim_balances."""
+    balances = await get_real_balances(session, ex)
+    if balances is None:
+        return None
+
+    real_lot = config["max_real_order_usdt"]  # $15 — жёсткий потолок реального ордера
+    lots = config["rebalance_target_lots"]
+    coin_target_usd = real_lot * lots
+    usdt_target = real_lot * lots
+
+    sell_exchanges = get_sell_exchanges()
+    coin_values: Dict[str, float] = {}
+    if ex in sell_exchanges:
+        for sym in SYMBOLS:
+            qty = balances.get(sym, 0.0)
+            if qty <= 0:
+                coin_values[sym] = 0.0
+                continue
+            price = await get_valuation_price(session, ex, sym)
+            coin_values[sym] = round(qty * price, 4) if price else 0.0
+
+    usdt_balance = balances.get("USDT", 0.0)
+    total_usd = usdt_balance + sum(coin_values.values())
+    needed_total = usdt_target + coin_target_usd * len(coin_values)
+
+    return {
+        "exchange": ex, "balances_qty": balances, "coin_values": coin_values,
+        "usdt_balance": round(usdt_balance, 2), "total_usd": round(total_usd, 2),
+        "needed_total": round(needed_total, 2), "surplus": round(total_usd - needed_total, 2),
+        "coin_target_usd": coin_target_usd, "usdt_target": usdt_target,
+    }
+
+
+async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> dict:
+    """Продаёт излишек монет в USDT, докупает дефицитные — РЕАЛЬНЫМИ ордерами.
+    Вызывать только когда plan['surplus'] >= 0 (иначе останется дефицит).
+    Пока config['real_rebalance_dry_run'] == True — ордера НЕ размещаются,
+    только считается и показывается план (см. /rebalancelive для включения)."""
+    dry_run = config["real_rebalance_dry_run"]
+    actions = []
+    coin_target = plan["coin_target_usd"]
+    threshold = 1.0  # не гоняем ребаланс из-за $1 — комиссия того не стоит
+
+    # Сначала продажи — освобождаем USDT для последующих покупок
+    for sym, value in plan["coin_values"].items():
+        if value > coin_target + threshold:
+            qty = plan["balances_qty"].get(sym, 0)
+            price = value / qty if qty else None
+            if not price:
+                continue
+            excess_usd = value - coin_target
+            qty_to_sell = round(excess_usd / price, 6)
+            result = "DRY_RUN" if dry_run else None
+            if not dry_run:
+                if ex == "Binance":
+                    result = await place_order_binance(session, sym, "SELL", qty_to_sell)
+                elif ex == "KuCoin":
+                    result = await place_order_kucoin(session, sym, "sell", qty_to_sell, use_funds=False)
+                elif ex == "HTX":
+                    if _htx_account_id_cache:
+                        result = await place_order_htx(session, _htx_account_id_cache, sym, "sell-market", qty_to_sell)
+            actions.append({"action": "sell", "symbol": sym, "usd_estimate": round(excess_usd, 2),
+                             "success": bool(result), "dry_run": dry_run})
+
+    # Затем покупки дефицитных монет
+    for sym, value in plan["coin_values"].items():
+        if value < coin_target - threshold:
+            deficit_usd = round(coin_target - value, 2)
+            result = "DRY_RUN" if dry_run else None
+            if not dry_run:
+                if ex == "Binance":
+                    result = await place_order_binance(session, sym, "BUY", deficit_usd)
+                elif ex == "KuCoin":
+                    result = await place_order_kucoin(session, sym, "buy", deficit_usd, use_funds=True)
+                elif ex == "HTX":
+                    if _htx_account_id_cache:
+                        result = await place_order_htx(session, _htx_account_id_cache, sym, "buy-market", deficit_usd)
+            actions.append({"action": "buy", "symbol": sym, "usd_estimate": deficit_usd,
+                             "success": bool(result), "dry_run": dry_run})
+
+    return {"exchange": ex, "actions": actions}
+
+
+async def real_auto_rebalance_all(session) -> dict:
+    """Реальная версия auto_rebalance_all для боевого режима.
+    ВНУТРИ биржи — реальные ордера (комиссия неизбежна).
+    МЕЖДУ биржами — только инструкция, как и в симуляции, автоперевод
+    между биржами не делаем никогда."""
+    plans = {}
+    for ex in ["Binance", "KuCoin", "HTX"]:
+        p = await real_exchange_rebalance_plan(session, ex)
+        if p is None:
+            return {"fully_rebalanced": False, "error": f"could_not_fetch_balance_{ex}",
+                     "applied": [], "cross_exchange_needed": None, "dry_run": config["real_rebalance_dry_run"],
+                     "safe_to_resume": False}
+        plans[ex] = p
+
+    dry_run = config["real_rebalance_dry_run"]
+    deficits = {ex: p for ex, p in plans.items() if p["surplus"] < -1.0}
+    surpluses = {ex: p for ex, p in plans.items() if p["surplus"] > 1.0}
+
+    applied = []
+    if not deficits:
+        for ex, p in plans.items():
+            applied.append(await apply_real_intra_exchange_rebalance(session, ex, p))
+        # safe_to_resume: средств достаточно И (либо реально исполнили, либо
+        # ничего не требовалось исполнять) — в dry-run с реальными действиями
+        # НЕЛЬЗЯ возобновлять торговлю, т.к. балансы физически не поменялись
+        had_actions = any(a["actions"] for a in applied)
+        safe = True if not (dry_run and had_actions) else False
+        return {"fully_rebalanced": True, "applied": applied, "cross_exchange_needed": None,
+                "dry_run": dry_run, "safe_to_resume": safe}
+
+    for ex, p in surpluses.items():
+        applied.append(await apply_real_intra_exchange_rebalance(session, ex, p))
+
+    instructions = []
+    remaining_surplus = {ex: p["surplus"] for ex, p in surpluses.items()}
+    for ex, p in sorted(deficits.items(), key=lambda kv: kv[1]["surplus"]):
+        need = round(-p["surplus"], 2)
+        source = max(remaining_surplus, key=remaining_surplus.get, default=None)
+        if source and remaining_surplus[source] > 0:
+            amount = round(min(need, remaining_surplus[source]), 2)
+            remaining_surplus[source] -= amount
+            instructions.append({"from": source, "to": ex, "amount_usdt": amount, "still_needed": round(need - amount, 2)})
+        else:
+            instructions.append({"from": None, "to": ex, "amount_usdt": 0, "still_needed": need})
+
+    return {"fully_rebalanced": False, "applied": applied, "cross_exchange_needed": instructions, "dry_run": dry_run, "safe_to_resume": False}
+
+
+# =====================================================================
 # СИМУЛЯЦИЯ БАЛАНСОВ / ИСПОЛНЕНИЕ (как и раньше — это НЕ реальная торговля)
 # =====================================================================
 
@@ -966,6 +1216,7 @@ async def execute_trade(session, opp: dict) -> dict:
     Раньше карточка сигнала отправлялась независимо от результата —
     это создавало иллюзию, что сделка прошла, даже когда она была
     тихо отклонена (баланс/рейт-лимит/стоп-лосс)."""
+    global _last_auto_rebalance_attempt
     if not check_rate():
         return {"executed": False, "reason": "rate_limit_exceeded"}
     if not can_trade():
@@ -976,7 +1227,22 @@ async def execute_trade(session, opp: dict) -> dict:
         real_result = await execute_real_arbitrage(session, opp)
         if not real_result.get("success"):
             logger.error(f"РЕАЛЬНАЯ сделка не удалась: {real_result}")
-            if CHAT_ID:
+            error = real_result.get("error", "")
+            if "buy_leg_failed" in error or "sell_leg_failed" in error:
+                # Скорее всего нехватка средств именно на этой ноге —
+                # мгновенная попытка реального ребаланса вместо ожидания
+                # планового цикла в 30 минут (с тем же cooldown-защитником)
+                now_ts = time.time()
+                if now_ts - _last_auto_rebalance_attempt > AUTO_REBALANCE_COOLDOWN:
+                    _last_auto_rebalance_attempt = now_ts
+                    rb_result = await real_auto_rebalance_all(session)
+                    if CHAT_ID:
+                        await send_tg(session, "🔄 Реальная сделка отклонена биржей — "
+                                                "пробую реальный ребаланс:\n\n" +
+                                       format_real_rebalance_result(rb_result))
+                    if not rb_result.get("safe_to_resume", False):
+                        config["paused"] = True
+            elif CHAT_ID:
                 msg = f"🔴 *РЕАЛЬНАЯ СДЕЛКА ОТКЛОНЕНА/ОШИБКА*\n`{real_result}`"
                 if real_result.get("emergency_close"):
                     msg += "\n⚠️ Выполнено аварийное закрытие позиции."
@@ -991,7 +1257,6 @@ async def execute_trade(session, opp: dict) -> dict:
             # ребаланса (раз в ~30 мин). Теперь — мгновенная попытка
             # авто-ребаланса прямо здесь, с cooldown против спама, если
             # подряд идёт несколько отказов за секунды.
-            global _last_auto_rebalance_attempt
             now_ts = time.time()
             if now_ts - _last_auto_rebalance_attempt > AUTO_REBALANCE_COOLDOWN:
                 _last_auto_rebalance_attempt = now_ts
@@ -1091,6 +1356,53 @@ async def get_updates(session, offset=0):
         return []
 
 
+def format_real_rebalance_result(result: dict) -> str:
+    if result.get("error"):
+        return (f"🔴 *РЕАЛЬНЫЙ РЕБАЛАНС НЕ ВЫПОЛНЕН*\n\n"
+                f"Не удалось получить реальный баланс: `{result['error']}`\n"
+                f"Проверьте API-ключи и логи Railway.")
+
+    is_dry_run = any(act.get("dry_run") for a in result["applied"] for act in a["actions"])
+    header = "🔍 *ПЛАН РЕБАЛАНСА (dry-run, ордера НЕ размещены)*" if is_dry_run else \
+             "⚖️ *РЕАЛЬНЫЙ АВТО-РЕБАЛАНС (ордера исполнены)*"
+    msg = header + "\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    any_actions = False
+    for a in result["applied"]:
+        if a["actions"]:
+            any_actions = True
+            msg += f"*{a['exchange']}:*\n"
+            for act in a["actions"]:
+                if act.get("dry_run"):
+                    icon = "🔍"
+                else:
+                    icon = "✅" if act["success"] else "❌"
+                verb = "Продать" if act["action"] == "sell" else "Купить"
+                msg += f"   {icon} {verb} {act['symbol']} на ~${act['usd_estimate']}\n"
+            msg += "\n"
+    if not any_actions:
+        msg += "Реальные балансы уже в целевых диапазонах, действия не требуются.\n\n"
+
+    if is_dry_run and any_actions:
+        msg += ("💡 Это только план — ни один ордер не размещён.\n"
+                "Проверьте цифры, и когда будете готовы включить реальное "
+                "исполнение: `/rebalancelive on`\n\n")
+    elif any_actions:
+        msg += "⚠️ Комиссии биржи за каждую ногу применились автоматически — это ожидаемо.\n\n"
+
+    if result["fully_rebalanced"]:
+        msg += "✅ *Все биржи в целевом диапазоне" + (", торговля продолжается." if not is_dry_run else " (по плану).*")
+    else:
+        msg += "🔴 *ТОРГОВЛЯ НА ПАУЗЕ* — не хватает реальных средств внутри отдельных бирж:\n\n"
+        for instr in result["cross_exchange_needed"]:
+            if instr["from"]:
+                msg += f"➡️ Переведите *${instr['amount_usdt']}* USDT: *{instr['from']} → {instr['to']}*\n"
+            else:
+                msg += f"⚠️ На {instr['to']} нужно ещё ${instr['still_needed']}, свободных излишков нет — довнесите извне.\n"
+        msg += "\nПосле перевода на реальных биржах — просто `/go` (реальные балансы бот прочитает заново из API)."
+    return msg
+
+
 def format_rebalance_result(result: dict) -> str:
     msg = "⚖️ *АВТО-РЕБАЛАНС*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
@@ -1180,6 +1492,7 @@ async def handle_command(session, text, chat_id):
             f"/stats — статистика | /balances — балансы\n"
             f"/rebalance — авто-ребаланс внутри бирж (+ инструкция если нужен перевод между биржами)\n"
             f"/crosstransfer FROM TO СУММА — записать ручной перевод\n"
+            f"/rebalancelive on|off — включить/выключить РЕАЛЬНЫЕ ордера ребаланса (по умолчанию OFF — только план)\n"
             f"/setrebalance N — целевой запас (в лотах) на монету\n"
             f"/hours — активность по часам | /report — отчёт за день\n"
             f"/history — последние сделки | /csv — экспорт\n"
@@ -1324,6 +1637,13 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/rebalance":
+        if not config["simulation_mode"]:
+            config["paused"] = True
+            result = await real_auto_rebalance_all(session)
+            await send_tg(session, format_real_rebalance_result(result))
+            if result.get("safe_to_resume", False):
+                config["paused"] = False
+            return
         warns = check_balance_warnings()
         if not warns:
             await send_tg(session, "✅ Все балансы в норме! Ребалансировка не нужна.")
@@ -1335,12 +1655,37 @@ async def handle_command(session, text, chat_id):
             config["paused"] = False
 
     elif cmd == "/autorebalance":
-        # Синоним /rebalance — форсирует авто-ребаланс прямо сейчас, даже без warnings
         config["paused"] = True
-        result = auto_rebalance_all()
-        await send_tg(session, format_rebalance_result(result))
-        if result["fully_rebalanced"]:
-            config["paused"] = False
+        if not config["simulation_mode"]:
+            result = await real_auto_rebalance_all(session)
+            await send_tg(session, format_real_rebalance_result(result))
+            if result.get("safe_to_resume", False):
+                config["paused"] = False
+        else:
+            result = auto_rebalance_all()
+            await send_tg(session, format_rebalance_result(result))
+            if result["fully_rebalanced"]:
+                config["paused"] = False
+
+    elif cmd == "/rebalancelive":
+        if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+            state = "ВЫКЛЮЧЕН (dry-run, безопасно)" if config["real_rebalance_dry_run"] else "🔴 ВКЛЮЧЁН (реальные ордера)"
+            await send_tg(session,
+                f"Текущий режим реального ребаланса: {state}\n\n"
+                f"`/rebalancelive on` — включить реальные ордера ребаланса\n"
+                f"`/rebalancelive off` — вернуть в безопасный dry-run режим"
+            )
+            return
+        if parts[1].lower() == "on":
+            config["real_rebalance_dry_run"] = False
+            await send_tg(session,
+                "🔴 *Реальные ордера ребаланса ВКЛЮЧЕНЫ.*\n\n"
+                "Следующий `/rebalance` или `/autorebalance` будет реально "
+                "продавать/покупать на бирже, с реальной комиссией."
+            )
+        else:
+            config["real_rebalance_dry_run"] = True
+            await send_tg(session, "🔵 Реальный ребаланс возвращён в безопасный режим (только план, без ордеров).")
 
     elif cmd == "/crosstransfer":
         if len(parts) < 4:
@@ -1728,16 +2073,26 @@ async def scan_loop(session):
 
                 # Авто-ребаланс — каждые ~30 мин (180 сканов × 10 сек)
                 if stats["scans"] % 180 == 0:
-                    warns = check_balance_warnings()
-                    if warns:
-                        config["paused"] = True  # останавливаем торговлю на время ребаланса
-                        result = auto_rebalance_all()
-                        if CHAT_ID:
-                            await send_tg(session, format_rebalance_result(result))
-                        if result["fully_rebalanced"]:
-                            config["paused"] = False  # ребаланс закрыл всё сам — продолжаем
-                        # если fully_rebalanced == False — остаёмся на паузе,
-                        # ждём ручного /crosstransfer + /go
+                    if not config["simulation_mode"]:
+                        config["paused"] = True
+                        result = await real_auto_rebalance_all(session)
+                        had_actions = any(a["actions"] for a in result.get("applied", []))
+                        if result.get("error") or not result.get("safe_to_resume", False) or had_actions:
+                            if CHAT_ID:
+                                await send_tg(session, format_real_rebalance_result(result))
+                        if result.get("safe_to_resume", False):
+                            config["paused"] = False
+                    else:
+                        warns = check_balance_warnings()
+                        if warns:
+                            config["paused"] = True  # останавливаем торговлю на время ребаланса
+                            result = auto_rebalance_all()
+                            if CHAT_ID:
+                                await send_tg(session, format_rebalance_result(result))
+                            if result["fully_rebalanced"]:
+                                config["paused"] = False  # ребаланс закрыл всё сам — продолжаем
+                            # если fully_rebalanced == False — остаёмся на паузе,
+                            # ждём ручного /crosstransfer + /go
 
         except Exception as e:
             stats["errors"] += 1
