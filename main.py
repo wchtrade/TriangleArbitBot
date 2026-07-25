@@ -6,6 +6,8 @@ import csv
 import io
 import time
 import json
+import gzip
+import uuid
 import hmac
 import hashlib
 import base64
@@ -371,12 +373,10 @@ async def get_orderbook_binance(session, symbol: str) -> Optional[Dict]:
     return await get_orderbook_binance_rest(session, symbol)
 
 
-async def get_orderbook_kucoin(session, symbol: str) -> Optional[Dict]:
+async def get_orderbook_kucoin_rest(session, symbol: str) -> Optional[Dict]:
+    """REST-фоллбэк на случай, если WS ещё не синхронизирован."""
     if is_backed_off("KuCoin"):
         return None
-    # Публичный уровень 2 (агрегированный, 20 уровней). Если KuCoin потребует
-    # авторизацию на этом endpoint — вернётся ошибка, бот просто пропустит биржу
-    # для этого символа (как и раньше делал при недоступности API).
     url = "https://api.kucoin.com/api/v1/market/orderbook/level2_20"
     params = {"symbol": f"{symbol}-{QUOTE}"}
     try:
@@ -399,7 +399,8 @@ async def get_orderbook_kucoin(session, symbol: str) -> Optional[Dict]:
         return None
 
 
-async def get_orderbook_htx(session, symbol: str) -> Optional[Dict]:
+async def get_orderbook_htx_rest(session, symbol: str) -> Optional[Dict]:
+    """REST-фоллбэк на случай, если WS ещё не синхронизирован."""
     if is_backed_off("HTX"):
         return None
     url = "https://api.huobi.pro/market/depth"
@@ -422,6 +423,289 @@ async def get_orderbook_htx(session, symbol: str) -> Optional[Dict]:
         stats["depth_fail"]["HTX"] += 1
         logger.error(f"HTX depth {symbol}: {e}")
         return None
+
+
+# =====================================================================
+# WEBSOCKET ORDER BOOK ДЛЯ KUCOIN
+#
+# Используется публичный канал level2Depth50 — биржа сама присылает готовый
+# снимок топ-50 уровней при каждом изменении, не нужно мержить дельты по
+# sequence-номерам вручную (проще и надёжнее, чем полный diff-подход).
+# Протокол требует: 1) получить bullet-токен через REST,
+# 2) подключиться с этим токеном, 3) слать ping каждые pingInterval мс.
+# =====================================================================
+
+KUCOIN_BULLET_URL = "https://api.kucoin.com/api/v1/bullet-public"
+
+
+class KuCoinLocalOrderBook:
+    def __init__(self, symbol: str):
+        self.symbol = symbol.upper()
+        self.bids: List[Tuple[float, float]] = []
+        self.asks: List[Tuple[float, float]] = []
+        self.synced = False
+        self.last_event_time = 0.0
+        self.event_count = 0
+        self.reconnect_count = 0
+        self._stop = False
+
+    def get_book(self, depth: int = 50) -> Optional[Dict[str, List[Tuple[float, float]]]]:
+        if not self.synced or time.time() - self.last_event_time > 15:
+            return None
+        if not self.bids or not self.asks:
+            return None
+        return {"bids": self.bids[:depth], "asks": self.asks[:depth]}
+
+    def is_healthy(self) -> bool:
+        return self.synced and (time.time() - self.last_event_time) < 15
+
+    def stop(self):
+        self._stop = True
+
+    async def _get_bullet_token(self, session: aiohttp.ClientSession) -> Optional[dict]:
+        try:
+            async with session.post(KUCOIN_BULLET_URL, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    logger.error(f"KuCoin bullet-public HTTP {r.status}")
+                    return None
+                data = await r.json()
+                if data.get("code") != "200000":
+                    logger.error(f"KuCoin bullet-public: {data}")
+                    return None
+                return data["data"]
+        except Exception as e:
+            logger.error(f"KuCoin bullet-public exception: {e}")
+            return None
+
+    def _apply_snapshot(self, data: dict):
+        bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
+        asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+        if not bids or not asks:
+            return
+        self.bids = sorted(bids, key=lambda x: -x[0])
+        self.asks = sorted(asks, key=lambda x: x[0])
+        self.synced = True
+        self.last_event_time = time.time()
+        self.event_count += 1
+
+    async def _ping_loop(self, ws, interval_ms: int):
+        interval = max(interval_ms / 1000 - 2, 5)
+        try:
+            while not self._stop:
+                await asyncio.sleep(interval)
+                await ws.send_json({"id": str(int(time.time() * 1000)), "type": "ping"})
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        except Exception as e:
+            logger.error(f"{self.symbol} KuCoin ping error: {e}")
+
+    async def run(self, session: aiohttp.ClientSession):
+        topic = f"/spotMarket/level2Depth50:{self.symbol}-{QUOTE}"
+        backoff = 1
+        while not self._stop:
+            try:
+                bullet = await self._get_bullet_token(session)
+                if not bullet or not bullet.get("instanceServers"):
+                    raise ConnectionError("Не удалось получить bullet-токен")
+
+                server = bullet["instanceServers"][0]
+                token = bullet["token"]
+                connect_id = str(uuid.uuid4())
+                ws_url = f"{server['endpoint']}?token={token}&connectId={connect_id}"
+                ping_interval = server.get("pingInterval", 18000)
+
+                async with session.ws_connect(ws_url, heartbeat=None) as ws:
+                    logger.info(f"{self.symbol} KuCoin WS: подключен")
+                    backoff = 1
+                    welcome = await ws.receive_json(timeout=10)
+                    if welcome.get("type") != "welcome":
+                        raise ConnectionError(f"Не получен welcome: {welcome}")
+
+                    ping_task = asyncio.create_task(self._ping_loop(ws, ping_interval))
+                    await ws.send_json({
+                        "id": str(int(time.time() * 1000)), "type": "subscribe",
+                        "topic": topic, "privateChannel": False, "response": True,
+                    })
+                    try:
+                        async for msg in ws:
+                            if self._stop:
+                                break
+                            if msg.type != aiohttp.WSMsgType.TEXT:
+                                continue
+                            data = json.loads(msg.data)
+                            if data.get("type") == "message" and data.get("topic") == topic:
+                                self._apply_snapshot(data.get("data", {}))
+                            elif data.get("type") == "error":
+                                logger.error(f"{self.symbol} KuCoin WS error msg: {data}")
+                    finally:
+                        ping_task.cancel()
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.reconnect_count += 1
+                logger.error(f"{self.symbol} KuCoin WS: ошибка {e}, реконнект через {backoff} сек")
+                self.synced = False
+
+            if self._stop:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
+kucoin_ws_books: Dict[str, KuCoinLocalOrderBook] = {}
+kucoin_ws_tasks: Dict[str, asyncio.Task] = {}
+
+
+def start_kucoin_ws_book(session: aiohttp.ClientSession, symbol: str):
+    if symbol in kucoin_ws_books:
+        return
+    book = KuCoinLocalOrderBook(symbol)
+    kucoin_ws_books[symbol] = book
+    kucoin_ws_tasks[symbol] = asyncio.create_task(book.run(session))
+    logger.info(f"KuCoin WS: запущен для {symbol}")
+
+
+def stop_kucoin_ws_book(symbol: str):
+    book = kucoin_ws_books.pop(symbol, None)
+    task = kucoin_ws_tasks.pop(symbol, None)
+    if book:
+        book.stop()
+    if task:
+        task.cancel()
+    logger.info(f"KuCoin WS: остановлен для {symbol}")
+
+
+async def get_orderbook_kucoin(session, symbol: str) -> Optional[Dict]:
+    book = kucoin_ws_books.get(symbol)
+    if book and book.is_healthy():
+        snap = book.get_book(depth=config["depth_limit"])
+        if snap:
+            return snap
+    return await get_orderbook_kucoin_rest(session, symbol)
+
+
+# =====================================================================
+# WEBSOCKET ORDER BOOK ДЛЯ HTX
+#
+# Особенность HTX: сообщения приходят GZIP-сжатыми бинарными фреймами
+# (не текстом!), нужно распаковывать перед json.loads. Плюс сервер сам
+# шлёт {"ping": ts} — клиент ОБЯЗАН ответить {"pong": ts}, иначе разрыв.
+# =====================================================================
+
+HTX_WS_URL = "wss://api.huobi.pro/ws"
+
+
+class HTXLocalOrderBook:
+    def __init__(self, symbol: str):
+        self.symbol = symbol.upper()
+        self.bids: List[Tuple[float, float]] = []
+        self.asks: List[Tuple[float, float]] = []
+        self.synced = False
+        self.last_event_time = 0.0
+        self.event_count = 0
+        self.reconnect_count = 0
+        self._stop = False
+
+    def get_book(self, depth: int = 50) -> Optional[Dict[str, List[Tuple[float, float]]]]:
+        if not self.synced or time.time() - self.last_event_time > 15:
+            return None
+        if not self.bids or not self.asks:
+            return None
+        return {"bids": self.bids[:depth], "asks": self.asks[:depth]}
+
+    def is_healthy(self) -> bool:
+        return self.synced and (time.time() - self.last_event_time) < 15
+
+    def stop(self):
+        self._stop = True
+
+    def _apply_snapshot(self, tick: dict):
+        bids = [(float(p), float(q)) for p, q in tick.get("bids", [])]
+        asks = [(float(p), float(q)) for p, q in tick.get("asks", [])]
+        if not bids or not asks:
+            return
+        self.bids = sorted(bids, key=lambda x: -x[0])
+        self.asks = sorted(asks, key=lambda x: x[0])
+        self.synced = True
+        self.last_event_time = time.time()
+        self.event_count += 1
+
+    async def run(self, session: aiohttp.ClientSession):
+        channel = f"market.{self.symbol.lower()}{QUOTE.lower()}.depth.step0"
+        backoff = 1
+        while not self._stop:
+            try:
+                async with session.ws_connect(HTX_WS_URL, heartbeat=None) as ws:
+                    logger.info(f"{self.symbol} HTX WS: подключен")
+                    backoff = 1
+                    await ws.send_json({"sub": channel, "id": f"sub_{self.symbol}"})
+
+                    async for msg in ws:
+                        if self._stop:
+                            break
+                        if msg.type != aiohttp.WSMsgType.BINARY:
+                            continue
+                        try:
+                            raw = gzip.decompress(msg.data)
+                            data = json.loads(raw)
+                        except Exception as e:
+                            logger.error(f"{self.symbol} HTX WS: ошибка распаковки {e}")
+                            continue
+
+                        if "ping" in data:
+                            # Обязательный ответ, иначе биржа закроет соединение
+                            await ws.send_json({"pong": data["ping"]})
+                            continue
+
+                        if data.get("ch") == channel and "tick" in data:
+                            self._apply_snapshot(data["tick"])
+                        elif data.get("status") == "error":
+                            logger.error(f"{self.symbol} HTX WS error msg: {data}")
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.reconnect_count += 1
+                logger.error(f"{self.symbol} HTX WS: ошибка {e}, реконнект через {backoff} сек")
+                self.synced = False
+
+            if self._stop:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
+htx_ws_books: Dict[str, HTXLocalOrderBook] = {}
+htx_ws_tasks: Dict[str, asyncio.Task] = {}
+
+
+def start_htx_ws_book(session: aiohttp.ClientSession, symbol: str):
+    if symbol in htx_ws_books:
+        return
+    book = HTXLocalOrderBook(symbol)
+    htx_ws_books[symbol] = book
+    htx_ws_tasks[symbol] = asyncio.create_task(book.run(session))
+    logger.info(f"HTX WS: запущен для {symbol}")
+
+
+def stop_htx_ws_book(symbol: str):
+    book = htx_ws_books.pop(symbol, None)
+    task = htx_ws_tasks.pop(symbol, None)
+    if book:
+        book.stop()
+    if task:
+        task.cancel()
+    logger.info(f"HTX WS: остановлен для {symbol}")
+
+
+async def get_orderbook_htx(session, symbol: str) -> Optional[Dict]:
+    book = htx_ws_books.get(symbol)
+    if book and book.is_healthy():
+        snap = book.get_book(depth=config["depth_limit"])
+        if snap:
+            return snap
+    return await get_orderbook_htx_rest(session, symbol)
 
 
 async def get_24h_volume(session) -> Dict[str, float]:
@@ -2069,7 +2353,9 @@ async def handle_command(session, text, chat_id):
             return
         SYMBOLS.append(sym)
         stats["symbol_stats"][sym] = 0
-        start_binance_ws_book(session, sym)  # поднимаем живой стакан для новой монеты
+        start_binance_ws_book(session, sym)
+        start_kucoin_ws_book(session, sym)
+        start_htx_ws_book(session, sym)
         # Без начального баланса монета будет получать сигналы, но НИКОГДА не
         # сможет исполниться в симуляции (has_sufficient_sim_balance всегда
         # откажет) — та же ситуация, что случилась с FET/INJ. Даём стартовый
@@ -2099,7 +2385,9 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Нельзя удалить последнюю монету из списка.")
             return
         SYMBOLS.remove(sym)
-        stop_binance_ws_book(sym)  # останавливаем WS-стакан, больше не нужен
+        stop_binance_ws_book(sym)
+        stop_kucoin_ws_book(sym)
+        stop_htx_ws_book(sym)
         # Немедленно ликвидируем остаток монеты в USDT на всех биржах —
         # иначе баланс "зависает" видимым в /balances, но недоступным
         # для торговли и авто-ребаланса (это и произошло с BONK).
@@ -2139,14 +2427,35 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/wsstatus":
-        msg = "🔌 *BINANCE WEBSOCKET СТАКАНЫ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        msg = "🔌 *WEBSOCKET СТАКАНЫ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        msg += "*Binance:*\n"
         if not binance_ws_books:
-            msg += "Ни один WS-стакан ещё не запущен."
+            msg += "   Ни один стакан ещё не запущен.\n"
         for sym, book in binance_ws_books.items():
             icon = "✅" if book.is_healthy() else "⏳" if book.synced else "🔴"
             age = round(time.time() - book.last_event_time) if book.last_event_time else "—"
-            msg += (f"{icon} *{sym}*: events={book.event_count} "
-                    f"resyncs={book.resync_count} последнее событие {age}с назад\n")
+            msg += (f"   {icon} {sym}: events={book.event_count} "
+                    f"resyncs={book.resync_count} {age}с назад\n")
+
+        msg += "\n*KuCoin:*\n"
+        if not kucoin_ws_books:
+            msg += "   Ни один стакан ещё не запущен.\n"
+        for sym, book in kucoin_ws_books.items():
+            icon = "✅" if book.is_healthy() else "⏳" if book.synced else "🔴"
+            age = round(time.time() - book.last_event_time) if book.last_event_time else "—"
+            msg += (f"   {icon} {sym}: events={book.event_count} "
+                    f"reconnects={book.reconnect_count} {age}с назад\n")
+
+        msg += "\n*HTX:*\n"
+        if not htx_ws_books:
+            msg += "   Ни один стакан ещё не запущен.\n"
+        for sym, book in htx_ws_books.items():
+            icon = "✅" if book.is_healthy() else "⏳" if book.synced else "🔴"
+            age = round(time.time() - book.last_event_time) if book.last_event_time else "—"
+            msg += (f"   {icon} {sym}: events={book.event_count} "
+                    f"reconnects={book.reconnect_count} {age}с назад\n")
+
         msg += "\n💡 REST-фоллбэк подключается автоматически, если WS ещё не готов."
         await send_tg(session, msg)
 
@@ -2420,12 +2729,14 @@ async def main():
     if not TG_TOKEN:
         logger.error("ARB_BOT_TOKEN не установлен!")
         return
-    logger.info("DepthArbBot стартует — реальная глубина стакана вместо top-of-book")
+    logger.info("DepthArbBot стартует — WebSocket-стаканы на всех трёх биржах")
     connector = aiohttp.TCPConnector(ssl=True)  # SSL включён, не отключаем проверку сертификатов
     async with aiohttp.ClientSession(connector=connector) as session:
         for sym in SYMBOLS:
             start_binance_ws_book(session, sym)
-        logger.info(f"Binance WS: запущены стаканы для {SYMBOLS}")
+            start_kucoin_ws_book(session, sym)
+            start_htx_ws_book(session, sym)
+        logger.info(f"WS-стаканы запущены на Binance/KuCoin/HTX для {SYMBOLS}")
         await asyncio.gather(polling_loop(session), scan_loop(session))
 
 
