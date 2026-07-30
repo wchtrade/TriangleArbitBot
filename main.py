@@ -1216,11 +1216,16 @@ async def get_htx_account_id(session) -> Optional[str]:
                 trigger_backoff("HTX", r.status, r.headers.get("Retry-After"))
                 return None
             data = await r.json()
-            for acc in data.get("data", []):
+            acc_list = data.get("data") or []
+            for acc in acc_list:
                 if acc.get("type") == "spot":
                     return str(acc["id"])
+            # Дошли сюда — либо data пуст/None, либо нет spot-аккаунта.
+            # Логируем ПОЛНЫЙ ответ биржи, чтобы видеть настоящую причину
+            # (обычно это ошибка прав ключа или неверная подпись).
+            logger.error(f"HTX account id: не нашли spot-аккаунт, полный ответ: {data}")
     except Exception as e:
-        logger.error(f"HTX account id: {e}")
+        logger.error(f"HTX account id exception: {e}")
     return None
 
 
@@ -1394,7 +1399,7 @@ async def get_real_balances_htx(session) -> Optional[Dict[str, float]]:
                 logger.error(f"HTX balance fetch failed: {data}")
                 return None
             result = {}
-            for item in data.get("data", {}).get("list", []):
+            for item in (data.get("data") or {}).get("list", []):
                 if item.get("type") == "trade":
                     cur = item["currency"].upper()
                     result[cur] = result.get(cur, 0.0) + float(item["balance"])
