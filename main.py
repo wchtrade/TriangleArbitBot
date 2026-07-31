@@ -2411,6 +2411,7 @@ async def handle_command(session, text, chat_id):
             f"/realfees SYMBOL — подтянуть реальные комиссии аккаунта вместо дефолтных\n"
             f"/wsstatus — здоровье WebSocket-стаканов Binance\n"
             f"/setrebalance N — целевой запас (в лотах) на монету\n"
+            f"/setreallot N — снизить реальный лимит ордера (не выше $15)\n"
             f"/hours — активность по часам | /report — отчёт за день\n"
             f"/history — последние сделки | /csv — экспорт\n"
             f"/howtoread — как читать отчёты | /guide — инструкция\n"
@@ -2638,9 +2639,37 @@ async def handle_command(session, text, chat_id):
         try:
             config["rebalance_target_lots"] = int(parts[1])
             await send_tg(session, f"✅ Цель ребаланса: {config['rebalance_target_lots']} лотов "
-                                    f"(${config['trade_usdt']*config['rebalance_target_lots']} на монету/USDT)")
+                                    f"(${config['trade_usdt']*config['rebalance_target_lots']} на монету/USDT в СИМУЛЯЦИИ, "
+                                    f"${config['max_real_order_usdt']*config['rebalance_target_lots']} в РЕАЛЬНОМ режиме)")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setrebalance 3`")
+
+    elif cmd == "/setreallot":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущий реальный лимит ордера: ${config['max_real_order_usdt']}\n"
+                f"Можно только УМЕНЬШИТЬ (не больше $15 — это жёсткий потолок безопасности).\n"
+                f"Пример: `/setreallot 10`")
+            return
+        try:
+            new_val = float(parts[1])
+            if new_val > 15.0:
+                await send_tg(session,
+                    "❌ Нельзя установить больше $15 — это намеренный потолок безопасности, "
+                    "заложенный при построении реального исполнения. Уменьшать можно.")
+                return
+            if new_val <= 0:
+                await send_tg(session, "❌ Значение должно быть больше 0.")
+                return
+            config["max_real_order_usdt"] = new_val
+            needed = round(new_val * config["rebalance_target_lots"] * 5, 2)
+            await send_tg(session,
+                f"✅ Реальный лимит ордера: ${new_val}\n"
+                f"При текущей цели ребаланса ({config['rebalance_target_lots']} лот(а)) "
+                f"нужно суммарно ~${needed} на всех биржах для комфортного буфера."
+            )
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setreallot 10`")
 
     elif cmd == "/mode":
         if config["simulation_mode"]:
