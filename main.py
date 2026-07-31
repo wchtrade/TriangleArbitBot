@@ -1563,6 +1563,20 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     vol = min(opp["vol"], config["max_real_order_usdt"])  # ЖЁСТКИЙ потолок, /setlot не обходит
     symbol, buy_ex, sell_ex = opp["symbol"], opp["buy_ex"], opp["sell_ex"]
 
+    # НАХОДКА 31.07: у каждой биржи своя НЕЗАВИСИМАЯ предзаведённая монета —
+    # купленное на buy_ex физически не переносится на sell_ex. Раньше бот
+    # покупал вслепую, не проверив, хватит ли монеты на sell_ex для продажи —
+    # отсюда застревания. Теперь проверяем РЕАЛЬНЫЙ баланс sell_ex ДО покупки.
+    sell_balances = await get_real_balances(session, sell_ex)
+    if sell_balances is None:
+        return {"success": False, "error": f"could_not_verify_sell_balance_on_{sell_ex}"}
+    qty_needed_estimate = vol / opp["sell_price"] if opp.get("sell_price") else 0
+    available_on_sell_ex = sell_balances.get(symbol, 0.0)
+    if available_on_sell_ex < qty_needed_estimate * 1.02:  # 2% запас на движение цены
+        return {"success": False,
+                "error": f"insufficient_real_balance_on_{sell_ex}: "
+                         f"нужно ~{qty_needed_estimate:.2f} {symbol}, есть {available_on_sell_ex:.2f}"}
+
     # --- НОГА 1: ПОКУПКА ---
     buy_result = None
     if buy_ex == "Binance":
@@ -2128,7 +2142,7 @@ async def execute_trade(session, opp: dict) -> dict:
         if not real_result.get("success"):
             logger.error(f"РЕАЛЬНАЯ сделка не удалась: {real_result}")
             error = real_result.get("error", "")
-            if "buy_leg_failed" in error or "sell_leg_failed" in error:
+            if "buy_leg_failed" in error or "sell_leg_failed" in error or "insufficient_real_balance" in error:
                 # Скорее всего нехватка средств именно на этой ноге —
                 # мгновенная попытка реального ребаланса вместо ожидания
                 # планового цикла в 30 минут (с тем же cooldown-защитником)
