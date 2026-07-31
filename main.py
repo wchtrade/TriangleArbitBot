@@ -1051,6 +1051,216 @@ def is_real_trading_allowed() -> bool:
     return env_ok and runtime_ok and keys_ok
 
 
+# =====================================================================
+# ТРЕБОВАНИЕ 4 (ТЗ 30.07): ОКРУГЛЕНИЕ ПОД ПРАВИЛА БИРЖИ
+#
+# Причина сегодняшних отказов (LOT_SIZE у Binance, "increment invalid" у
+# KuCoin, "precision-error" у HTX) — количество монеты в ордере считалось
+# из симуляции "как есть", без округления под реальный шаг лота биржи.
+# Получаем правила один раз на символ, кэшируем, округляем ВНИЗ (никогда
+# не вверх — иначе можем продать/купить больше, чем реально есть).
+# =====================================================================
+
+import math
+
+_binance_lot_step_cache: Dict[str, float] = {}
+_kucoin_increment_cache: Dict[str, float] = {}
+_htx_precision_cache: Dict[str, int] = {}
+
+
+async def get_binance_lot_step(session, symbol: str) -> float:
+    if symbol in _binance_lot_step_cache:
+        return _binance_lot_step_cache[symbol]
+    try:
+        async with session.get("https://api.binance.com/api/v3/exchangeInfo",
+                                params={"symbol": f"{symbol}{QUOTE}"},
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            for s in data.get("symbols", []):
+                for f in s.get("filters", []):
+                    if f["filterType"] == "LOT_SIZE":
+                        step = float(f["stepSize"])
+                        _binance_lot_step_cache[symbol] = step
+                        return step
+    except Exception as e:
+        logger.error(f"Binance lot step fetch {symbol}: {e}")
+    return 1.0  # безопасный дефолт: округлит до целого, ордер хотя бы не отклонится по фильтру
+
+
+async def get_kucoin_base_increment(session, symbol: str) -> float:
+    if symbol in _kucoin_increment_cache:
+        return _kucoin_increment_cache[symbol]
+    try:
+        async with session.get("https://api.kucoin.com/api/v2/symbols",
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            for s in data.get("data", []):
+                if s.get("symbol") == f"{symbol}-{QUOTE}":
+                    inc = float(s["baseIncrement"])
+                    _kucoin_increment_cache[symbol] = inc
+                    return inc
+    except Exception as e:
+        logger.error(f"KuCoin increment fetch {symbol}: {e}")
+    return 1.0
+
+
+async def get_htx_amount_precision(session, symbol: str) -> int:
+    if symbol in _htx_precision_cache:
+        return _htx_precision_cache[symbol]
+    try:
+        async with session.get("https://api.huobi.pro/v1/common/symbols",
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            for s in data.get("data", []):
+                if s.get("symbol") == f"{symbol.lower()}{QUOTE.lower()}":
+                    prec = int(s["amount-precision"])
+                    _htx_precision_cache[symbol] = prec
+                    return prec
+    except Exception as e:
+        logger.error(f"HTX precision fetch {symbol}: {e}")
+    return 0  # безопасный дефолт: округлит до целого
+
+
+def _round_down_to_step(qty: float, step: float) -> float:
+    if step <= 0:
+        return qty
+    return math.floor(qty / step) * step
+
+
+def _round_down_to_precision(qty: float, decimals: int) -> float:
+    factor = 10 ** decimals
+    return math.floor(qty * factor) / factor
+
+
+async def round_quantity_for_exchange(session, ex: str, symbol: str, raw_qty: float) -> float:
+    """Округляет количество монеты ВНИЗ под реальные правила конкретной
+    биржи. Обязательно вызывать перед ЛЮБЫМ реальным ордером на продажу
+    (и на покупку, если объём задаётся в количестве монет, а не в USDT)."""
+    if ex == "Binance":
+        step = await get_binance_lot_step(session, symbol)
+        result = _round_down_to_step(raw_qty, step)
+    elif ex == "KuCoin":
+        inc = await get_kucoin_base_increment(session, symbol)
+        result = _round_down_to_step(raw_qty, inc)
+    elif ex == "HTX":
+        prec = await get_htx_amount_precision(session, symbol)
+        result = _round_down_to_precision(raw_qty, prec)
+    else:
+        result = raw_qty
+    return round(result, 10)  # чистим float-мусор (1901.1000000000001 → 1901.1)
+
+
+# =====================================================================
+# ТРЕБОВАНИЕ 1 (ТЗ 30.07): ПРОВЕРКА РЕАЛЬНОГО ИСПОЛНЕНИЯ ОРДЕРА
+#
+# Раньше бот считал ногу сделки успешной сразу по факту, что POST-запрос
+# на размещение ордера прошёл (HTTP 200) — но у KuCoin и HTX ответ на
+# размещение MARKET-ордера возвращает только orderId, БЕЗ подтверждения
+# реального исполнения. Именно так родилась зависшая позиция на Binance:
+# бот решил, что купил, хотя реального fill не проверял по факту с биржи.
+# Теперь — обязательный опрос статуса ордера (до 3 сек, каждые 300 мс),
+# и только подтверждённый FILLED считается успехом.
+# =====================================================================
+
+async def wait_for_binance_fill(session, symbol: str, order_id, timeout: float = 3.0) -> Optional[float]:
+    """Возвращает РЕАЛЬНО исполненное количество монет, или None если не
+    исполнилось/отменилось за отведённое время."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ts = int(time.time() * 1000)
+        params = {"symbol": f"{symbol}{QUOTE}", "orderId": order_id, "timestamp": ts, "recvWindow": 5000}
+        params["signature"] = sign_binance(params, BINANCE_SECRET)
+        headers = {"X-MBX-APIKEY": BINANCE_KEY}
+        try:
+            async with session.get("https://api.binance.com/api/v3/order", params=params,
+                                    headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                data = await r.json()
+                if data.get("status") == "FILLED":
+                    return float(data.get("executedQty", 0))
+                if data.get("status") in ("CANCELED", "REJECTED", "EXPIRED"):
+                    return None
+        except Exception as e:
+            logger.error(f"Binance fill check {symbol}: {e}")
+        await asyncio.sleep(0.3)
+    return None
+
+
+async def wait_for_kucoin_fill(session, order_id: str, timeout: float = 3.0) -> Optional[float]:
+    deadline = time.time() + timeout
+    endpoint = f"/api/v1/orders/{order_id}"
+    while time.time() < deadline:
+        ts = str(int(time.time() * 1000))
+        signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "GET", endpoint, "")
+        headers = {"KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+                   "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2"}
+        try:
+            async with session.get(f"https://api.kucoin.com{endpoint}", headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=5)) as r:
+                data = await r.json()
+                d = data.get("data", {})
+                if d.get("isActive") is False and float(d.get("dealSize", 0)) > 0:
+                    return float(d["dealSize"])
+                if d.get("cancelExist"):
+                    return None
+        except Exception as e:
+            logger.error(f"KuCoin fill check {order_id}: {e}")
+        await asyncio.sleep(0.3)
+    return None
+
+
+async def wait_for_htx_fill(session, order_id, timeout: float = 3.0) -> Optional[float]:
+    deadline = time.time() + timeout
+    host = "api.huobi.pro"
+    endpoint = f"/v1/order/orders/{order_id}"
+    while time.time() < deadline:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        params = {"AccessKeyId": HTX_KEY, "SignatureMethod": "HmacSHA256",
+                  "SignatureVersion": "2", "Timestamp": ts}
+        sorted_params = sorted(params.items())
+        query = urllib.parse.urlencode(sorted_params)
+        payload = f"GET\n{host}\n{endpoint}\n{query}"
+        signature = base64.b64encode(
+            hmac.new(HTX_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
+        ).decode()
+        params["Signature"] = signature
+        try:
+            async with session.get(f"https://{host}{endpoint}", params=params,
+                                    timeout=aiohttp.ClientTimeout(total=5)) as r:
+                data = await r.json()
+                order_data = data.get("data", {})
+                state = order_data.get("state")
+                if state == "filled":
+                    return float(order_data.get("field-amount", 0))
+                if state in ("canceled", "partial-canceled"):
+                    return None
+        except Exception as e:
+            logger.error(f"HTX fill check {order_id}: {e}")
+        await asyncio.sleep(0.3)
+    return None
+
+
+async def confirm_fill_and_get_qty(session, ex: str, buy_result: dict) -> Optional[float]:
+    """Единая точка: извлекает order_id из ответа биржи на размещение
+    ордера и ждёт подтверждения РЕАЛЬНОГО исполнения. Возвращает None,
+    если исполнение не подтвердилось — тогда вторую ногу открывать нельзя."""
+    if ex == "Binance":
+        order_id = buy_result.get("orderId")
+        if buy_result.get("status") == "FILLED":
+            return float(buy_result.get("executedQty", 0))  # уже пришло сразу в ответе
+        return await wait_for_binance_fill(session, buy_result.get("symbol", "")[:-len(QUOTE)], order_id)
+    elif ex == "KuCoin":
+        order_id = buy_result.get("data", {}).get("orderId")
+        if not order_id:
+            return None
+        return await wait_for_kucoin_fill(session, order_id)
+    elif ex == "HTX":
+        order_id = buy_result.get("data")
+        if not order_id:
+            return None
+        return await wait_for_htx_fill(session, order_id)
+    return None
+
+
 def sign_binance(params: dict, secret: str) -> str:
     query = urllib.parse.urlencode(params)
     return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -1194,6 +1404,109 @@ async def place_order_htx(session, account_id: str, symbol: str, side: str,
         return None
 
 
+# =====================================================================
+# ТРЕБОВАНИЕ 3 (ТЗ 30.07): ДИНАМИЧЕСКИЕ КОМИССИИ ВМЕСТО СТАТИЧНЫХ
+#
+# FEES = {"Binance": 0.10, "KuCoin": 0.10, "HTX": 0.20} — это разумные
+# дефолты, но реальная комиссия аккаунта может отличаться (скидки за объём,
+# использование биржевого токена для оплаты комиссии и т.п.). Команда
+# /realfees подтягивает фактические комиссии и обновляет FEES на лету.
+# Намеренно НЕ вызывается автоматически при старте — если хоть один запрос
+# упадёт (неверный формат ответа, смена биржей API), последствия должны
+# быть локальными ("не обновили один процент"), а не блокировать весь бот.
+# =====================================================================
+
+async def fetch_real_fee_binance(session, symbol: str) -> Optional[float]:
+    if is_backed_off("Binance"):
+        return None
+    ts = int(time.time() * 1000)
+    params = {"symbol": f"{symbol}{QUOTE}", "timestamp": ts, "recvWindow": 5000}
+    params["signature"] = sign_binance(params, BINANCE_SECRET)
+    headers = {"X-MBX-APIKEY": BINANCE_KEY}
+    try:
+        async with session.get("https://api.binance.com/sapi/v1/asset/tradeFee", params=params,
+                                headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if isinstance(data, list) and data:
+                return round(float(data[0]["takerCommission"]) * 100, 4)  # доля → проценты
+            logger.error(f"Binance fee: неожиданный формат ответа {data}")
+    except Exception as e:
+        logger.error(f"Binance fee fetch exception: {e}")
+    return None
+
+
+async def fetch_real_fee_kucoin(session, symbol: str) -> Optional[float]:
+    if is_backed_off("KuCoin"):
+        return None
+    endpoint = "/api/v1/trade-fees"
+    query = f"symbols={symbol}-{QUOTE}"
+    ts = str(int(time.time() * 1000))
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "GET", f"{endpoint}?{query}", "")
+    headers = {"KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+               "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2"}
+    try:
+        async with session.get(f"https://api.kucoin.com{endpoint}?{query}", headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            items = data.get("data", [])
+            if items:
+                return round(float(items[0]["takerFeeRate"]) * 100, 4)
+            logger.error(f"KuCoin fee: неожиданный формат ответа {data}")
+    except Exception as e:
+        logger.error(f"KuCoin fee fetch exception: {e}")
+    return None
+
+
+async def fetch_real_fee_htx(session, symbol: str) -> Optional[float]:
+    if is_backed_off("HTX"):
+        return None
+    host = "api.huobi.pro"
+    endpoint = "/v2/reference/transact-fee-rate"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    params = {"AccessKeyId": HTX_KEY, "SignatureMethod": "HmacSHA256", "SignatureVersion": "2",
+              "Timestamp": ts, "symbols": f"{symbol.lower()}{QUOTE.lower()}"}
+    sorted_params = sorted(params.items())
+    query = urllib.parse.urlencode(sorted_params)
+    payload = f"GET\n{host}\n{endpoint}\n{query}"
+    signature = base64.b64encode(
+        hmac.new(HTX_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
+    ).decode()
+    params["Signature"] = signature
+    try:
+        async with session.get(f"https://{host}{endpoint}", params=params,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            items = data.get("data", [])
+            if items:
+                return round(float(items[0]["actualTakerRate"]) * 100, 4)
+            logger.error(f"HTX fee: неожиданный формат ответа {data}")
+    except Exception as e:
+        logger.error(f"HTX fee fetch exception: {e}")
+    return None
+
+
+async def refresh_real_fees(session, symbol: str) -> Dict[str, Optional[float]]:
+    """Обновляет FEES реальными значениями там, где удалось получить.
+    Возвращает то, что реально получилось (для сообщения в Telegram)."""
+    results = {}
+    binance_fee = await fetch_real_fee_binance(session, symbol)
+    if binance_fee is not None:
+        FEES["Binance"] = binance_fee
+    results["Binance"] = binance_fee
+
+    kucoin_fee = await fetch_real_fee_kucoin(session, symbol)
+    if kucoin_fee is not None:
+        FEES["KuCoin"] = kucoin_fee
+    results["KuCoin"] = kucoin_fee
+
+    htx_fee = await fetch_real_fee_htx(session, symbol)
+    if htx_fee is not None:
+        FEES["HTX"] = htx_fee
+    results["HTX"] = htx_fee
+
+    return results
+
+
 async def get_htx_account_id(session) -> Optional[str]:
     if is_backed_off("HTX"):
         return None
@@ -1267,42 +1580,52 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
 
     config["real_trades_today"] += 1
 
-    # Сколько монет реально куплено — по-хорошему нужно запросить факт исполнения
-    # ордера (GET order status), здесь используем расчётное количество как
-    # консервативную оценку. ЭТО МЕСТО ТРЕБУЕТ ДОРАБОТКИ: добавить polling
-    # реального fill amount перед второй ногой.
-    coins_bought = opp["coins"]
+    # ТРЕБОВАНИЕ 1: не верим на слово, что покупка исполнилась — подтверждаем
+    # реальным опросом биржи и берём ФАКТИЧЕСКОЕ количество, а не расчётное
+    confirmed_qty = await confirm_fill_and_get_qty(session, buy_ex, buy_result)
+    if not confirmed_qty or confirmed_qty <= 0:
+        return {"success": False, "error": f"buy_leg_not_confirmed_filled_on_{buy_ex}"}
+
+    # ТРЕБОВАНИЕ 4: округляем ВНИЗ под реальный шаг лота биржи ПРОДАЖИ,
+    # прежде чем размещать вторую ногу — иначе LOT_SIZE/precision-error
+    sell_qty = await round_quantity_for_exchange(session, sell_ex, symbol, confirmed_qty)
+    if sell_qty <= 0:
+        return {"success": False, "error": f"sell_qty_rounds_to_zero_on_{sell_ex}"}
 
     # --- НОГА 2: ПРОДАЖА ---
     sell_result = None
     if sell_ex == "Binance":
-        sell_result = await place_order_binance(session, symbol, "SELL", coins_bought)
+        sell_result = await place_order_binance(session, symbol, "SELL", sell_qty)
     elif sell_ex == "KuCoin":
-        sell_result = await place_order_kucoin(session, symbol, "sell", coins_bought, use_funds=False)
+        sell_result = await place_order_kucoin(session, symbol, "sell", sell_qty, use_funds=False)
     elif sell_ex == "HTX":
         if not _htx_account_id_cache:
             _htx_account_id_cache = await get_htx_account_id(session)
         if _htx_account_id_cache:
-            sell_result = await place_order_htx(session, _htx_account_id_cache, symbol, "sell-market", coins_bought)
+            sell_result = await place_order_htx(session, _htx_account_id_cache, symbol, "sell-market", sell_qty)
 
     if not sell_result:
         # АВАРИЙНОЕ ЗАКРЫТИЕ: продаём купленное обратно на бирже покупки,
-        # чтобы не остаться с открытой направленной позицией
+        # чтобы не остаться с открытой направленной позицией. Округляем
+        # под правила ИМЕННО buy_ex (это другая биржа с другим шагом лота).
+        emergency_qty = await round_quantity_for_exchange(session, buy_ex, symbol, confirmed_qty)
         emergency = None
-        if buy_ex == "Binance":
-            emergency = await place_order_binance(session, symbol, "SELL", coins_bought)
-        elif buy_ex == "KuCoin":
-            emergency = await place_order_kucoin(session, symbol, "sell", coins_bought, use_funds=False)
-        elif buy_ex == "HTX":
-            if _htx_account_id_cache:
-                emergency = await place_order_htx(session, _htx_account_id_cache, symbol, "sell-market", coins_bought)
+        if emergency_qty > 0:
+            if buy_ex == "Binance":
+                emergency = await place_order_binance(session, symbol, "SELL", emergency_qty)
+            elif buy_ex == "KuCoin":
+                emergency = await place_order_kucoin(session, symbol, "sell", emergency_qty, use_funds=False)
+            elif buy_ex == "HTX":
+                if _htx_account_id_cache:
+                    emergency = await place_order_htx(session, _htx_account_id_cache, symbol, "sell-market", emergency_qty)
         return {
             "success": False, "error": f"sell_leg_failed_on_{sell_ex}",
             "emergency_close": bool(emergency),
             "buy_result": buy_result,
         }
 
-    return {"success": True, "buy_result": buy_result, "sell_result": sell_result, "vol": vol}
+    return {"success": True, "buy_result": buy_result, "sell_result": sell_result, "vol": vol,
+             "confirmed_qty": confirmed_qty}
 
 
 # =====================================================================
@@ -1487,7 +1810,13 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
             if not price:
                 continue
             excess_usd = value - coin_target
-            qty_to_sell = round(excess_usd / price, 6)
+            qty_to_sell_raw = excess_usd / price
+            # ТРЕБОВАНИЕ 4: та же защита, что и в арбитраже — округляем ВНИЗ
+            # под реальный шаг лота, иначе LOT_SIZE/precision-error как 30.07
+            qty_to_sell = qty_to_sell_raw if dry_run else \
+                await round_quantity_for_exchange(session, ex, sym, qty_to_sell_raw)
+            if not dry_run and qty_to_sell <= 0:
+                continue  # после округления продавать нечего — пропускаем
             result = "DRY_RUN" if dry_run else None
             if not dry_run:
                 if ex == "Binance":
@@ -2065,6 +2394,7 @@ async def handle_command(session, text, chat_id):
             f"/crosstransfer FROM TO СУММА — записать ручной перевод\n"
             f"/rebalancelive on|off — включить/выключить РЕАЛЬНЫЕ ордера ребаланса (по умолчанию OFF — только план)\n"
             f"/apistatus — не заблокирована ли какая-то биржа rate-limit'ом\n"
+            f"/realfees SYMBOL — подтянуть реальные комиссии аккаунта вместо дефолтных\n"
             f"/wsstatus — здоровье WebSocket-стаканов Binance\n"
             f"/setrebalance N — целевой запас (в лотах) на монету\n"
             f"/hours — активность по часам | /report — отчёт за день\n"
@@ -2413,6 +2743,22 @@ async def handle_command(session, text, chat_id):
     elif cmd == "/listcoins":
         await send_tg(session, f"💱 *Торгуемые монеты:* {', '.join(SYMBOLS)}\n\n"
                                 f"Добавить: `/addcoin SYMBOL`\nУдалить: `/removecoin SYMBOL`")
+
+    elif cmd == "/realfees":
+        if not SYMBOLS:
+            await send_tg(session, "Список монет пуст.")
+            return
+        sym = parts[1].upper() if len(parts) > 1 else SYMBOLS[0]
+        await send_tg(session, f"📡 Запрашиваю реальные комиссии для {sym} на трёх биржах...")
+        results = await refresh_real_fees(session, sym)
+        msg = f"💳 *РЕАЛЬНЫЕ КОМИССИИ ({sym})*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for ex, fee in results.items():
+            if fee is not None:
+                msg += f"✅ {ex}: {fee}% (было {FEES.get(ex, '?')}% → обновлено)\n"
+            else:
+                msg += f"⚠️ {ex}: не удалось получить, оставлена прежняя {FEES.get(ex)}%\n"
+        msg += f"\nТекущий FEES: {FEES}"
+        await send_tg(session, msg)
 
     elif cmd == "/apistatus":
         now = time.time()
