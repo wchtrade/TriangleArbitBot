@@ -51,7 +51,7 @@ config = {
                                        # только показывает план, не размещает ордера,
                                        # пока вы явно не отключите через /rebalancelive
     "real_trades_today":    0,
-    "max_real_trades_per_day": 20,  # доп. защита от разгона в реальном режиме
+    "max_real_trades_per_day": 200,  # поднято с 20 - для круглосуточной работы; /setmaxtrades меняет
 
     # ===== ЭТАП 4: ТРЕУГОЛЬНЫЙ АРБИТРАЖ =====
     "triangular_enabled": True,
@@ -1921,6 +1921,9 @@ def reset_daily():
         config["daily_loss"] = 0.0
         config["daily_profit"] = 0.0
         config["trading_active"] = True
+        config["real_trades_today"] = 0  # БАГ 31.07: раньше не сбрасывался вообще,
+                                           # после 20 сделок с момента старта бот
+                                           # навсегда блокировал реальную торговлю
 
 
 def can_trade() -> bool:
@@ -2360,8 +2363,23 @@ def format_rebalance_result(result: dict) -> str:
 
 
 def format_signal(opp: dict) -> str:
-    mode = "🔵 СИМУЛЯЦИЯ" if config["simulation_mode"] else "🔴 РЕАЛЬНАЯ"
-    derated = round(opp["profit_usdt"] * config["derating_factor"], 4)
+    is_real = not config["simulation_mode"]
+    mode = "🔴 РЕАЛЬНАЯ" if is_real else "🔵 СИМУЛЯЦИЯ"
+
+    if is_real:
+        profit_line = (
+            f"💰 Расчётная прибыль (до исполнения): `{opp['profit_usdt']} USDT`\n"
+            f"⚠️ Точная сумма зависит от факта исполнения — сверяйте с историей "
+            f"ордеров на бирже, это предварительный расчёт, не гарантированный результат.\n\n"
+        )
+    else:
+        derated = round(opp["profit_usdt"] * config["derating_factor"], 4)
+        profit_line = (
+            f"💰 Прибыль (симуляция): `{opp['profit_usdt']} USDT`\n"
+            f"💡 Реалистичная оценка (×{config['derating_factor']}): "
+            f"`~{derated} USDT`\n\n"
+        )
+
     return (
         f"🚨 *{opp['buy_ex']} → {opp['sell_ex']} | {opp['symbol']}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2374,9 +2392,7 @@ def format_signal(opp: dict) -> str:
         f"📊 После комиссий: `{opp['net_pct']}%`\n"
         f"⚠️ Наивный расчёт (top-of-book) переоценивал спред на: "
         f"`{opp['slippage_impact_pct']}%`\n\n"
-        f"💰 Прибыль (симуляция): `{opp['profit_usdt']} USDT`\n"
-        f"💡 Реалистичная оценка (×{config['derating_factor']}): "
-        f"`~{derated} USDT`\n\n"
+        f"{profit_line}"
         f"🕐 {opp['time']}"
     )
 
@@ -2412,6 +2428,7 @@ async def handle_command(session, text, chat_id):
             f"/wsstatus — здоровье WebSocket-стаканов Binance\n"
             f"/setrebalance N — целевой запас (в лотах) на монету\n"
             f"/setreallot N — снизить реальный лимит ордера (не выше $15)\n"
+            f"/setmaxtrades N — суточный лимит реальных сделок (сбрасывается каждый день)\n"
             f"/hours — активность по часам | /report — отчёт за день\n"
             f"/history — последние сделки | /csv — экспорт\n"
             f"/howtoread — как читать отчёты | /guide — инструкция\n"
@@ -2482,8 +2499,12 @@ async def handle_command(session, text, chat_id):
         pnl = round(total_bal - SIM_START, 2)
         per_trade = round(stats["profit"] / stats["trades"], 4) if stats["trades"] else 0
         wd = suggest_withdrawal()
+        mode_line = (f"🔴 РЕАЛЬНЫЙ | сделок сегодня: {config['real_trades_today']}/"
+                     f"{config['max_real_trades_per_day']}\n\n") if not config["simulation_mode"] else \
+                    "🔵 СИМУЛЯЦИЯ\n\n"
         await send_tg(session,
             f"📈 *СТАТИСТИКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{mode_line}"
             f"Сканов: {stats['scans']} | Сигналов: {stats['signals']} | Сделок: {stats['trades']}\n"
             f"Прибыль (сим.): {round(stats['profit'],2)} USDT | На сделку: ~{per_trade}\n"
             f"Реалистичная оценка (×{config['derating_factor']}): "
@@ -2670,6 +2691,22 @@ async def handle_command(session, text, chat_id):
             )
         except ValueError:
             await send_tg(session, "❌ Пример: `/setreallot 10`")
+
+    elif cmd == "/setmaxtrades":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущий суточный лимит реальных сделок: {config['max_real_trades_per_day']}\n"
+                f"Пример: `/setmaxtrades 200`\n\n"
+                f"⚠️ Раньше счётчик НЕ сбрасывался вообще — после 20 сделок с момента "
+                f"старта бот навсегда блокировал торговлю. Теперь исправлено: "
+                f"сбрасывается каждые сутки автоматически."
+            )
+            return
+        try:
+            config["max_real_trades_per_day"] = int(parts[1])
+            await send_tg(session, f"✅ Суточный лимит: {config['max_real_trades_per_day']} сделок")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setmaxtrades 200`")
 
     elif cmd == "/mode":
         if config["simulation_mode"]:
@@ -2876,24 +2913,52 @@ async def handle_command(session, text, chat_id):
         if not today_trades:
             await send_tg(session, "📋 Нет сделок за сегодня.")
             return
-        total = sum(t["profit_usdt"] for t in today_trades)
-        wins = sum(1 for t in today_trades if t["profit_usdt"] > 0)
-        sym_profit, pair_profit = defaultdict(float), defaultdict(float)
-        for t in today_trades:
-            sym_profit[t["symbol"]] += t["profit_usdt"]
-            pair_profit[f"{t['buy_ex']}→{t['sell_ex']}"] += t["profit_usdt"]
-        msg = (
-            f"📋 *ОТЧЁТ — {today}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ Сделок: {len(today_trades)}\n"
-            f"💰 Прибыль (сим.): {round(total, 4)} USDT\n"
-            f"💡 Реалистично (×{config['derating_factor']}): {round(total*config['derating_factor'], 4)} USDT\n"
-            f"📈 Прибыльных: {wins}/{len(today_trades)}\n\n💱 *По монетам:*\n"
-        )
-        for sym, p in sorted(sym_profit.items(), key=lambda x: x[1], reverse=True):
-            msg += f"   {sym}: {'+' if p>=0 else ''}{round(p, 4)} USDT\n"
-        msg += "\n🔀 *По парам:*\n"
-        for pair, p in sorted(pair_profit.items(), key=lambda x: x[1], reverse=True):
-            msg += f"   {pair}: {'+' if p>=0 else ''}{round(p, 4)} USDT\n"
+
+        real_trades = [t for t in today_trades if t.get("mode") == "REAL"]
+        sim_trades = [t for t in today_trades if t.get("mode") == "SIM"]
+        msg = f"📋 *ОТЧЁТ — {today}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        if real_trades:
+            total_real = sum(t["profit_usdt"] for t in real_trades)
+            wins_real = sum(1 for t in real_trades if t["profit_usdt"] > 0)
+            sym_profit, pair_profit = defaultdict(float), defaultdict(float)
+            for t in real_trades:
+                sym_profit[t["symbol"]] += t["profit_usdt"]
+                pair_profit[f"{t['buy_ex']}→{t['sell_ex']}"] += t["profit_usdt"]
+            msg += (
+                f"🔴 *РЕАЛЬНЫЕ СДЕЛКИ*\n"
+                f"✅ Сделок: {len(real_trades)}\n"
+                f"💰 Расчётная прибыль (по цифрам до исполнения): {round(total_real, 4)} USDT\n"
+                f"⚠️ Точные цифры — только в истории ордеров бирж, здесь предварительный расчёт\n"
+                f"📈 Прибыльных (по расчёту): {wins_real}/{len(real_trades)}\n\n💱 По монетам:\n"
+            )
+            for sym, p in sorted(sym_profit.items(), key=lambda x: x[1], reverse=True):
+                msg += f"   {sym}: {'+' if p>=0 else ''}{round(p, 4)} USDT\n"
+            msg += "🔀 По парам:\n"
+            for pair, p in sorted(pair_profit.items(), key=lambda x: x[1], reverse=True):
+                msg += f"   {pair}: {'+' if p>=0 else ''}{round(p, 4)} USDT\n"
+            msg += "\n"
+
+        if sim_trades:
+            total_sim = sum(t["profit_usdt"] for t in sim_trades)
+            wins_sim = sum(1 for t in sim_trades if t["profit_usdt"] > 0)
+            sym_profit, pair_profit = defaultdict(float), defaultdict(float)
+            for t in sim_trades:
+                sym_profit[t["symbol"]] += t["profit_usdt"]
+                pair_profit[f"{t['buy_ex']}→{t['sell_ex']}"] += t["profit_usdt"]
+            msg += (
+                f"🔵 *СИМУЛЯЦИЯ*\n"
+                f"✅ Сделок: {len(sim_trades)}\n"
+                f"💰 Прибыль (сим.): {round(total_sim, 4)} USDT\n"
+                f"💡 Реалистично (×{config['derating_factor']}): {round(total_sim*config['derating_factor'], 4)} USDT\n"
+                f"📈 Прибыльных: {wins_sim}/{len(sim_trades)}\n\n💱 По монетам:\n"
+            )
+            for sym, p in sorted(sym_profit.items(), key=lambda x: x[1], reverse=True):
+                msg += f"   {sym}: {'+' if p>=0 else ''}{round(p, 4)} USDT\n"
+            msg += "🔀 По парам:\n"
+            for pair, p in sorted(pair_profit.items(), key=lambda x: x[1], reverse=True):
+                msg += f"   {pair}: {'+' if p>=0 else ''}{round(p, 4)} USDT\n"
+
         await send_tg(session, msg)
 
     elif cmd == "/hours":
