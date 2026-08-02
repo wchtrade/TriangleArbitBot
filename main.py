@@ -51,6 +51,7 @@ config = {
                                        # только показывает план, не размещает ордера,
                                        # пока вы явно не отключите через /rebalancelive
     "real_trades_today":    0,
+    "real_start_capital":   None,  # фиксируется командой /setrealstart, для честного P&L в реальном режиме
     "max_real_trades_per_day": 200,  # поднято с 20 - для круглосуточной работы; /setmaxtrades меняет
 
     # ===== ЭТАП 4: ТРЕУГОЛЬНЫЙ АРБИТРАЖ =====
@@ -1771,6 +1772,27 @@ async def get_valuation_price(session, ex: str, symbol: str) -> Optional[float]:
     return ob["bids"][0][0]
 
 
+async def get_total_real_capital(session) -> Optional[dict]:
+    """Реальный совокупный капитал на всех трёх биржах — используется в /stats
+    вместо симуляционного SIM_START/sim_balances, когда бот в реальном режиме."""
+    per_exchange = {}
+    total = 0.0
+    for ex in ["Binance", "KuCoin", "HTX"]:
+        balances = await get_real_balances(session, ex)
+        if balances is None:
+            return None
+        ex_total = balances.get("USDT", 0.0)
+        for sym in SYMBOLS:
+            qty = balances.get(sym, 0.0)
+            if qty > 0:
+                price = await get_valuation_price(session, ex, sym)
+                if price:
+                    ex_total += qty * price
+        per_exchange[ex] = round(ex_total, 2)
+        total += ex_total
+    return {"total": round(total, 2), "per_exchange": per_exchange}
+
+
 async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
     """Реальный аналог exchange_rebalance_plan — читает ФАКТИЧЕСКИЕ балансы
     с биржи через API, а не виртуальный sim_balances."""
@@ -1824,7 +1846,26 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
             if not price:
                 continue
             excess_usd = value - coin_target
+            # ПРЕДОХРАНИТЕЛЬ 01.08: circuit breaker против ошибки расчёта —
+            # ребаланс НИКОГДА не продаёт больше 3x реального лимита ордера
+            # за одну операцию, даже если формула выше почему-то посчитала больше.
+            max_single_sell_usd = config["max_real_order_usdt"] * 3
+            if excess_usd > max_single_sell_usd:
+                logger.error(f"⚠️ РЕБАЛАНС {ex}/{sym}: расчётный излишек ${excess_usd:.2f} "
+                              f"превышает потолок ${max_single_sell_usd} — ограничиваю, "
+                              f"это подозрительно большая цифра для одного ребаланса")
+                if CHAT_ID:
+                    await send_tg(session,
+                        f"⚠️ *ПРЕДОХРАНИТЕЛЬ СРАБОТАЛ*\n\n"
+                        f"Ребаланс {ex}/{sym} рассчитал излишек ${excess_usd:.2f} к продаже — "
+                        f"это подозрительно много (больше ${max_single_sell_usd}). "
+                        f"Продажа ограничена этим потолком вместо полной суммы. "
+                        f"Проверьте баланс {ex} вручную после исполнения.")
+                excess_usd = max_single_sell_usd
             qty_to_sell_raw = excess_usd / price
+            # ВТОРОЙ ПРЕДОХРАНИТЕЛЬ: физически нельзя продать больше, чем реально
+            # есть на балансе — даже если выше в расчётах где-то ошибка
+            qty_to_sell_raw = min(qty_to_sell_raw, qty * 0.98)  # 2% запас на комиссию/округление
             # ТРЕБОВАНИЕ 4: та же защита, что и в арбитраже — округляем ВНИЗ
             # под реальный шаг лота, иначе LOT_SIZE/precision-error как 30.07
             qty_to_sell = qty_to_sell_raw if dry_run else \
@@ -2429,6 +2470,8 @@ async def handle_command(session, text, chat_id):
             f"/setrebalance N — целевой запас (в лотах) на монету\n"
             f"/setreallot N — снизить реальный лимит ордера (не выше $15)\n"
             f"/setmaxtrades N — суточный лимит реальных сделок (сбрасывается каждый день)\n"
+            f"/realbalance — точный разбор реального баланса и плана ребаланса по каждой бирже\n"
+            f"/setrealstart — зафиксировать стартовый реальный капитал для честного P&L\n"
             f"/hours — активность по часам | /report — отчёт за день\n"
             f"/history — последние сделки | /csv — экспорт\n"
             f"/howtoread — как читать отчёты | /guide — инструкция\n"
@@ -2495,16 +2538,52 @@ async def handle_command(session, text, chat_id):
                         f"пропущено: {reason}")
 
     elif cmd == "/stats":
+        per_trade = round(stats["profit"] / stats["trades"], 4) if stats["trades"] else 0
+
+        if not config["simulation_mode"]:
+            # РЕАЛЬНЫЙ РЕЖИМ — честные цифры с бирж, не симуляционные
+            await send_tg(session, "📡 Читаю реальный баланс с трёх бирж...")
+            real = await get_total_real_capital(session)
+            if real is None:
+                balance_block = "⚠️ Не удалось прочитать реальный баланс — см. /realbalance для деталей.\n"
+            else:
+                per_ex = " | ".join(f"{ex}: ${v}" for ex, v in real["per_exchange"].items())
+                if config["real_start_capital"]:
+                    pnl_real = round(real["total"] - config["real_start_capital"], 2)
+                    balance_block = (
+                        f"💵 Реальный баланс: ${real['total']} ({per_ex})\n"
+                        f"   Старт (зафиксирован): ${config['real_start_capital']} | "
+                        f"P&L: {pnl_real:+.2f}\n"
+                    )
+                else:
+                    balance_block = (
+                        f"💵 Реальный баланс: ${real['total']} ({per_ex})\n"
+                        f"   💡 Стартовая точка не зафиксирована — `/setrealstart` "
+                        f"чтобы считать P&L честно\n"
+                    )
+            await send_tg(session,
+                f"📈 *СТАТИСТИКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🔴 РЕАЛЬНЫЙ | сделок сегодня: {config['real_trades_today']}/"
+                f"{config['max_real_trades_per_day']}\n\n"
+                f"Сканов: {stats['scans']} | Сигналов: {stats['signals']} | "
+                f"Реальных сделок исполнено: {stats['trades']}\n\n"
+                f"⚠️ *Отказы API стакана:*\n"
+                f"   Binance: {stats['depth_fail']['Binance']}\n"
+                f"   KuCoin: {stats['depth_fail']['KuCoin']}\n"
+                f"   HTX: {stats['depth_fail']['HTX']}\n\n"
+                f"{balance_block}\n"
+                f"⚙️ Реальный лимит ордера: ${config['max_real_order_usdt']} | "
+                f"Порог: {config['min_profit_pct']}%"
+            )
+            return
+
+        # СИМУЛЯЦИЯ — как раньше
         total_bal = get_balance_usdt()
         pnl = round(total_bal - SIM_START, 2)
-        per_trade = round(stats["profit"] / stats["trades"], 4) if stats["trades"] else 0
         wd = suggest_withdrawal()
-        mode_line = (f"🔴 РЕАЛЬНЫЙ | сделок сегодня: {config['real_trades_today']}/"
-                     f"{config['max_real_trades_per_day']}\n\n") if not config["simulation_mode"] else \
-                    "🔵 СИМУЛЯЦИЯ\n\n"
         await send_tg(session,
             f"📈 *СТАТИСТИКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{mode_line}"
+            f"🔵 СИМУЛЯЦИЯ\n\n"
             f"Сканов: {stats['scans']} | Сигналов: {stats['signals']} | Сделок: {stats['trades']}\n"
             f"Прибыль (сим.): {round(stats['profit'],2)} USDT | На сделку: ~{per_trade}\n"
             f"Реалистичная оценка (×{config['derating_factor']}): "
@@ -2708,6 +2787,18 @@ async def handle_command(session, text, chat_id):
         except ValueError:
             await send_tg(session, "❌ Пример: `/setmaxtrades 200`")
 
+    elif cmd == "/setrealstart":
+        await send_tg(session, "📡 Читаю реальный баланс для фиксации стартовой точки...")
+        real = await get_total_real_capital(session)
+        if real is None:
+            await send_tg(session, "🔴 Не удалось прочитать баланс. Попробуйте /realbalance для диагностики.")
+            return
+        config["real_start_capital"] = real["total"]
+        await send_tg(session,
+            f"✅ Стартовая точка зафиксирована: ${real['total']}\n"
+            f"Дальше `/stats` будет честно считать P&L от этой суммы."
+        )
+
     elif cmd == "/mode":
         if config["simulation_mode"]:
             # Переход в реальный режим — только если гейт уже пройден
@@ -2839,6 +2930,26 @@ async def handle_command(session, text, chat_id):
                 msg += f"⚠️ {ex}: не удалось получить, оставлена прежняя {FEES.get(ex)}%\n"
         msg += f"\nТекущий FEES: {FEES}"
         await send_tg(session, msg)
+
+    elif cmd == "/realbalance":
+        await send_tg(session, "📡 Читаю реальные балансы и считаю план по каждой бирже...")
+        for ex in ["Binance", "KuCoin", "HTX"]:
+            plan = await real_exchange_rebalance_plan(session, ex)
+            if plan is None:
+                await send_tg(session, f"🔴 *{ex}*: не удалось получить баланс")
+                continue
+            msg = (
+                f"📊 *{ex}*\n"
+                f"   USDT: ${plan['usdt_balance']}\n"
+            )
+            for sym, val in plan["coin_values"].items():
+                qty = plan["balances_qty"].get(sym, 0)
+                msg += f"   {sym}: {qty} шт ≈ ${val}\n"
+            msg += (
+                f"   Всего: ${plan['total_usd']} | Нужно: ${plan['needed_total']} | "
+                f"Излишек/дефицит: ${plan['surplus']}\n"
+            )
+            await send_tg(session, msg)
 
     elif cmd == "/apistatus":
         now = time.time()
