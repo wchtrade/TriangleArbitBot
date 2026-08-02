@@ -1828,6 +1828,12 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
     }
 
 
+MIN_ORDER_VALUE_USD = {"Binance": 5.0, "KuCoin": 1.0, "HTX": 10.0}  # НАХОДКА 02.08:
+# HTX отклоняет любой ордер дешевле $10 ("order-value-min-error") — именно
+# поэтому ребаланс молча не мог докупить ZK на HTX, когда цель ($10) была
+# впритык к минимуму: нужная докупка ($9.92) оказывалась ЧУТЬ ниже порога.
+
+
 async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> dict:
     """Продаёт излишек монет в USDT, докупает дефицитные — РЕАЛЬНЫМИ ордерами.
     Вызывать только когда plan['surplus'] >= 0 (иначе останется дефицит).
@@ -1837,6 +1843,7 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
     actions = []
     coin_target = plan["coin_target_usd"]
     threshold = 1.0  # не гоняем ребаланс из-за $1 — комиссия того не стоит
+    min_order = MIN_ORDER_VALUE_USD.get(ex, 5.0)
 
     # Сначала продажи — освобождаем USDT для последующих покупок
     for sym, value in plan["coin_values"].items():
@@ -1862,6 +1869,14 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
                         f"Продажа ограничена этим потолком вместо полной суммы. "
                         f"Проверьте баланс {ex} вручную после исполнения.")
                 excess_usd = max_single_sell_usd
+            # НАХОДКА 02.08: если излишек меньше минимума биржи — биржа откажет.
+            # Продаём ВЕСЬ остаток (не только излишек), если после этого не
+            # уйдём в серьёзный дефицит, иначе пропускаем это действие вовсе.
+            if excess_usd < min_order:
+                if value >= min_order:
+                    excess_usd = value  # продаём всё — проще, чем мучить биржу микросуммой
+                else:
+                    continue  # даже вся позиция меньше минимума биржи — нечего продавать
             qty_to_sell_raw = excess_usd / price
             # ВТОРОЙ ПРЕДОХРАНИТЕЛЬ: физически нельзя продать больше, чем реально
             # есть на балансе — даже если выше в расчётах где-то ошибка
@@ -1888,6 +1903,16 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
     for sym, value in plan["coin_values"].items():
         if value < coin_target - threshold:
             deficit_usd = round(coin_target - value, 2)
+            # НАХОДКА 02.08: та же проблема, что и с продажей — если нужная
+            # докупка меньше минимума биржи ($10 у HTX), ордер будет отклонён.
+            # Поднимаем до минимума биржи (с небольшим запасом), если хватает
+            # свободного USDT; иначе честно пропускаем это действие.
+            if deficit_usd < min_order:
+                bumped = min_order * 1.02  # 2% запас, чтобы не упереться в минимум ещё раз
+                if plan["usdt_balance"] >= bumped:
+                    deficit_usd = round(bumped, 2)
+                else:
+                    continue  # даже минимума биржи не хватает свободного USDT — пропускаем
             result = "DRY_RUN" if dry_run else None
             if not dry_run:
                 if ex == "Binance":
