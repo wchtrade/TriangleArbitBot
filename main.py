@@ -76,7 +76,16 @@ SYMBOLS = ["BONK", "SEI", "FET", "INJ"]   # теперь можно менять
 QUOTE   = "USDT"
 BRIDGE  = "BTC"   # мост для треугольного арбитража: USDT -> COIN -> BTC -> USDT
 PAIRS   = [
-    ("HTX",     "KuCoin"),
+    # ("HTX",     "KuCoin"),  # ОТКЛЮЧЕНО 04.08 по вашему выбору: HTX больше
+    # не покупает — только продаёт (в двух парах ниже). Раньше HTX должна
+    # была одновременно держать резерв USDT (для покупки здесь) И резерв
+    # монеты (для продажи в паре ниже) с общим капиталом ~$20, из-за чего
+    # регулярно не хватало буквально центов на нужный лот. Без этой пары
+    # HTX нужно держать только резерв монеты (~$10.5 при лоте $10 и запасе
+    # 5%) — при её балансе ~$20 это огромный запас, разрыв больше не
+    # возникнет. Минус — на один канал сигналов меньше. Верните строку,
+    # если решите вернуть эту пару обратно (и не забудьте снова докинуть
+    # капитал на HTX под обе роли).
     ("KuCoin",  "HTX"),
     ("Binance", "HTX"),
 ]
@@ -1997,34 +2006,45 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
     usdt_target = real_lot * lots
 
     sell_exchanges = get_sell_exchanges()
+    is_sell_ex = ex in sell_exchanges
+
+    # ИСПРАВЛЕНИЕ 04.08 (раунд 7): раньше coin_values считался ТОЛЬКО для
+    # бирж, которые сейчас числятся в sell_exchanges — если убрать биржу из
+    # этой роли (например, изменив PAIRS), любая монета, оставшаяся на ней с
+    # прошлого раза, становилась НЕВИДИМОЙ для расчёта total_usd (баланс
+    # занижался) и никогда не продавалась обратно в USDT — "мёртвый" остаток,
+    # та же ловушка, что раньше чинили только вручную через /removecoin.
+    # Теперь стоимость ВСЕЙ имеющейся монеты считается всегда (для честного
+    # total_usd), а целевой резерв (coin_target) требуется только там, где
+    # биржа ДЕЙСТВИТЕЛЬНО продаёт — для всех остальных случаев target = 0,
+    # то есть любая монета сверху сразу считается "излишком" и уходит в
+    # USDT на ближайшем /rebalance, как и должно быть.
     coin_values: Dict[str, float] = {}
-    if ex in sell_exchanges:
-        for sym in SYMBOLS:
-            qty = balances.get(sym, 0.0)
-            if qty <= 0:
-                coin_values[sym] = 0.0
-                continue
-            price = await get_valuation_price(session, ex, sym)
-            coin_values[sym] = round(qty * price, 4) if price else 0.0
+    for sym in SYMBOLS:
+        qty = balances.get(sym, 0.0)
+        if qty <= 0:
+            continue
+        price = await get_valuation_price(session, ex, sym)
+        if price:
+            coin_values[sym] = round(qty * price, 4)
 
     usdt_balance = balances.get("USDT", 0.0)
     total_usd = usdt_balance + sum(coin_values.values())
-    # ИСПРАВЛЕНИЕ 04.08 (раунд 6): раньше needed_total считался БЕЗ запаса
-    # ребаланса (headroom), хотя реальная докупка монеты внутри
-    # apply_real_intra_exchange_rebalance целится именно в target×(1+headroom).
-    # Из-за этого рассинхрона план мог считать биржу "в целом сбалансированной"
-    # (surplus близко к нулю), хотя по факту для покупки нужного лота реально
-    # не хватало — и preflight-проверка внутри самой сделки (у неё свой,
-    # отдельный и корректный буфер) каждый раз честно отказывала. Теперь оба
-    # расчёта используют один и тот же целевой запас.
+    # usdt_target требуется ТОЛЬКО если биржа реально покупает (buy_ex хоть
+    # в одной паре) — иначе это лишнее требование к капиталу без всякой
+    # торговой необходимости.
+    buy_exchanges = get_buy_exchanges()
+    effective_usdt_target = usdt_target if ex in buy_exchanges else 0.0
+    effective_coin_target = coin_target_usd if is_sell_ex else 0.0
     headroom_mult = 1 + config["rebalance_headroom_pct"] / 100
-    needed_total = usdt_target + (coin_target_usd * headroom_mult) * len(coin_values)
+    coin_reserve_syms = len(coin_values) if is_sell_ex else 0
+    needed_total = effective_usdt_target + (coin_target_usd * headroom_mult) * coin_reserve_syms
 
     return {
         "exchange": ex, "balances_qty": balances, "coin_values": coin_values,
         "usdt_balance": round(usdt_balance, 2), "total_usd": round(total_usd, 2),
         "needed_total": round(needed_total, 2), "surplus": round(total_usd - needed_total, 2),
-        "coin_target_usd": coin_target_usd, "usdt_target": usdt_target,
+        "coin_target_usd": effective_coin_target, "usdt_target": effective_usdt_target,
     }
 
 
@@ -2294,6 +2314,16 @@ def get_sell_exchanges() -> set:
     (Binance→HTX) и никогда не продаёт — значит ей монеты вообще не нужны,
     любые монеты, осевшие там после покупки, должны сразу уходить в USDT."""
     return {sell_ex for _, sell_ex in PAIRS}
+
+
+def get_buy_exchanges() -> set:
+    """ИСПРАВЛЕНИЕ 04.08 (раунд 6, симметрично get_sell_exchanges): биржи,
+    которые хоть раз выступают buy_ex в PAIRS — только им реально нужен
+    резерв USDT под покупку. Раньше needed_total требовал держать usdt_target
+    ($10+) на КАЖДОЙ бирже безусловно, даже если у неё в PAIRS нет ни одной
+    роли покупателя — это лишняя, ничем не обоснованная нагрузка на капитал
+    именно на той бирже, где он и так разрывается между двумя ролями."""
+    return {buy_ex for buy_ex, _ in PAIRS}
 
 
 def exchange_rebalance_plan(ex: str) -> dict:
