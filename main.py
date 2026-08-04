@@ -68,6 +68,13 @@ config = {
     # проверка), плюс добавлена мгновенная точечная докупка нехватки.
     "balance_safety_buffer_pct": 1.0,   # % запас, который ТРЕБУЕТ preflight-проверка перед сделкой
     "rebalance_headroom_pct":    15.0,  # % запас, который ЦЕЛЕНАПРАВЛЕННО держит ребаланс (должен быть заметно больше buffer_pct)
+    "rebalance_headroom_overrides": {"HTX": 3.0},  # НОВОЕ 04.08: персональный % запаса для
+        # конкретной биржи вместо общего rebalance_headroom_pct. HTX играет
+        # ДВЕ роли (покупает в одной паре, продаёт в двух других) на
+        # ограниченном капитале — стандартный общий запас (15%) там просто
+        # физически не помещается. Здесь можно точечно снизить требование
+        # именно для неё, не трогая безопасный запас на остальных биржах.
+        # Меняется командой /setheadroomex БИРЖА N.
 }
 
 CONFIRM_PHRASE = "YES-I-UNDERSTAND-THE-RISK"
@@ -76,16 +83,7 @@ SYMBOLS = ["BONK", "SEI", "FET", "INJ"]   # теперь можно менять
 QUOTE   = "USDT"
 BRIDGE  = "BTC"   # мост для треугольного арбитража: USDT -> COIN -> BTC -> USDT
 PAIRS   = [
-    # ("HTX",     "KuCoin"),  # ОТКЛЮЧЕНО 04.08 по вашему выбору: HTX больше
-    # не покупает — только продаёт (в двух парах ниже). Раньше HTX должна
-    # была одновременно держать резерв USDT (для покупки здесь) И резерв
-    # монеты (для продажи в паре ниже) с общим капиталом ~$20, из-за чего
-    # регулярно не хватало буквально центов на нужный лот. Без этой пары
-    # HTX нужно держать только резерв монеты (~$10.5 при лоте $10 и запасе
-    # 5%) — при её балансе ~$20 это огромный запас, разрыв больше не
-    # возникнет. Минус — на один канал сигналов меньше. Верните строку,
-    # если решите вернуть эту пару обратно (и не забудьте снова докинуть
-    # капитал на HTX под обе роли).
+    ("HTX",     "KuCoin"),
     ("KuCoin",  "HTX"),
     ("Binance", "HTX"),
 ]
@@ -129,6 +127,8 @@ stats = {
     "symbol_stats": {s: 0 for s in SYMBOLS},
     "depth_fail":   {"Binance": 0, "KuCoin": 0, "HTX": 0},  # счётчик отказов стакана
     "insufficient_liquidity": 0,  # сколько раз стакана не хватило на объём
+    "volume_fetch_fail": 0,  # НОВОЕ 04.08: сколько раз не удалось получить 24h-объём с Binance
+                              # (раньше это было полностью невидимо и тихо блокировало ВСЕ сигналы)
     "insufficient_balance_skips": 0,  # сколько раз симуляция честно отказала из-за нехватки виртуального баланса
     "hourly_signals": defaultdict(int),
     "hourly_profit":  defaultdict(float),
@@ -751,27 +751,50 @@ async def get_orderbook_htx(session, symbol: str) -> Optional[Dict]:
 
 
 async def get_24h_volume(session) -> Dict[str, float]:
-    """Отдельно берём 24h объём с Binance (для фильтра ликвидности,
-    как и раньше — это не заменяет реальную глубину, а дополняет её)."""
+    """ИСПРАВЛЕНИЕ 04.08 (раунд 8): раньше запрашивался ПОЛНЫЙ тикер по ВСЕМ
+    парам Binance (без фильтра по символу) — это огромный ответ (тысячи
+    пар), и при таймауте 8 сек запрос регулярно не успевал на медленной сети
+    Railway. Исключение тихо ловилось и логировалось только в Railway-логи —
+    ни в Telegram, ни в /stats это никак не было видно. В результате
+    coin_volumes оставался пустым, и calc_arb_real() отбрасывал АБСОЛЮТНО
+    ВСЕ сигналы на первой же строке (0 < min_volume_usdt), без единого следа
+    в статистике — то, что и произошло: /top показывал "нет данных" при
+    полностью исправных стаканах на всех трёх биржах.
+    Теперь запрашиваем объём ТОЧЕЧНО по каждому нужному символу (маленький
+    быстрый ответ, параллельно), и любой сбой инкрементирует видимый
+    счётчик stats['volume_fetch_fail']."""
     volumes = {}
     if is_backed_off("Binance"):
         return volumes
-    try:
-        async with session.get(
-            "https://api.binance.com/api/v3/ticker/24hr",
-            timeout=aiohttp.ClientTimeout(total=8)
-        ) as r:
-            if r.status in (429, 418):
-                trigger_backoff("Binance", r.status, r.headers.get("Retry-After"))
-                return volumes
-            for item in await r.json():
-                sym = item.get("symbol", "")
-                if sym.endswith(QUOTE):
-                    base = sym[:-len(QUOTE)]
-                    if base in SYMBOLS:
-                        volumes[base] = float(item.get("quoteVolume", 0) or 0)
-    except Exception as e:
-        logger.error(f"Volume fetch: {e}")
+
+    async def fetch_one(sym: str) -> Tuple[str, Optional[float]]:
+        try:
+            async with session.get(
+                "https://api.binance.com/api/v3/ticker/24hr",
+                params={"symbol": f"{sym}{QUOTE}"},
+                timeout=aiohttp.ClientTimeout(total=6)
+            ) as r:
+                if r.status in (429, 418):
+                    trigger_backoff("Binance", r.status, r.headers.get("Retry-After"))
+                    return sym, None
+                if r.status != 200:
+                    return sym, None
+                data = await r.json()
+                return sym, float(data.get("quoteVolume", 0) or 0)
+        except Exception as e:
+            logger.error(f"Volume fetch {sym}: {e}")
+            return sym, None
+
+    results = await asyncio.gather(*[fetch_one(s) for s in SYMBOLS], return_exceptions=True)
+    for res in results:
+        if isinstance(res, Exception):
+            stats["volume_fetch_fail"] = stats.get("volume_fetch_fail", 0) + 1
+            continue
+        sym, vol = res
+        if vol is None:
+            stats["volume_fetch_fail"] = stats.get("volume_fetch_fail", 0) + 1
+        else:
+            volumes[sym] = vol
     return volumes
 
 
@@ -966,7 +989,18 @@ async def scan_triangles(session) -> List[dict]:
 
 def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob: Dict,
                    trade_usdt: float) -> Optional[dict]:
-    if coin_volumes.get(symbol, 0) < config["min_volume_usdt"]:
+    # ИСПРАВЛЕНИЕ 04.08 (раунд 8): раньше отсутствие данных об объёме
+    # (coin_volumes.get(symbol, 0) == 0 из-за сбоя get_24h_volume) трактовалось
+    # как "объём заведомо мал" и БЕЗ следа в статистике отбрасывало сигнал.
+    # Реальная ликвидность и так честно проверяется чуть ниже через
+    # walk-the-book (fully_filled) — это первичная и куда более надёжная
+    # проверка. 24h-объём — вторичный, вспомогательный фильтр. Поэтому
+    # теперь он блокирует сигнал ТОЛЬКО если данные реально есть и объём
+    # реально ниже порога; отсутствие данных (символ не значится в
+    # coin_volumes вообще) сигнал не блокирует, а полагается на реальную
+    # глубину стакана ниже.
+    known_volume = coin_volumes.get(symbol)
+    if known_volume is not None and known_volume < config["min_volume_usdt"]:
         return None
 
     buy_fill  = walk_the_book(buy_ob["asks"], trade_usdt)
@@ -2036,7 +2070,7 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
     buy_exchanges = get_buy_exchanges()
     effective_usdt_target = usdt_target if ex in buy_exchanges else 0.0
     effective_coin_target = coin_target_usd if is_sell_ex else 0.0
-    headroom_mult = 1 + config["rebalance_headroom_pct"] / 100
+    headroom_mult = 1 + get_headroom_pct(ex) / 100
     coin_reserve_syms = len(coin_values) if is_sell_ex else 0
     needed_total = effective_usdt_target + (coin_target_usd * headroom_mult) * coin_reserve_syms
 
@@ -2127,7 +2161,7 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
     buy_threshold = 0.30
     for sym, value in plan["coin_values"].items():
         if value < coin_target - buy_threshold:
-            headroom_mult = 1 + config["rebalance_headroom_pct"] / 100
+            headroom_mult = 1 + get_headroom_pct(ex) / 100
             effective_target = coin_target * headroom_mult
             deficit_usd = round(effective_target - value, 2)
             # НАХОДКА 02.08: та же проблема, что и с продажей — если нужная
@@ -2324,6 +2358,15 @@ def get_buy_exchanges() -> set:
     роли покупателя — это лишняя, ничем не обоснованная нагрузка на капитал
     именно на той бирже, где он и так разрывается между двумя ролями."""
     return {buy_ex for buy_ex, _ in PAIRS}
+
+
+def get_headroom_pct(ex: str) -> float:
+    """НОВОЕ 04.08 (раунд 9): персональный % запаса для конкретной биржи,
+    если задан в rebalance_headroom_overrides — иначе общий config
+    rebalance_headroom_pct. Нужно для бирж с двойной ролью (одновременно
+    покупают и продают) на ограниченном капитале — им физически не хватает
+    места под стандартный общий запас."""
+    return config["rebalance_headroom_overrides"].get(ex, config["rebalance_headroom_pct"])
 
 
 def exchange_rebalance_plan(ex: str) -> dict:
@@ -2814,7 +2857,8 @@ async def handle_command(session, text, chat_id):
                 f"Бирж онлайн: {', '.join(active) if active else 'ни одной!'}\n"
                 f"Отказов стакана: Binance={stats['depth_fail']['Binance']} "
                 f"KuCoin={stats['depth_fail']['KuCoin']} HTX={stats['depth_fail']['HTX']}\n"
-                f"Недостаточно ликвидности (за всё время): {stats['insufficient_liquidity']}"
+                f"Недостаточно ликвидности (за всё время): {stats['insufficient_liquidity']}\n"
+                f"Сбоев получения 24h-объёма: {stats.get('volume_fetch_fail', 0)}"
             )
         else:
             await send_tg(session, f"✅ {len(signals)} валидных сигналов (после проверки реальной глубины)!")
@@ -2861,7 +2905,8 @@ async def handle_command(session, text, chat_id):
                 f"⚠️ *Отказы API стакана:*\n"
                 f"   Binance: {stats['depth_fail']['Binance']}\n"
                 f"   KuCoin: {stats['depth_fail']['KuCoin']}\n"
-                f"   HTX: {stats['depth_fail']['HTX']}\n\n"
+                f"   HTX: {stats['depth_fail']['HTX']}\n"
+                f"   Сбоев 24h-объёма: {stats.get('volume_fetch_fail', 0)}\n\n"
                 f"🔧 Автодокупок при нехватке баланса: {stats['topup_success']}/{stats['topup_attempts']}\n\n"
                 f"{balance_block}\n"
                 f"⚙️ Реальный лимит ордера: ${config['max_real_order_usdt']} | "
@@ -3061,12 +3106,14 @@ async def handle_command(session, text, chat_id):
 
     elif cmd == "/setheadroom":
         if len(parts) < 2:
+            overrides_str = ", ".join(f"{ex}={v}%" for ex, v in config["rebalance_headroom_overrides"].items()) or "нет"
             await send_tg(session,
-                f"Текущий запас, который держит ребаланс сверх номинальной цели: "
-                f"{config['rebalance_headroom_pct']}%\n\n"
+                f"Текущий ОБЩИЙ запас ребаланса: {config['rebalance_headroom_pct']}%\n"
+                f"Персональные переопределения по биржам: {overrides_str}\n\n"
                 f"Должен быть заметно БОЛЬШЕ, чем `/setbalancebuffer` — иначе баланс "
                 f"после ребаланса снова окажется впритык к порогу проверки.\n\n"
-                f"Пример: `/setheadroom 15`"
+                f"Пример: `/setheadroom 15`\n"
+                f"Для отдельной биржи: `/setheadroomex HTX 3`"
             )
             return
         try:
@@ -3075,9 +3122,39 @@ async def handle_command(session, text, chat_id):
                 await send_tg(session, "❌ Разумный диапазон: 0–100%.")
                 return
             config["rebalance_headroom_pct"] = val
-            await send_tg(session, f"✅ Запас ребаланса: {val}%")
+            await send_tg(session, f"✅ Общий запас ребаланса: {val}%")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setheadroom 15`")
+
+    elif cmd == "/setheadroomex":
+        if len(parts) < 3:
+            overrides_str = ", ".join(f"{ex}={v}%" for ex, v in config["rebalance_headroom_overrides"].items()) or "нет"
+            await send_tg(session,
+                f"Персональные переопределения запаса ребаланса по биржам: {overrides_str}\n\n"
+                f"Нужно для бирж с двойной ролью (одновременно покупают и продают) на "
+                f"ограниченном капитале — общий запас там физически не помещается.\n\n"
+                f"Пример: `/setheadroomex HTX 3` — поставить HTX персональный запас 3%\n"
+                f"`/setheadroomex HTX reset` — убрать переопределение, вернуть общий запас"
+            )
+            return
+        ex_name = parts[1]
+        if ex_name not in ("Binance", "KuCoin", "HTX"):
+            await send_tg(session, "❌ Биржа должна быть одной из: Binance, KuCoin, HTX")
+            return
+        if parts[2].lower() == "reset":
+            config["rebalance_headroom_overrides"].pop(ex_name, None)
+            await send_tg(session, f"✅ Переопределение для {ex_name} снято, используется общий запас "
+                                    f"{config['rebalance_headroom_pct']}%")
+            return
+        try:
+            val = float(parts[2])
+            if val < 0 or val > 100:
+                await send_tg(session, "❌ Разумный диапазон: 0–100%.")
+                return
+            config["rebalance_headroom_overrides"][ex_name] = val
+            await send_tg(session, f"✅ Персональный запас ребаланса для {ex_name}: {val}%")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setheadroomex HTX 3`")
 
     elif cmd == "/setreallot":
         floor_val = max(MIN_ORDER_VALUE_USD.values())  # $10 (HTX) — ниже гарантированный отказ
