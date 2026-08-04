@@ -2009,7 +2009,16 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
 
     usdt_balance = balances.get("USDT", 0.0)
     total_usd = usdt_balance + sum(coin_values.values())
-    needed_total = usdt_target + coin_target_usd * len(coin_values)
+    # ИСПРАВЛЕНИЕ 04.08 (раунд 6): раньше needed_total считался БЕЗ запаса
+    # ребаланса (headroom), хотя реальная докупка монеты внутри
+    # apply_real_intra_exchange_rebalance целится именно в target×(1+headroom).
+    # Из-за этого рассинхрона план мог считать биржу "в целом сбалансированной"
+    # (surplus близко к нулю), хотя по факту для покупки нужного лота реально
+    # не хватало — и preflight-проверка внутри самой сделки (у неё свой,
+    # отдельный и корректный буфер) каждый раз честно отказывала. Теперь оба
+    # расчёта используют один и тот же целевой запас.
+    headroom_mult = 1 + config["rebalance_headroom_pct"] / 100
+    needed_total = usdt_target + (coin_target_usd * headroom_mult) * len(coin_values)
 
     return {
         "exchange": ex, "balances_qty": balances, "coin_values": coin_values,
@@ -2141,8 +2150,17 @@ async def real_auto_rebalance_all(session) -> dict:
         plans[ex] = p
 
     dry_run = config["real_rebalance_dry_run"]
-    deficits = {ex: p for ex, p in plans.items() if p["surplus"] < -1.0}
-    surpluses = {ex: p for ex, p in plans.items() if p["surplus"] > 1.0}
+    # ИСПРАВЛЕНИЕ 04.08 (раунд 6): порог классификации дефицита раньше был
+    # жёстко зашит в $1 — на старте (лоты $15-20) это было разумно, но при
+    # текущих лотах $8-10 нехватка в $0.2-0.8 (типичная причина повторяющихся
+    # "insufficient_usdt_on_HTX") была МЕНЬШЕ этого порога и НЕ считалась
+    # дефицитом вообще — биржа молча пролетала мимо ребаланса, план говорил
+    # "всё в порядке", а реальная сделка потом честно отказывала. Порог
+    # теперь пропорционален размеру лота (5% от лимита ордера, но не меньше
+    # $0.10), чтобы ловить именно такие небольшие, но критичные разрывы.
+    deficit_threshold = max(0.10, config["max_real_order_usdt"] * 0.05)
+    deficits = {ex: p for ex, p in plans.items() if p["surplus"] < -deficit_threshold}
+    surpluses = {ex: p for ex, p in plans.items() if p["surplus"] > deficit_threshold}
 
     applied = []
     if not deficits:
@@ -2409,7 +2427,14 @@ async def execute_trade(session, opp: dict) -> dict:
         if not real_result.get("success"):
             logger.error(f"РЕАЛЬНАЯ сделка не удалась: {real_result}")
             error = real_result.get("error", "")
-            if "buy_leg_failed" in error or "sell_leg_failed" in error or "insufficient_real_balance" in error:
+            # ИСПРАВЛЕНИЕ 04.08 (раунд 5): добавлена проверка "insufficient_usdt_on_"
+            # (нехватка USDT на бирже покупки) — раньше эта ошибка НЕ входила
+            # в список триггеров авто-ребаланса, поэтому при её появлении бот
+            # просто показывал сообщение и ничего не предпринимал сам, ждал,
+            # пока вы вручную наберёте /rebalance + /go. Теперь эта причина
+            # тоже автоматически запускает мгновенный реальный ребаланс.
+            if ("buy_leg_failed" in error or "sell_leg_failed" in error
+                    or "insufficient_real_balance" in error or "insufficient_usdt_on" in error):
                 # ИСПРАВЛЕНИЕ 04.08 (раунд 2): раньше здесь сразу запускался
                 # ребаланс, а РЕАЛЬНЫЙ текст ошибки биржи (error, который к
                 # этому моменту уже содержит детали благодаря _remember_error)
