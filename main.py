@@ -56,6 +56,18 @@ config = {
 
     # ===== ЭТАП 4: ТРЕУГОЛЬНЫЙ АРБИТРАЖ =====
     "triangular_enabled": True,
+
+    # ===== ИСПРАВЛЕНИЕ 04.08: ЛОЖНЫЕ ОТКАЗЫ "insufficient_real_balance" =====
+    # Раньше буфер preflight-проверки (2%, захардкожен) и буфер, который
+    # держит ребаланс (3%, тоже захардкожен), стояли слишком близко друг к
+    # другу. На дешёвых монетах (типа ZIL, тысячи штук на $10) 2% превращаются
+    # в десятки монет разницы — и любое небольшое движение цены между
+    # моментом ребаланса и моментом сделки роняло проверку, хотя по сути
+    # денег хватало "почти впритык". Теперь оба буфера настраиваемые и
+    # разнесены по умолчанию (ребаланс держит намного больше, чем требует
+    # проверка), плюс добавлена мгновенная точечная докупка нехватки.
+    "balance_safety_buffer_pct": 1.0,   # % запас, который ТРЕБУЕТ preflight-проверка перед сделкой
+    "rebalance_headroom_pct":    15.0,  # % запас, который ЦЕЛЕНАПРАВЛЕННО держит ребаланс (должен быть заметно больше buffer_pct)
 }
 
 CONFIRM_PHRASE = "YES-I-UNDERSTAND-THE-RISK"
@@ -111,6 +123,8 @@ stats = {
     "insufficient_balance_skips": 0,  # сколько раз симуляция честно отказала из-за нехватки виртуального баланса
     "hourly_signals": defaultdict(int),
     "hourly_profit":  defaultdict(float),
+    "topup_attempts": 0,   # НОВОЕ: сколько раз сработала точечная автодокупка
+    "topup_success":  0,
 }
 trade_history: List[dict] = []
 last_signal_time: Dict[str, float] = {}
@@ -1548,6 +1562,62 @@ _last_auto_rebalance_attempt: float = 0.0
 AUTO_REBALANCE_COOLDOWN = 30  # сек — не пытаться ребалансить чаще, чем раз в 30 сек
 
 
+MIN_ORDER_VALUE_USD = {"Binance": 5.0, "KuCoin": 1.0, "HTX": 10.0}  # НАХОДКА 02.08:
+# HTX отклоняет любой ордер дешевле $10 ("order-value-min-error") — именно
+# поэтому ребаланс молча не мог докупить ZK на HTX, когда цель ($10) была
+# впритык к минимуму: нужная докупка ($9.92) оказывалась ЧУТЬ ниже порога.
+
+
+async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: float,
+                               price_hint: float) -> bool:
+    """ИСПРАВЛЕНИЕ 04.08: точечная мгновенная докупка нехватающей монеты.
+
+    Раньше, если preflight-проверка перед сделкой обнаруживала нехватку
+    буквально на пару процентов (как было с ZIL: нужно 3595.83, есть
+    3665.50 — не хватало 2% буфера), сделка просто отклонялась, а
+    восстановление баланса откладывалось на общий /rebalance (который
+    считает по ВСЕМ монетам сразу и с тем же тесным буфером мог опять
+    попасть впритык).
+
+    Эта функция вместо этого докупает НАПРЯМУЮ и НЕМЕДЛЕННО именно
+    недостающее количество, с запасом сверху, прямо на бирже продажи —
+    и сделка может продолжиться в той же попытке, без ожидания."""
+    if is_backed_off(ex):
+        return False
+    if not price_hint or price_hint <= 0:
+        return False
+
+    stats["topup_attempts"] += 1
+    # Берём не только сам shortfall, но и запас сверху (+8%), чтобы после
+    # этой докупки следующая сделка не уткнулась в тот же порог снова.
+    usd_needed = round(shortfall_qty * price_hint * 1.08, 2)
+    usd_needed = max(usd_needed, MIN_ORDER_VALUE_USD.get(ex, 5.0))  # не меньше минимума биржи
+
+    result = None
+    if ex == "Binance":
+        result = await place_order_binance(session, symbol, "BUY", usd_needed)
+    elif ex == "KuCoin":
+        result = await place_order_kucoin(session, symbol, "buy", usd_needed, use_funds=True)
+    elif ex == "HTX":
+        global _htx_account_id_cache
+        if not _htx_account_id_cache:
+            _htx_account_id_cache = await get_htx_account_id(session)
+        if _htx_account_id_cache:
+            result = await place_order_htx(session, _htx_account_id_cache, symbol, "buy-market", usd_needed)
+
+    if result:
+        stats["topup_success"] += 1
+        logger.info(f"✅ Точечная докупка {symbol} на {ex}: ~${usd_needed} размещена "
+                     f"(нехватка была {shortfall_qty:.2f} {symbol})")
+        if CHAT_ID:
+            await send_tg(session,
+                f"🔧 *Автодокупка*: не хватало {shortfall_qty:.2f} {symbol} на {ex} "
+                f"перед сделкой — докупил на ~${usd_needed} и продолжаю.")
+    else:
+        logger.error(f"❌ Точечная докупка {symbol} на {ex} не удалась")
+    return bool(result)
+
+
 async def execute_real_arbitrage(session, opp: dict) -> dict:
     """Исполняет РЕАЛЬНУЮ сделку с ЖЁСТКИМ лимитом на объём.
     Возвращает результат с полями success/error/emergency_close для логирования.
@@ -1561,7 +1631,7 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     if config["real_trades_today"] >= config["max_real_trades_per_day"]:
         return {"success": False, "error": "daily_real_trade_limit_reached"}
 
-    vol = min(opp["vol"], config["max_real_order_usdt"])  # ЖЁСТКИЙ потолок, /setlot не обходит
+    vol = min(opp["vol"], config["max_real_order_usdt"])  # ЖЁСТКИЙ потолок, /setlot его не обходит
     symbol, buy_ex, sell_ex = opp["symbol"], opp["buy_ex"], opp["sell_ex"]
 
     # НАХОДКА 03.08: та же проблема с минимумом биржи, что чинили в ребалансе,
@@ -1586,10 +1656,28 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
         return {"success": False, "error": f"could_not_verify_sell_balance_on_{sell_ex}"}
     qty_needed_estimate = vol / opp["sell_price"] if opp.get("sell_price") else 0
     available_on_sell_ex = sell_balances.get(symbol, 0.0)
-    if available_on_sell_ex < qty_needed_estimate * 1.02:  # 2% запас на движение цены
-        return {"success": False,
-                "error": f"insufficient_real_balance_on_{sell_ex}: "
-                         f"нужно ~{qty_needed_estimate:.2f} {symbol}, есть {available_on_sell_ex:.2f}"}
+
+    # ИСПРАВЛЕНИЕ 04.08 (было: жёстко зашитые 2% — регулярно ложно отклоняли
+    # сделки, когда реального запаса было ~1.9%, то есть денег хватало почти
+    # впритык). Буфер теперь настраиваемый через /setbalancebuffer, а если
+    # не хватает — сразу пробуем точечно докупить разницу, вместо отказа.
+    buffer_mult = 1 + config["balance_safety_buffer_pct"] / 100
+    required_with_buffer = qty_needed_estimate * buffer_mult
+    if available_on_sell_ex < required_with_buffer:
+        shortfall = round(required_with_buffer - available_on_sell_ex, 4)
+        topped = await top_up_coin_reserve(session, sell_ex, symbol, shortfall, opp["sell_price"])
+        if topped:
+            await asyncio.sleep(1.5)  # даём бирже время зачислить монету на баланс
+            refreshed = await get_real_balances(session, sell_ex)
+            available_on_sell_ex = (refreshed or {}).get(symbol, available_on_sell_ex)
+        if available_on_sell_ex < required_with_buffer:
+            return {"success": False,
+                    "error": f"insufficient_real_balance_on_{sell_ex}: "
+                             f"нужно ~{qty_needed_estimate:.2f} {symbol} "
+                             f"(+{config['balance_safety_buffer_pct']}% буфер = {required_with_buffer:.2f}), "
+                             f"есть {available_on_sell_ex:.2f}, не хватает "
+                             f"{round(required_with_buffer - available_on_sell_ex, 2)} "
+                             f"{'(автодокупка не удалась)' if not topped else '(даже после автодокупки)'}"}
 
     # --- НОГА 1: ПОКУПКА ---
     buy_result = None
@@ -1841,12 +1929,6 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
     }
 
 
-MIN_ORDER_VALUE_USD = {"Binance": 5.0, "KuCoin": 1.0, "HTX": 10.0}  # НАХОДКА 02.08:
-# HTX отклоняет любой ордер дешевле $10 ("order-value-min-error") — именно
-# поэтому ребаланс молча не мог докупить ZK на HTX, когда цель ($10) была
-# впритык к минимуму: нужная докупка ($9.92) оказывалась ЧУТЬ ниже порога.
-
-
 async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> dict:
     """Продаёт излишек монет в USDT, докупает дефицитные — РЕАЛЬНЫМИ ордерами.
     Вызывать только когда plan['surplus'] >= 0 (иначе останется дефицит).
@@ -1917,14 +1999,17 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
     # гонять ребаланс из-за мелочи), но для ПОКУПКИ он вреден — если на
     # бирже полно свободного USDT, мелкий недобор ($0.5-0.9) должен
     # закрываться сразу, а не игнорироваться до следующего похода в минус.
+    #
+    # ИСПРАВЛЕНИЕ 04.08: цель по монете теперь считается с бОльшим запасом
+    # (rebalance_headroom_pct, по умолчанию +15%, а не жёсткие +3%) — именно
+    # тонкий зазор между этим запасом и буфером preflight-проверки
+    # (balance_safety_buffer_pct) регулярно приводил к ложным отказам
+    # "insufficient_real_balance" на дешёвых монетах вроде ZIL.
     buy_threshold = 0.30
     for sym, value in plan["coin_values"].items():
         if value < coin_target - buy_threshold:
-            # Целимся НЕМНОГО выше номинальной цели (+3%), чтобы после покупки
-            # оставался запас над тем, что реально требует арбитраж (тот
-            # проверяет баланс с запасом +2% — см. execute_real_arbitrage),
-            # а не садиться ровно на границу и упираться в неё на следующей сделке.
-            effective_target = coin_target * 1.03
+            headroom_mult = 1 + config["rebalance_headroom_pct"] / 100
+            effective_target = coin_target * headroom_mult
             deficit_usd = round(effective_target - value, 2)
             # НАХОДКА 02.08: та же проблема, что и с продажей — если нужная
             # докупка меньше минимума биржи ($10 у HTX), ордер будет отклонён.
@@ -2191,7 +2276,7 @@ def auto_rebalance_all() -> dict:
 
 def apply_manual_transfer(from_ex: str, to_ex: str, amount: float) -> bool:
     """Применяет к симуляции перевод USDT, который вы УЖЕ сделали руками
-    между биржами (TRC-20 и т.п.). Используется после /crosstransfer."""
+    между реальными биржами (TRC-20 и т.п.). Используется после /crosstransfer."""
     if from_ex not in sim_balances or to_ex not in sim_balances:
         return False
     if sim_balances[from_ex].get("USDT", 0) < amount:
@@ -2518,6 +2603,8 @@ async def handle_command(session, text, chat_id):
             f"/setrebalance N — целевой запас (в лотах) на монету\n"
             f"/setreallot N — снизить реальный лимит ордера (не выше $15)\n"
             f"/setmaxtrades N — суточный лимит реальных сделок (сбрасывается каждый день)\n"
+            f"/setbalancebuffer N — % запас в preflight-проверке перед сделкой (по умолч. {config['balance_safety_buffer_pct']}%)\n"
+            f"/setheadroom N — % запас, который держит ребаланс сверх цели (по умолч. {config['rebalance_headroom_pct']}%)\n"
             f"/realbalance — точный разбор реального баланса и плана ребаланса по каждой бирже\n"
             f"/setrealstart — зафиксировать стартовый реальный капитал для честного P&L\n"
             f"/hours — активность по часам | /report — отчёт за день\n"
@@ -2619,9 +2706,12 @@ async def handle_command(session, text, chat_id):
                 f"   Binance: {stats['depth_fail']['Binance']}\n"
                 f"   KuCoin: {stats['depth_fail']['KuCoin']}\n"
                 f"   HTX: {stats['depth_fail']['HTX']}\n\n"
+                f"🔧 Автодокупок при нехватке баланса: {stats['topup_success']}/{stats['topup_attempts']}\n\n"
                 f"{balance_block}\n"
                 f"⚙️ Реальный лимит ордера: ${config['max_real_order_usdt']} | "
-                f"Порог: {config['min_profit_pct']}%"
+                f"Порог: {config['min_profit_pct']}% | "
+                f"Буфер баланса: {config['balance_safety_buffer_pct']}% | "
+                f"Запас ребаланса: {config['rebalance_headroom_pct']}%"
             )
             return
 
@@ -2791,6 +2881,47 @@ async def handle_command(session, text, chat_id):
                                     f"${config['max_real_order_usdt']*config['rebalance_target_lots']} в РЕАЛЬНОМ режиме)")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setrebalance 3`")
+
+    elif cmd == "/setbalancebuffer":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущий буфер preflight-проверки перед сделкой: {config['balance_safety_buffer_pct']}%\n\n"
+                f"Это % запас сверх расчётной нужной суммы, который должен быть "
+                f"на бирже продажи, иначе сделка отклоняется (или пробуется "
+                f"точечная автодокупка).\n\n"
+                f"Пример: `/setbalancebuffer 1` (было жёстко зашито 2%, из-за чего "
+                f"сделки ложно отклонялись при почти достаточном балансе)"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0 or val > 20:
+                await send_tg(session, "❌ Разумный диапазон: 0–20%.")
+                return
+            config["balance_safety_buffer_pct"] = val
+            await send_tg(session, f"✅ Буфер preflight-проверки: {val}%")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setbalancebuffer 1`")
+
+    elif cmd == "/setheadroom":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущий запас, который держит ребаланс сверх номинальной цели: "
+                f"{config['rebalance_headroom_pct']}%\n\n"
+                f"Должен быть заметно БОЛЬШЕ, чем `/setbalancebuffer` — иначе баланс "
+                f"после ребаланса снова окажется впритык к порогу проверки.\n\n"
+                f"Пример: `/setheadroom 15`"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0 or val > 100:
+                await send_tg(session, "❌ Разумный диапазон: 0–100%.")
+                return
+            config["rebalance_headroom_pct"] = val
+            await send_tg(session, f"✅ Запас ребаланса: {val}%")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setheadroom 15`")
 
     elif cmd == "/setreallot":
         floor_val = max(MIN_ORDER_VALUE_USD.values())  # $10 (HTX) — ниже гарантированный отказ
@@ -3189,7 +3320,10 @@ async def handle_command(session, text, chat_id):
             "*Отказы API стакана* — если растут, конкретная биржа нестабильна, "
             "проверьте вручную её endpoint.\n\n"
             "*Недостаточно ликвидности* — сколько раз стакана не хватило на "
-            "заявленный объём; такие сигналы не считаются валидными и не торгуются."
+            "заявленный объём; такие сигналы не считаются валидными и не торгуются.\n\n"
+            "*Буфер баланса / запас ребаланса* — buffer нужен ПЕРЕД сделкой (сколько "
+            "монеты обязано быть в наличии), headroom — сколько ребаланс держит СВЕРХ "
+            "цели про запас. headroom должен быть заметно больше buffer."
         )
 
     elif cmd == "/guide":
@@ -3253,6 +3387,7 @@ async def handle_command(session, text, chat_id):
             "/howtoread /guide /mode\n"
             "/addcoin /removecoin /listcoins\n"
             "/confirmreal /disablereal\n"
+            "/setbalancebuffer /setheadroom\n"
             "/pause /go /resume\n"
             "/setlot /setprofit /setstop")
 
