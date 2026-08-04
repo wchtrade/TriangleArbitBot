@@ -1671,6 +1671,37 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
                              f"{buy_ex}/{sell_ex} требуют ${required_min}, потолок $15"}
         vol = required_min
 
+    # ИСПРАВЛЕНИЕ 04.08 (раунд 4): раньше здесь ВООБЩЕ не проверялся баланс
+    # USDT на бирже ПОКУПКИ (buy_ex) — проверялась только монета на бирже
+    # продажи. HTX в вашей конфигурации играет ДВОЙНУЮ роль (и покупает
+    # HTX→KuCoin, и продаёт KuCoin→HTX), поэтому её капитал разделён между
+    # свободными USDT (нужны для покупки) и резервом монеты (нужен для
+    # продажи) — при небольшом общем балансе USDT может НЕ хватать на
+    # полный лот, хотя формально биржа "в целом" не пустая. Раньше бот
+    # слепо пытался купить на всю сумму vol и получал прямой отказ биржи
+    # ("trade account balance is not enough"). Теперь: если свободных USDT
+    # чуть меньше vol — сделка автоматически уменьшается до того, что
+    # реально есть (не ниже биржевого минимума), вместо полного отказа.
+    buy_balances = await get_real_balances(session, buy_ex)
+    if buy_balances is None:
+        return {"success": False, "error": f"could_not_verify_buy_balance_on_{buy_ex}"}
+    available_usdt_on_buy_ex = buy_balances.get("USDT", 0.0)
+    usdt_buffer_mult = 1 + config["balance_safety_buffer_pct"] / 100
+    if available_usdt_on_buy_ex < vol * usdt_buffer_mult:
+        # Пробуем ужать сделку до реально доступных USDT (оставляя чуть-чуть
+        # запаса на комиссию), а не просто отказывать
+        shrunk_vol = round(available_usdt_on_buy_ex / usdt_buffer_mult, 2)
+        if shrunk_vol >= required_min:
+            logger.info(f"Уменьшаю объём сделки {buy_ex}: ${vol} → ${shrunk_vol} "
+                         f"(свободно USDT: {available_usdt_on_buy_ex:.2f})")
+            vol = shrunk_vol
+        else:
+            return {"success": False,
+                    "error": f"insufficient_usdt_on_{buy_ex}: "
+                             f"нужно ~${vol} для лота, свободно ${available_usdt_on_buy_ex:.2f} "
+                             f"(меньше биржевого минимума ${required_min}) — "
+                             f"нужен ручной перевод USDT на {buy_ex} или /rebalance"}
+
     # НАХОДКА 31.07: у каждой биржи своя НЕЗАВИСИМАЯ предзаведённая монета —
     # купленное на buy_ex физически не переносится на sell_ex. Раньше бот
     # покупал вслепую, не проверив, хватит ли монеты на sell_ex для продажи —
@@ -1678,7 +1709,16 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     sell_balances = await get_real_balances(session, sell_ex)
     if sell_balances is None:
         return {"success": False, "error": f"could_not_verify_sell_balance_on_{sell_ex}"}
-    qty_needed_estimate = vol / opp["sell_price"] if opp.get("sell_price") else 0
+    # ИСПРАВЛЕНИЕ 04.08 (раунд 3, КОРНЕВАЯ ПРИЧИНА): раньше здесь бралась
+    # opp["sell_price"] — но реальное количество монеты, которое придётся
+    # продать на sell_ex, определяется тем, СКОЛЬКО РЕАЛЬНО КУПЯТ на buy_ex
+    # (confirmed_qty = vol / buy_price), а НЕ ценой продажи. Поскольку в
+    # арбитраже buy_price ВСЕГДА меньше sell_price (иначе сделки бы не было),
+    # vol/buy_price systematически БОЛЬШЕ, чем vol/sell_price — то есть эта
+    # проверка систематически НЕДООЦЕНИВАЛА нужное количество монеты на
+    # величину самого спреда сделки. Отсюда и "Balance insufficient!" от
+    # KuCoin при том, что наша проверка была уверена, что монеты хватает.
+    qty_needed_estimate = vol / opp["buy_price"] if opp.get("buy_price") else 0
     available_on_sell_ex = sell_balances.get(symbol, 0.0)
 
     # ИСПРАВЛЕНИЕ 04.08 (было: жёстко зашитые 2% — регулярно ложно отклоняли
@@ -1732,6 +1772,30 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     sell_qty = await round_quantity_for_exchange(session, sell_ex, symbol, confirmed_qty)
     if sell_qty <= 0:
         return {"success": False, "error": f"sell_qty_rounds_to_zero_on_{sell_ex}"}
+
+    # ИСПРАВЛЕНИЕ 04.08 (раунд 3): второй, уже ТОЧНЫЙ рубеж защиты. Первая
+    # preflight-проверка (в начале функции) — это оценка ДО покупки, по
+    # ожидаемой цене. Теперь, когда покупка на buy_ex реально прошла и
+    # confirmed_qty известен точно, сверяем его напрямую с фактическим
+    # балансом sell_ex — без всяких оценок. Если и тут не хватает —
+    # пробуем точечно докупить именно этот остаток перед тем, как вообще
+    # пытаться разместить ордер на продажу (а не после отказа биржи).
+    fresh_sell_balances = await get_real_balances(session, sell_ex)
+    fresh_available = (fresh_sell_balances or {}).get(symbol, 0.0)
+    if fresh_available < sell_qty:
+        shortfall = round(sell_qty - fresh_available, 4)
+        topped = await top_up_coin_reserve(session, sell_ex, symbol, shortfall, opp["sell_price"])
+        if topped:
+            await asyncio.sleep(1.5)
+            refreshed = await get_real_balances(session, sell_ex)
+            fresh_available = (refreshed or {}).get(symbol, fresh_available)
+        if fresh_available < sell_qty:
+            return {"success": False,
+                    "error": f"insufficient_real_balance_on_{sell_ex}_precheck: "
+                             f"после покупки на {buy_ex} нужно продать {sell_qty} {symbol}, "
+                             f"реально на {sell_ex} есть {fresh_available:.4f} "
+                             f"{'(автодокупка не помогла)' if not topped else '(даже после автодокупки)'}",
+                    "buy_result": buy_result}
 
     # --- НОГА 2: ПРОДАЖА ---
     sell_result = None
