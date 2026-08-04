@@ -1564,6 +1564,19 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     vol = min(opp["vol"], config["max_real_order_usdt"])  # ЖЁСТКИЙ потолок, /setlot не обходит
     symbol, buy_ex, sell_ex = opp["symbol"], opp["buy_ex"], opp["sell_ex"]
 
+    # НАХОДКА 03.08: та же проблема с минимумом биржи, что чинили в ребалансе,
+    # оказывается актуальна и для самой сделки — HTX отклоняет ЛЮБОЙ ордер
+    # дешевле $10 ('order-value-min-error'). Если лот меньше минимума хотя бы
+    # одной из двух бирж сделки — поднимаем объём до минимума (не выше
+    # потолка безопасности $15), иначе сделка гарантированно отклонится.
+    required_min = max(MIN_ORDER_VALUE_USD.get(buy_ex, 0), MIN_ORDER_VALUE_USD.get(sell_ex, 0))
+    if vol < required_min:
+        if required_min > 15.0:
+            return {"success": False,
+                    "error": f"min_order_value_exceeds_safety_ceiling: "
+                             f"{buy_ex}/{sell_ex} требуют ${required_min}, потолок $15"}
+        vol = required_min
+
     # НАХОДКА 31.07: у каждой биржи своя НЕЗАВИСИМАЯ предзаведённая монета —
     # купленное на buy_ex физически не переносится на sell_ex. Раньше бот
     # покупал вслепую, не проверив, хватит ли монеты на sell_ex для продажи —
@@ -2780,10 +2793,11 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Пример: `/setrebalance 3`")
 
     elif cmd == "/setreallot":
+        floor_val = max(MIN_ORDER_VALUE_USD.values())  # $10 (HTX) — ниже гарантированный отказ
         if len(parts) < 2:
             await send_tg(session,
                 f"Текущий реальный лимит ордера: ${config['max_real_order_usdt']}\n"
-                f"Можно только УМЕНЬШИТЬ (не больше $15 — это жёсткий потолок безопасности).\n"
+                f"Диапазон: от ${floor_val} до $15 (минимум биржи ↔ потолок безопасности).\n"
                 f"Пример: `/setreallot 10`")
             return
         try:
@@ -2791,10 +2805,13 @@ async def handle_command(session, text, chat_id):
             if new_val > 15.0:
                 await send_tg(session,
                     "❌ Нельзя установить больше $15 — это намеренный потолок безопасности, "
-                    "заложенный при построении реального исполнения. Уменьшать можно.")
+                    "заложенный при построении реального исполнения.")
                 return
-            if new_val <= 0:
-                await send_tg(session, "❌ Значение должно быть больше 0.")
+            if new_val < floor_val:
+                await send_tg(session,
+                    f"❌ Нельзя установить меньше ${floor_val} — это минимальная сумма ордера "
+                    f"у HTX. Сделка с лотом меньше этого будет ГАРАНТИРОВАННО отклонена биржей "
+                    f"(мы это уже проходили). Минимум — ${floor_val}.")
                 return
             config["max_real_order_usdt"] = new_val
             needed = round(new_val * config["rebalance_target_lots"] * 5, 2)
