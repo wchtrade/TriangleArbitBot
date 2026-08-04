@@ -157,6 +157,24 @@ REAL_TRADING_UNLOCKED = os.environ.get("REAL_TRADING_UNLOCKED", "")
 
 exchange_backoff_until: Dict[str, float] = {"Binance": 0.0, "KuCoin": 0.0, "HTX": 0.0}
 
+# ИСПРАВЛЕНИЕ 04.08 (раунд 2): раньше при отказе размещения реального ордера
+# биржа возвращала подробный текст ошибки (например, точную причину отказа —
+# insufficient balance / precision / min notional и т.п.), но бот его нигде
+# не показывал пользователю — ни в Telegram, ни даже в сообщении об ошибке
+# внутри execute_real_arbitrage. Наружу уходила только маска вида
+# "buy_leg_failed_on_HTX" без единой цифры или слова причины, из-за чего
+# невозможно было понять, что именно не так — баланс, шаг лота, минимальная
+# сумма ордера или что-то ещё. Теперь текст ответа биржи сохраняется здесь
+# и подставляется в сообщение об ошибке.
+_last_exchange_error: Dict[str, str] = {"Binance": "", "KuCoin": "", "HTX": ""}
+
+
+def _remember_error(ex: str, detail) -> None:
+    text = str(detail)
+    if len(text) > 300:
+        text = text[:300] + "…"
+    _last_exchange_error[ex] = text
+
 
 def is_backed_off(ex: str) -> bool:
     return time.time() < exchange_backoff_until.get(ex, 0.0)
@@ -1312,10 +1330,12 @@ async def place_order_binance(session, symbol: str, side: str, quote_usdt: float
             data = await r.json()
             if r.status != 200:
                 logger.error(f"Binance order failed: {data}")
+                _remember_error("Binance", data.get("msg", data))
                 return None
             return data
     except Exception as e:
         logger.error(f"Binance order exception: {e}")
+        _remember_error("Binance", e)
         return None
 
 
@@ -1366,10 +1386,12 @@ async def place_order_kucoin(session, symbol: str, side: str, funds_or_size: flo
             data = await r.json()
             if r.status != 200 or data.get("code") != "200000":
                 logger.error(f"KuCoin order failed: {data}")
+                _remember_error("KuCoin", data.get("msg", data))
                 return None
             return data
     except Exception as e:
         logger.error(f"KuCoin order exception: {e}")
+        _remember_error("KuCoin", e)
         return None
 
 
@@ -1412,10 +1434,12 @@ async def place_order_htx(session, account_id: str, symbol: str, side: str,
             data = await r.json()
             if data.get("status") != "ok":
                 logger.error(f"HTX order failed: {data}")
+                _remember_error("HTX", data.get("err-msg", data))
                 return None
             return data
     except Exception as e:
         logger.error(f"HTX order exception: {e}")
+        _remember_error("HTX", e)
         return None
 
 
@@ -1692,7 +1716,8 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
             buy_result = await place_order_htx(session, _htx_account_id_cache, symbol, "buy-market", vol)
 
     if not buy_result:
-        return {"success": False, "error": f"buy_leg_failed_on_{buy_ex}"}
+        return {"success": False,
+                "error": f"buy_leg_failed_on_{buy_ex}: {_last_exchange_error.get(buy_ex) or 'нет деталей от биржи'}"}
 
     config["real_trades_today"] += 1
 
@@ -1735,7 +1760,8 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
                 if _htx_account_id_cache:
                     emergency = await place_order_htx(session, _htx_account_id_cache, symbol, "sell-market", emergency_qty)
         return {
-            "success": False, "error": f"sell_leg_failed_on_{sell_ex}",
+            "success": False,
+            "error": f"sell_leg_failed_on_{sell_ex}: {_last_exchange_error.get(sell_ex) or 'нет деталей от биржи'}",
             "emergency_close": bool(emergency),
             "buy_result": buy_result,
         }
@@ -2320,6 +2346,18 @@ async def execute_trade(session, opp: dict) -> dict:
             logger.error(f"РЕАЛЬНАЯ сделка не удалась: {real_result}")
             error = real_result.get("error", "")
             if "buy_leg_failed" in error or "sell_leg_failed" in error or "insufficient_real_balance" in error:
+                # ИСПРАВЛЕНИЕ 04.08 (раунд 2): раньше здесь сразу запускался
+                # ребаланс, а РЕАЛЬНЫЙ текст ошибки биржи (error, который к
+                # этому моменту уже содержит детали благодаря _remember_error)
+                # никогда не попадал в Telegram — вы видели только общую
+                # маску "buy_leg_failed_on_HTX" в сообщении о пропуске сигнала,
+                # без единого слова о настоящей причине. Теперь показываем
+                # error целиком ПЕРЕД тем, как пробовать ребаланс — если
+                # причина НЕ в балансе (например API-ключ без прав на
+                # торговлю, неверный формат ордера, биржевой минимум), гонять
+                # ребаланс вообще бессмысленно, и вы это сразу увидите.
+                if CHAT_ID:
+                    await send_tg(session, f"🔴 *Реальная сделка отклонена биржей*\n`{error}`")
                 # Скорее всего нехватка средств именно на этой ноге —
                 # мгновенная попытка реального ребаланса вместо ожидания
                 # планового цикла в 30 минут (с тем же cooldown-защитником)
@@ -2328,8 +2366,7 @@ async def execute_trade(session, opp: dict) -> dict:
                     _last_auto_rebalance_attempt = now_ts
                     rb_result = await real_auto_rebalance_all(session)
                     if CHAT_ID:
-                        await send_tg(session, "🔄 Реальная сделка отклонена биржей — "
-                                                "пробую реальный ребаланс:\n\n" +
+                        await send_tg(session, "🔄 Пробую реальный ребаланс:\n\n" +
                                        format_real_rebalance_result(rb_result))
                     if not rb_result.get("safe_to_resume", False):
                         config["paused"] = True
