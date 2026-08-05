@@ -2911,7 +2911,14 @@ async def handle_command(session, text, chat_id):
                 "(до 8 монет за раз)"
             )
             return
-        candidates = [p.upper() for p in parts[1:9]]
+        # ИСПРАВЛЕНИЕ: запятые/точки с запятой в списке монет (частый способ
+        # ввода) раньше ломали разбор — "TRX," воспринималось как отдельный
+        # несуществующий тикер.
+        raw_candidates = " ".join(parts[1:]).replace(",", " ").replace(";", " ").split()
+        candidates = [p.upper() for p in raw_candidates if p][:8]
+        if not candidates:
+            await send_tg(session, "Не нашёл ни одной монеты в команде. Пример: `/scancandidates TRX DOGE XRP`")
+            return
         await send_tg(session, f"🔍 Проверяю глубину стакана на 3 биржах для: {', '.join(candidates)}...")
 
         results = []
