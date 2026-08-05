@@ -1,4 +1,4 @@
-import asyncio
+ import asyncio
 import aiohttp
 import logging
 import os
@@ -121,6 +121,24 @@ PAIRS   = [
     # неё больше не будет — при желании вернуть: добавить обратно строки
     # ("HTX","KuCoin"), ("KuCoin","HTX"), ("Binance","HTX").
 ]
+
+# ИСПРАВЛЕНИЕ 05.08 (раунд 11): маршруты теперь МОЖНО задавать индивидуально
+# для конкретной монеты через PAIR_OVERRIDES — не обязательно всем монетам
+# использовать одни и те же биржи. Пример: TRX торгуется Binance→HTX (вместо
+# общего Binance→KuCoin) — так HTX включена в оборот БЕЗ дополнительного
+# капитала: резерв TRX, который раньше держала KuCoin, просто "переехал" на
+# HTX, а не задублировался. Монеты, которых нет в PAIR_OVERRIDES, используют
+# общий PAIRS (переименован в DEFAULT_PAIRS ниже) как раньше.
+DEFAULT_PAIRS = PAIRS
+PAIR_OVERRIDES: Dict[str, List[Tuple[str, str]]] = {
+    "TRX": [("Binance", "HTX")],
+}
+
+
+def pairs_for_symbol(sym: str) -> List[Tuple[str, str]]:
+    return PAIR_OVERRIDES.get(sym, DEFAULT_PAIRS)
+
+
 FEES = {"Binance": 0.10, "KuCoin": 0.10, "HTX": 0.20}
 SIM_START = 500.0
 
@@ -1139,7 +1157,7 @@ async def scan_all(session) -> Tuple[List[dict], List[str]]:
 
     hour = datetime.now().hour
     for sym in SYMBOLS:
-        for buy_ex, sell_ex in PAIRS:
+        for buy_ex, sell_ex in pairs_for_symbol(sym):
             bob = ex_map.get(buy_ex, {}).get(sym)
             sob = ex_map.get(sell_ex, {}).get(sym)
             if not bob or not sob:
@@ -2104,30 +2122,31 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
     coin_target_usd = real_lot * lots
     usdt_target = real_lot * lots
 
-    sell_exchanges = get_sell_exchanges()
-    is_sell_ex = ex in sell_exchanges
+    def is_seller_for(sym: str) -> bool:
+        return ex in {s for _, s in pairs_for_symbol(sym)}
 
-    # ИСПРАВЛЕНИЕ 04.08 (раунд 7): раньше coin_values считался ТОЛЬКО для
-    # бирж, которые сейчас числятся в sell_exchanges — если убрать биржу из
-    # этой роли (например, изменив PAIRS), любая монета, оставшаяся на ней с
-    # прошлого раза, становилась НЕВИДИМОЙ для расчёта total_usd (баланс
-    # занижался) и никогда не продавалась обратно в USDT — "мёртвый" остаток,
-    # та же ловушка, что раньше чинили только вручную через /removecoin.
-    # Теперь стоимость ВСЕЙ имеющейся монеты считается всегда (для честного
-    # total_usd), а целевой резерв (coin_target) требуется только там, где
-    # биржа ДЕЙСТВИТЕЛЬНО продаёт — для всех остальных случаев target = 0,
-    # то есть любая монета сверху сразу считается "излишком" и уходит в
-    # USDT на ближайшем /rebalance, как и должно быть.
-    # ИСПРАВЛЕНИЕ 05.08 (раунд 10, продолжение): coin_values ТОЖЕ должен
-    # содержать запись для монеты с нулевым балансом на бирже-продавце —
-    # иначе цикл докупки дефицита в apply_real_intra_exchange_rebalance
-    # (который идёт ПО ЗАПИСЯМ coin_values) просто не увидит эту монету
-    # вообще и никогда не купит резерв с нуля.
+    def is_buyer_for(sym: str) -> bool:
+        return ex in {b for b, _ in pairs_for_symbol(sym)}
+
+    # ИСПРАВЛЕНИЕ 05.08 (раунд 11): роль биржи теперь проверяется ОТДЕЛЬНО
+    # для каждой монеты (маршруты у монет могут отличаться — см.
+    # PAIR_OVERRIDES), а не одним флагом "биржа вообще продаёт хоть что-то".
+    # Иначе KuCoin (продаёт ORDI/THETA, но для TRX теперь не участвует)
+    # ошибочно продолжила бы требовать резерв TRX, а HTX (продаёт только
+    # TRX) не получила бы для неё цель вообще.
     coin_values: Dict[str, float] = {}
+    coin_targets: Dict[str, float] = {}
+    coin_reserve_syms = 0
     for sym in SYMBOLS:
         qty = balances.get(sym, 0.0)
+        seller_here = is_seller_for(sym)
+        if seller_here:
+            coin_reserve_syms += 1
+            coin_targets[sym] = coin_target_usd
+        else:
+            coin_targets[sym] = 0.0
         if qty <= 0:
-            if is_sell_ex:
+            if seller_here:
                 coin_values[sym] = 0.0  # монета нужна по роли, но резерва пока нет — не пропускаем
             continue
         price = await get_valuation_price(session, ex, sym)
@@ -2136,29 +2155,21 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
 
     usdt_balance = balances.get("USDT", 0.0)
     total_usd = usdt_balance + sum(coin_values.values())
-    # usdt_target требуется ТОЛЬКО если биржа реально покупает (buy_ex хоть
-    # в одной паре) — иначе это лишнее требование к капиталу без всякой
-    # торговой необходимости.
-    buy_exchanges = get_buy_exchanges()
-    effective_usdt_target = usdt_target if ex in buy_exchanges else 0.0
-    effective_coin_target = coin_target_usd if is_sell_ex else 0.0
+    # usdt_target требуется, только если биржа реально покупает хотя бы одну
+    # монету по её фактическому маршруту.
+    effective_usdt_target = usdt_target if any(is_buyer_for(sym) for sym in SYMBOLS) else 0.0
     headroom_mult = 1 + get_headroom_pct(ex) / 100
-    # ИСПРАВЛЕНИЕ 05.08 (раунд 10): раньше coin_reserve_syms = len(coin_values) —
-    # но coin_values пропускает символы с НУЛЕВЫМ балансом (qty <= 0 → continue).
-    # На свежепереключённой монете (только что добавили TRX, ещё ни разу не
-    # покупали резерв) coin_values оказывался ПУСТЫМ, и needed_total считал,
-    # что бирже-продавцу вообще ничего не нужно ($0) — хотя по роли ей
-    # положен резерв. Теперь считаем от количества монет в SYMBOLS (то есть
-    # от ЦЕЛИ), а не от того, что уже случайно есть на балансе — иначе цель
-    # "рассасывается" именно тогда, когда она нужнее всего: при старте с нуля.
-    coin_reserve_syms = len(SYMBOLS) if is_sell_ex else 0
+    # Считаем от ЦЕЛИ (сколько монет ex реально обязана продавать по
+    # маршрутам), а не от того, что уже случайно есть на балансе — иначе
+    # цель "рассасывается" именно тогда, когда она нужнее всего: при
+    # старте резерва с нуля.
     needed_total = effective_usdt_target + (coin_target_usd * headroom_mult) * coin_reserve_syms
 
     return {
         "exchange": ex, "balances_qty": balances, "coin_values": coin_values,
         "usdt_balance": round(usdt_balance, 2), "total_usd": round(total_usd, 2),
         "needed_total": round(needed_total, 2), "surplus": round(total_usd - needed_total, 2),
-        "coin_target_usd": effective_coin_target, "usdt_target": effective_usdt_target,
+        "coin_targets": coin_targets, "usdt_target": effective_usdt_target,
     }
 
 
@@ -2169,12 +2180,13 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
     только считается и показывается план (см. /rebalancelive для включения)."""
     dry_run = config["real_rebalance_dry_run"]
     actions = []
-    coin_target = plan["coin_target_usd"]
+    coin_targets = plan["coin_targets"]  # теперь словарь — своя цель на каждую монету
     threshold = 1.0  # не гоняем ребаланс из-за $1 — комиссия того не стоит
     min_order = MIN_ORDER_VALUE_USD.get(ex, 5.0)
 
     # Сначала продажи — освобождаем USDT для последующих покупок
     for sym, value in plan["coin_values"].items():
+        coin_target = coin_targets.get(sym, 0.0)
         if value > coin_target + threshold:
             qty = plan["balances_qty"].get(sym, 0)
             price = value / qty if qty else None
@@ -2240,6 +2252,7 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
     # "insufficient_real_balance" на дешёвых монетах вроде ZIL.
     buy_threshold = 0.30
     for sym, value in plan["coin_values"].items():
+        coin_target = coin_targets.get(sym, 0.0)
         if value < coin_target - buy_threshold:
             headroom_mult = 1 + get_headroom_pct(ex) / 100
             effective_target = coin_target * headroom_mult
@@ -2424,21 +2437,25 @@ def suggest_withdrawal() -> dict:
 # =====================================================================
 
 def get_sell_exchanges() -> set:
-    """Биржи, которые хоть раз выступают sell_ex в PAIRS — только им реально
-    нужен запас монет. Binance в текущей конфигурации только покупает
-    (Binance→HTX) и никогда не продаёт — значит ей монеты вообще не нужны,
-    любые монеты, осевшие там после покупки, должны сразу уходить в USDT."""
-    return {sell_ex for _, sell_ex in PAIRS}
+    """Биржи, которые хоть раз выступают sell_ex — теперь считается по
+    ФАКТИЧЕСКИМ маршрутам каждой монеты (pairs_for_symbol), а не по одному
+    общему PAIRS — раз маршруты стали индивидуальными для каждой монеты
+    (см. PAIR_OVERRIDES), агрегат должен строиться по всем реально
+    используемым маршрутам, иначе биржа, играющая роль только для одной
+    конкретной монеты (как HTX для TRX), выпадет из расчёта капитала."""
+    exs = set()
+    for sym in SYMBOLS:
+        exs |= {sell_ex for _, sell_ex in pairs_for_symbol(sym)}
+    return exs
 
 
 def get_buy_exchanges() -> set:
-    """ИСПРАВЛЕНИЕ 04.08 (раунд 6, симметрично get_sell_exchanges): биржи,
-    которые хоть раз выступают buy_ex в PAIRS — только им реально нужен
-    резерв USDT под покупку. Раньше needed_total требовал держать usdt_target
-    ($10+) на КАЖДОЙ бирже безусловно, даже если у неё в PAIRS нет ни одной
-    роли покупателя — это лишняя, ничем не обоснованная нагрузка на капитал
-    именно на той бирже, где он и так разрывается между двумя ролями."""
-    return {buy_ex for buy_ex, _ in PAIRS}
+    """Симметрично get_sell_exchanges — биржи, которые хоть раз выступают
+    buy_ex хоть для одной монеты по её фактическому маршруту."""
+    exs = set()
+    for sym in SYMBOLS:
+        exs |= {buy_ex for buy_ex, _ in pairs_for_symbol(sym)}
+    return exs
 
 
 def get_headroom_pct(ex: str) -> float:
@@ -3814,7 +3831,7 @@ async def handle_command(session, text, chat_id):
         config["min_profit_pct"] = -999
         all_opps = []
         for sym in SYMBOLS:
-            for buy_ex, sell_ex in PAIRS:
+            for buy_ex, sell_ex in pairs_for_symbol(sym):
                 bob = ex_map.get(buy_ex, {}).get(sym)
                 sob = ex_map.get(sell_ex, {}).get(sym)
                 if bob and sob:
