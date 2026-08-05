@@ -50,7 +50,7 @@ config = {
         # проблемной паре, нигде не отражаясь в видимой прибыли. Сбрасывается
         # каждые сутки автоматически (как и real_trades_today).
     "depth_limit":        50,      # сколько уровней стакана запрашиваем
-    "rebalance_target_lots": 3,    # сколько лотов держать в резерве на каждую монету/USDT при авто-ребалансе
+    "rebalance_target_lots": 1,    # ЗАФИКСИРОВАНО 05.08 (было 3): сколько лотов держать в резерве на каждую монету/USDT при авто-ребалансе — 1 лот достаточно и не требует избыточного капитала
     "derating_factor":    0.25,    # реальность ≈ симуляция × 0.25 (ваша же оценка)
 
     # ===== ЭТАП 6: РЕАЛЬНОЕ ИСПОЛНЕНИЕ — ЖЁСТКИЙ ГЕЙТ =====
@@ -60,7 +60,7 @@ config = {
     #   2) runtime-флаг real_confirmed, включаемый командой /confirmreal <фраза>
     # Если хоть одно условие не выполнено — бот принудительно торгует в símulation.
     "real_confirmed":       False,
-    "max_real_order_usdt":  15.0,   # ЖЁСТКИЙ потолок на один ордер, /setlot его не обходит
+    "max_real_order_usdt":  10.0,   # ЗАФИКСИРОВАНО 05.08 (было 15): ЖЁСТКИЙ потолок на один ордер, /setlot его не обходит
     "real_rebalance_dry_run": True,  # ПО УМОЛЧАНИЮ включено: первый реальный ребаланс
                                        # только показывает план, не размещает ордера,
                                        # пока вы явно не отключите через /rebalancelive
@@ -81,7 +81,7 @@ config = {
     # разнесены по умолчанию (ребаланс держит намного больше, чем требует
     # проверка), плюс добавлена мгновенная точечная докупка нехватки.
     "balance_safety_buffer_pct": 1.0,   # % запас, который ТРЕБУЕТ preflight-проверка перед сделкой
-    "rebalance_headroom_pct":    15.0,  # % запас, который ЦЕЛЕНАПРАВЛЕННО держит ребаланс (должен быть заметно больше buffer_pct)
+    "rebalance_headroom_pct":    5.0,  # ЗАФИКСИРОВАНО 05.08 (было 15): % запас, который ЦЕЛЕНАПРАВЛЕННО держит ребаланс (должен быть заметно больше buffer_pct)
     "rebalance_headroom_overrides": {"HTX": 3.0},  # НОВОЕ 04.08: персональный % запаса для
         # конкретной биржи вместо общего rebalance_headroom_pct. HTX играет
         # ДВЕ роли (покупает в одной паре, продаёт в двух других) на
@@ -3530,6 +3530,65 @@ async def handle_command(session, text, chat_id):
     elif cmd == "/listcoins":
         await send_tg(session, f"💱 *Торгуемые монеты:* {', '.join(SYMBOLS)}\n\n"
                                 f"Добавить: `/addcoin SYMBOL`\nУдалить: `/removecoin SYMBOL`")
+
+    elif cmd == "/sellcoin":
+        # НОВОЕ 05.08: продать ЛЮБОЙ реальный остаток монеты на всех трёх
+        # биржах, даже если её СЕЙЧАС нет в SYMBOLS. Нужно для ситуаций вроде
+        # ZIL: список монет сбросился при передеплое (или монету удалили
+        # раньше), а реальный остаток на биржах остался и стал невидим для
+        # /removecoin (тот требует, чтобы монета сначала была в списке).
+        if len(parts) < 2:
+            await send_tg(session,
+                "Продаёт РЕАЛЬНЫЙ остаток монеты на всех трёх биржах в USDT, "
+                "даже если её нет в текущем списке SYMBOLS.\n\n"
+                "Пример: `/sellcoin ZIL`"
+            )
+            return
+        sym = parts[1].upper()
+        if config["simulation_mode"]:
+            await send_tg(session, "⚠️ Бот в режиме симуляции — на реальных биржах продавать нечего "
+                                    "(переключитесь `/mode`, если нужно продать реальный остаток).")
+            return
+        await send_tg(session, f"📡 Проверяю реальный остаток {sym} на трёх биржах...")
+        sold, failed, none_found = {}, [], []
+        for ex in ["Binance", "KuCoin", "HTX"]:
+            real_balances = await get_real_balances(session, ex)
+            if not real_balances:
+                failed.append(f"{ex}: не удалось прочитать баланс")
+                continue
+            qty = real_balances.get(sym, 0.0)
+            if qty <= 0:
+                none_found.append(ex)
+                continue
+            sell_qty = await round_quantity_for_exchange(session, ex, sym, qty)
+            if sell_qty <= 0:
+                none_found.append(f"{ex} (остаток {qty} слишком мал после округления)")
+                continue
+            result = None
+            if ex == "Binance":
+                result = await place_order_binance(session, sym, "SELL", sell_qty)
+            elif ex == "KuCoin":
+                result = await place_order_kucoin(session, sym, "sell", sell_qty, use_funds=False)
+            elif ex == "HTX":
+                if not _htx_account_id_cache:
+                    _htx_account_id_cache = await get_htx_account_id(session)
+                if _htx_account_id_cache:
+                    result = await place_order_htx(session, _htx_account_id_cache, sym, "sell-market", sell_qty)
+            if result:
+                sold[ex] = sell_qty
+            else:
+                failed.append(f"{ex} ({sell_qty} {sym}, {_last_exchange_error.get(ex, 'нет деталей')})")
+
+        msg = f"📊 *Продажа {sym}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        if sold:
+            msg += "✅ Продано:\n" + "\n".join(f"   {ex}: {qty} {sym} → USDT" for ex, qty in sold.items()) + "\n\n"
+        if none_found:
+            msg += "➖ Остатка нет: " + ", ".join(none_found) + "\n\n"
+        if failed:
+            msg += "🔴 Не удалось продать:\n   " + "\n   ".join(failed) + "\n\n"
+        if not sold and not failed:
+            msg += "На всех биржах остатка не найдено — продавать нечего."
+        await send_tg(session, msg)
 
     elif cmd == "/realfees":
         if not SYMBOLS:
