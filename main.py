@@ -93,7 +93,16 @@ config = {
 
 CONFIRM_PHRASE = "YES-I-UNDERSTAND-THE-RISK"
 
-SYMBOLS = ["BONK", "SEI", "FET", "INJ"]   # теперь можно менять на лету через /addcoin /removecoin
+SYMBOLS = ["TRX"]   # ИСПРАВЛЕНО 05.08: этот список — дефолт, с которым бот
+    # стартует при КАЖДОМ передеплое (SYMBOLS живёт только в памяти процесса,
+    # /addcoin и /removecoin меняют его лишь до следующего рестарта). Раньше
+    # тут были BONK/SEI/FET/INJ — мелкие альткоины с дырявой ликвидностью на
+    # HTX, из-за которых после каждого обновления кода бот тихо откатывался
+    # на них и требовал резерв под 4 монеты сразу ($45+ на биржу), хотя
+    # реально торговалась только одна. TRX прошёл проверку /scancandidates
+    # (50/50 и 50/20 уровней на всех трёх биржах, разброс цены 0.04%) —
+    # меняйте этот список, только когда осознанно переключаетесь на другую
+    # монету навсегда, а не через /addcoin в чате (это временно, до рестарта).
 QUOTE   = "USDT"
 BRIDGE  = "BTC"   # мост для треугольного арбитража: USDT -> COIN -> BTC -> USDT
 PAIRS   = [
@@ -3469,11 +3478,54 @@ async def handle_command(session, text, chat_id):
                 if amount:
                     liquidated[ex] = round(amount, 2)
         liq_lines = "\n".join(f"   {ex}: ${amt} → USDT" for ex, amt in liquidated.items())
-        await send_tg(session,
-            f"✅ Удалено: *{sym}*\n" +
-            (f"💰 Остатки конвертированы в USDT:\n{liq_lines}\n\n" if liquidated else "\n") +
-            f"Текущий список: {', '.join(SYMBOLS)}"
-        )
+
+        # ИСПРАВЛЕНИЕ 05.08: раньше в РЕАЛЬНОМ режиме остаток монеты на
+        # реальных биржах вообще не трогался — просто исчезал из SYMBOLS и
+        # становился НЕВИДИМЫМ для /realbalance и ребаланса (real_exchange_
+        # rebalance_plan сверяется только с текущим SYMBOLS), то есть навсегда
+        # застревал бы на бирже, требуя ручной продажи. Теперь при удалении
+        # монеты в реальном режиме бот сам пытается продать реальный остаток
+        # обратно в USDT на каждой бирже, где он есть.
+        real_liquidated = {}
+        real_liquidation_failed = []
+        if not config["simulation_mode"]:
+            for ex in ["Binance", "KuCoin", "HTX"]:
+                real_balances = await get_real_balances(session, ex)
+                if not real_balances:
+                    continue
+                qty = real_balances.get(sym, 0.0)
+                if qty <= 0:
+                    continue
+                sell_qty = await round_quantity_for_exchange(session, ex, sym, qty)
+                if sell_qty <= 0:
+                    continue
+                result = None
+                if ex == "Binance":
+                    result = await place_order_binance(session, sym, "SELL", sell_qty)
+                elif ex == "KuCoin":
+                    result = await place_order_kucoin(session, sym, "sell", sell_qty, use_funds=False)
+                elif ex == "HTX":
+                    global _htx_account_id_cache
+                    if not _htx_account_id_cache:
+                        _htx_account_id_cache = await get_htx_account_id(session)
+                    if _htx_account_id_cache:
+                        result = await place_order_htx(session, _htx_account_id_cache, sym, "sell-market", sell_qty)
+                if result:
+                    real_liquidated[ex] = sell_qty
+                else:
+                    real_liquidation_failed.append(f"{ex} ({sell_qty} {sym}, {_last_exchange_error.get(ex, 'нет деталей')})")
+
+        real_liq_lines = "\n".join(f"   {ex}: продано {qty} {sym} → USDT" for ex, qty in real_liquidated.items())
+        msg = f"✅ Удалено: *{sym}*\n"
+        if liquidated:
+            msg += f"💰 Остатки симуляции конвертированы в USDT:\n{liq_lines}\n\n"
+        if real_liquidated:
+            msg += f"💰 РЕАЛЬНЫЙ остаток продан в USDT:\n{real_liq_lines}\n\n"
+        if real_liquidation_failed:
+            msg += ("🔴 Не удалось продать реальный остаток (продайте вручную в приложении биржи):\n   " +
+                    "\n   ".join(real_liquidation_failed) + "\n\n")
+        msg += f"Текущий список: {', '.join(SYMBOLS)}"
+        await send_tg(session, msg)
 
     elif cmd == "/listcoins":
         await send_tg(session, f"💱 *Торгуемые монеты:* {', '.join(SYMBOLS)}\n\n"
