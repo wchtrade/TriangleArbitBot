@@ -35,6 +35,20 @@ config = {
     "trading_active":     True,
     "paused":             False,
     "min_volume_usdt":    100000,
+    "max_plausible_spread_pct": 5.0,  # НОВОЕ 05.08: спред выше этого — почти
+        # гарантированно не реальная возможность, а артефакт тонкого/устаревшего
+        # стакана (мёртвая заявка, которую никто не обновлял). На двух нормальных
+        # биржах реальный устойчивый арбитражный спред живёт секунды и обычно
+        # не превышает 1-2%. Спреды 13-23%, которые бот ловил на ZIL/HTX 04.08,
+        # были именно таким артефактом — расчётная прибыль на бумаге, а по факту
+        # реальное исполнение получало совсем другую (гораздо худшую) цену.
+    "min_depth_levels_required": 2,  # НОВОЕ 05.08: если оба плеча сделки
+        # заполнились с 1 уровня стакана — это тонкий/подозрительный рынок,
+        # сигнал такого типа требует минимум 2 уровня с каждой стороны.
+    "max_topup_spend_per_day": 5.0,  # НОВОЕ 05.08: дневной потолок трат на
+        # автодокупки — 04.08 они съели $8.66 за один вечер на одной и той же
+        # проблемной паре, нигде не отражаясь в видимой прибыли. Сбрасывается
+        # каждые сутки автоматически (как и real_trades_today).
     "depth_limit":        50,      # сколько уровней стакана запрашиваем
     "rebalance_target_lots": 3,    # сколько лотов держать в резерве на каждую монету/USDT при авто-ребалансе
     "derating_factor":    0.25,    # реальность ≈ симуляция × 0.25 (ваша же оценка)
@@ -1028,6 +1042,21 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
     if net < config["min_profit_pct"]:
         return None
 
+    # ИСПРАВЛЕНИЕ 05.08: раньше сигнал с ЛЮБЫМ спредом выше порога считался
+    # валидным — но 04.08 бот регулярно ловил спреды 13-23% на ZIL/HTX,
+    # которые оказались не реальной прибылью, а искажением из-за тонкого,
+    # неактуального стакана (1-2 заявки, которые никто не обновлял). Реальное
+    # исполнение получало совсем другую цену, чем показывал снимок стакана,
+    # и по факту баланс не рос, а падал, несмотря на "прибыльные" сделки на
+    # бумаге. Теперь два защитных фильтра:
+    if gross > config["max_plausible_spread_pct"]:
+        stats["implausible_spread_rejected"] = stats.get("implausible_spread_rejected", 0) + 1
+        return None
+    min_levels = config["min_depth_levels_required"]
+    if buy_fill["levels_used"] < min_levels or sell_fill["levels_used"] < min_levels:
+        stats["thin_book_rejected"] = stats.get("thin_book_rejected", 0) + 1
+        return None
+
     coins  = trade_usdt / buy_price
     profit = coins * sell_price * (1 - sell_fee) - trade_usdt * (1 + buy_fee)
 
@@ -1654,6 +1683,19 @@ async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: floa
     if not price_hint or price_hint <= 0:
         return False
 
+    # ИСПРАВЛЕНИЕ 05.08: раньше автодокупка срабатывала БЕЗ ограничений —
+    # 04.08 она сработала 5 раз подряд на одной и той же паре ZIL/HTX-KuCoin
+    # (реальная стоимость которых, ~$8.66, нигде не отражалась в отчётах).
+    # Если докупка нужна СНОВА и СНОВА на одной и той же связке — это не
+    # разовая мелкая коррекция, а признак структурной проблемы (нестабильный,
+    # слишком тонкий рынок), и продолжать докупать за реальные деньги —
+    # значит просто платить за симптом снова и снова. Дневной потолок трат
+    # на автодокупки останавливает это автоматически.
+    if stats.get("topup_cost_usdt", 0.0) >= config["max_topup_spend_per_day"]:
+        logger.error(f"⛔ Дневной лимит трат на автодокупки (${config['max_topup_spend_per_day']}) "
+                      f"исчерпан — докупка {symbol} на {ex} пропущена")
+        return False
+
     stats["topup_attempts"] += 1
     # Берём не только сам shortfall, но и запас сверху (+8%), чтобы после
     # этой докупки следующая сделка не уткнулась в тот же порог снова.
@@ -1674,12 +1716,15 @@ async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: floa
 
     if result:
         stats["topup_success"] += 1
+        stats["topup_cost_usdt"] = stats.get("topup_cost_usdt", 0.0) + usd_needed
         logger.info(f"✅ Точечная докупка {symbol} на {ex}: ~${usd_needed} размещена "
                      f"(нехватка была {shortfall_qty:.2f} {symbol})")
         if CHAT_ID:
             await send_tg(session,
                 f"🔧 *Автодокупка*: не хватало {shortfall_qty:.2f} {symbol} на {ex} "
-                f"перед сделкой — докупил на ~${usd_needed} и продолжаю.")
+                f"перед сделкой — докупил на ~${usd_needed} и продолжаю. "
+                f"(итого потрачено на автодокупки сегодня: ~${stats['topup_cost_usdt']:.2f} "
+                f"из лимита ${config['max_topup_spend_per_day']})")
     else:
         logger.error(f"❌ Точечная докупка {symbol} на {ex} не удалась")
     return bool(result)
@@ -2260,6 +2305,7 @@ def reset_daily():
         config["real_trades_today"] = 0  # БАГ 31.07: раньше не сбрасывался вообще,
                                            # после 20 сделок с момента старта бот
                                            # навсегда блокировал реальную торговлю
+        stats["topup_cost_usdt"] = 0.0  # НОВОЕ 05.08: дневной счётчик трат на автодокупки
 
 
 def can_trade() -> bool:
@@ -2792,6 +2838,8 @@ async def handle_command(session, text, chat_id):
             f"/scan — скан сейчас | /top — все пары без порога\n"
             f"/triangle — треугольный арбитраж (Binance)\n"
             f"/depthcheck SYMBOL — сырой стакан + проскальзывание\n"
+            f"/scancandidates СИМВОЛ1 СИМВОЛ2 ... — сравнить глубину нескольких "
+            f"кандидатов на 3 биржах сразу, без добавления в торговлю\n"
             f"/stats — статистика | /balances — балансы\n"
             f"/rebalance — авто-ребаланс внутри бирж (+ инструкция если нужен перевод между биржами)\n"
             f"/crosstransfer FROM TO СУММА — записать ручной перевод\n"
@@ -2817,6 +2865,81 @@ async def handle_command(session, text, chat_id):
             f"/confirmreal /disablereal — гейт реальной торговли\n"
             f"/setlot 20 /setprofit 0.3 /setstop 10"
         )
+
+    elif cmd == "/scancandidates":
+        if len(parts) < 2:
+            await send_tg(session,
+                "Проверяет глубину стакана СРАЗУ по нескольким кандидатам на "
+                "всех трёх биржах, без добавления их в торговлю — чтобы выбирать "
+                "монету по цифрам, а не по одной вслепую.\n\n"
+                "Пример: `/scancandidates TRX DOGE XRP ADA LTC TON`\n"
+                "(до 8 монет за раз)"
+            )
+            return
+        candidates = [p.upper() for p in parts[1:9]]
+        await send_tg(session, f"🔍 Проверяю глубину стакана на 3 биржах для: {', '.join(candidates)}...")
+
+        results = []
+        for sym in candidates:
+            bn_ob = await get_orderbook_binance_rest(session, sym)
+            kc_ob = await get_orderbook_kucoin_rest(session, sym)
+            hx_ob = await get_orderbook_htx_rest(session, sym)
+            books = {"Binance": bn_ob, "KuCoin": kc_ob, "HTX": hx_ob}
+
+            row = {"symbol": sym, "exchanges": {}, "ok": True, "reasons": []}
+            for ex, ob in books.items():
+                if not ob:
+                    row["ok"] = False
+                    row["reasons"].append(f"{ex}: нет данных (пары нет или биржа не ответила)")
+                    row["exchanges"][ex] = None
+                    continue
+                ask_levels, bid_levels = len(ob["asks"]), len(ob["bids"])
+                fill500 = walk_the_book(ob["asks"], 500)
+                slip500 = (round((fill500['avg_price'] - ob['asks'][0][0]) / ob['asks'][0][0] * 100, 2)
+                           if fill500 else None)
+                row["exchanges"][ex] = {
+                    "ask": ob["asks"][0][0], "bid": ob["bids"][0][0],
+                    "ask_levels": ask_levels, "bid_levels": bid_levels,
+                    "slip500": slip500,
+                }
+                if ask_levels < 15 or bid_levels < 15:
+                    row["ok"] = False
+                    row["reasons"].append(f"{ex}: тонкий стакан ({ask_levels} ask / {bid_levels} bid уровней)")
+
+            # Кросс-биржевой разброс цены (best bid каждой биржи между собой) —
+            # если он аномально большой (>5%), это тот же симптом, что подвёл
+            # ZIL/HTX: цена на одной из бирж оторвана от реального рынка.
+            valid_bids = [v["bid"] for v in row["exchanges"].values() if v]
+            if len(valid_bids) >= 2:
+                spread_pct = round((max(valid_bids) - min(valid_bids)) / min(valid_bids) * 100, 2)
+                row["cross_spread"] = spread_pct
+                if spread_pct > 5:
+                    row["ok"] = False
+                    row["reasons"].append(f"цены между биржами расходятся на {spread_pct}% — подозрительно")
+            else:
+                row["cross_spread"] = None
+
+            results.append(row)
+
+        msg = "📊 *СРАВНЕНИЕ КАНДИДАТОВ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for row in sorted(results, key=lambda r: (not r["ok"], r.get("cross_spread") or 999)):
+            icon = "✅" if row["ok"] else "❌"
+            msg += f"{icon} *{row['symbol']}*"
+            if row["cross_spread"] is not None:
+                msg += f" (разброс цены между биржами: {row['cross_spread']}%)"
+            msg += "\n"
+            for ex, d in row["exchanges"].items():
+                if d is None:
+                    msg += f"   {ex}: нет данных\n"
+                else:
+                    msg += (f"   {ex}: {d['ask_levels']}/{d['bid_levels']} уровней, "
+                            f"проскальз. $500: {d['slip500']}%\n")
+            if row["reasons"]:
+                msg += f"   ⚠️ {'; '.join(row['reasons'])}\n"
+            msg += "\n"
+        msg += ("_✅ = минимум 15 уровней с обеих сторон на всех биржах, цены "
+                "не расходятся сильнее 5% — годится для добавления через /addcoin._")
+        await send_tg(session, msg)
 
     elif cmd == "/depthcheck":
         if len(parts) < 2 or parts[1].upper() not in SYMBOLS:
@@ -2907,7 +3030,13 @@ async def handle_command(session, text, chat_id):
                 f"   KuCoin: {stats['depth_fail']['KuCoin']}\n"
                 f"   HTX: {stats['depth_fail']['HTX']}\n"
                 f"   Сбоев 24h-объёма: {stats.get('volume_fetch_fail', 0)}\n\n"
-                f"🔧 Автодокупок при нехватке баланса: {stats['topup_success']}/{stats['topup_attempts']}\n\n"
+                f"🔧 Автодокупок при нехватке баланса: {stats['topup_success']}/{stats['topup_attempts']} "
+                f"(потрачено сегодня: ~${stats.get('topup_cost_usdt', 0.0):.2f} из "
+                f"${config['max_topup_spend_per_day']} лимита)\n"
+                f"🚫 Отклонено как неправдоподобный спред (>{config['max_plausible_spread_pct']}%): "
+                f"{stats.get('implausible_spread_rejected', 0)}\n"
+                f"🚫 Отклонено из-за тонкого стакана (<{config['min_depth_levels_required']} уровней): "
+                f"{stats.get('thin_book_rejected', 0)}\n\n"
                 f"{balance_block}\n"
                 f"⚙️ Реальный лимит ордера: ${config['max_real_order_usdt']} | "
                 f"Порог: {config['min_profit_pct']}% | "
@@ -3155,6 +3284,25 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Персональный запас ребаланса для {ex_name}: {val}%")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setheadroomex HTX 3`")
+
+    elif cmd == "/setmaxspread":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущий потолок правдоподобного спреда: {config['max_plausible_spread_pct']}%\n\n"
+                f"Сигналы со спредом ВЫШЕ этого значения отклоняются как вероятный "
+                f"артефакт тонкого/неактуального стакана, а не реальная возможность.\n\n"
+                f"Пример: `/setmaxspread 5`"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val <= 0 or val > 50:
+                await send_tg(session, "❌ Разумный диапазон: 0.1-50%.")
+                return
+            config["max_plausible_spread_pct"] = val
+            await send_tg(session, f"✅ Потолок правдоподобного спреда: {val}%")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setmaxspread 5`")
 
     elif cmd == "/setreallot":
         floor_val = max(MIN_ORDER_VALUE_USD.values())  # $10 (HTX) — ниже гарантированный отказ
