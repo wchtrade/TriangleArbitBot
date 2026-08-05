@@ -2118,10 +2118,17 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
     # биржа ДЕЙСТВИТЕЛЬНО продаёт — для всех остальных случаев target = 0,
     # то есть любая монета сверху сразу считается "излишком" и уходит в
     # USDT на ближайшем /rebalance, как и должно быть.
+    # ИСПРАВЛЕНИЕ 05.08 (раунд 10, продолжение): coin_values ТОЖЕ должен
+    # содержать запись для монеты с нулевым балансом на бирже-продавце —
+    # иначе цикл докупки дефицита в apply_real_intra_exchange_rebalance
+    # (который идёт ПО ЗАПИСЯМ coin_values) просто не увидит эту монету
+    # вообще и никогда не купит резерв с нуля.
     coin_values: Dict[str, float] = {}
     for sym in SYMBOLS:
         qty = balances.get(sym, 0.0)
         if qty <= 0:
+            if is_sell_ex:
+                coin_values[sym] = 0.0  # монета нужна по роли, но резерва пока нет — не пропускаем
             continue
         price = await get_valuation_price(session, ex, sym)
         if price:
@@ -2136,7 +2143,15 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
     effective_usdt_target = usdt_target if ex in buy_exchanges else 0.0
     effective_coin_target = coin_target_usd if is_sell_ex else 0.0
     headroom_mult = 1 + get_headroom_pct(ex) / 100
-    coin_reserve_syms = len(coin_values) if is_sell_ex else 0
+    # ИСПРАВЛЕНИЕ 05.08 (раунд 10): раньше coin_reserve_syms = len(coin_values) —
+    # но coin_values пропускает символы с НУЛЕВЫМ балансом (qty <= 0 → continue).
+    # На свежепереключённой монете (только что добавили TRX, ещё ни разу не
+    # покупали резерв) coin_values оказывался ПУСТЫМ, и needed_total считал,
+    # что бирже-продавцу вообще ничего не нужно ($0) — хотя по роли ей
+    # положен резерв. Теперь считаем от количества монет в SYMBOLS (то есть
+    # от ЦЕЛИ), а не от того, что уже случайно есть на балансе — иначе цель
+    # "рассасывается" именно тогда, когда она нужнее всего: при старте с нуля.
+    coin_reserve_syms = len(SYMBOLS) if is_sell_ex else 0
     needed_total = effective_usdt_target + (coin_target_usd * headroom_mult) * coin_reserve_syms
 
     return {
