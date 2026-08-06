@@ -3671,6 +3671,37 @@ async def handle_command(session, text, chat_id):
             msg += "На всех биржах остатка не найдено — продавать нечего."
         await send_tg(session, msg)
 
+    elif cmd == "/setfee":
+        # НОВОЕ 06.08: /realfees дёргает API биржи, но у Binance этот
+        # эндпоинт не отражает скидку от оплаты комиссии в BNB (возвращает
+        # номинальную ставку, а не фактическую после скидки) — скидка
+        # применяется в момент самой сделки, но не видна через этот запрос.
+        # Раз включили "Оплата комиссии в BNB/KCS" вручную в приложении
+        # биржи — можно задать реальную ставку сюда напрямую, без API.
+        if len(parts) < 3:
+            await send_tg(session,
+                f"Текущие комиссии: {FEES}\n\n"
+                f"Задать вручную (например, после включения скидки BNB/KCS, "
+                f"которую /realfees не видит через API):\n"
+                f"`/setfee Binance 0.075` — Binance со скидкой BNB (25% от 0.1%)\n"
+                f"`/setfee KuCoin 0.08` — KuCoin со скидкой KCS (20% от 0.1%)\n"
+                f"`/setfee HTX 0.2` — вернуть обычное значение"
+            )
+            return
+        ex_name = parts[1]
+        if ex_name not in ("Binance", "KuCoin", "HTX"):
+            await send_tg(session, "❌ Биржа должна быть одной из: Binance, KuCoin, HTX")
+            return
+        try:
+            val = float(parts[2])
+            if val < 0 or val > 2:
+                await send_tg(session, "❌ Разумный диапазон: 0-2%.")
+                return
+            FEES[ex_name] = val
+            await send_tg(session, f"✅ Комиссия {ex_name}: {val}%\nТекущий FEES: {FEES}")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setfee Binance 0.075`")
+
     elif cmd == "/realfees":
         if not SYMBOLS:
             await send_tg(session, "Список монет пуст.")
