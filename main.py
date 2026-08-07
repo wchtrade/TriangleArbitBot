@@ -2697,6 +2697,22 @@ async def execute_trade(session, opp: dict) -> dict:
     real_result = None
     if not config["simulation_mode"] and is_real_trading_allowed():
         real_result = await execute_real_arbitrage(session, opp)
+        if real_result.get("success"):
+            # НОВОЕ 08.08: раньше единственная метрика P&L была "Реальный
+            # баланс" целиком — а это ОБЩАЯ рыночная стоимость портфеля,
+            # включая переоценку резерва монеты по текущей цене. Колебание
+            # цены IOST на резерве (~$21) всего на десятые доли процента
+            # маскирует или искажает результат нескольких сделок подряд —
+            # после 3 сделок с честной расчётной прибылью +$0.0046 каждая
+            # (~$0.014 суммарно) общий баланс показывал -$0.15, и было
+            # невозможно понять, торговля ли в минусе или просто цена
+            # резерва просела. Теперь считаем РЕАЛИЗОВАННУЮ прибыль отдельно,
+            # независимо от рыночной переоценки резерва.
+            rebalance_cost_est = round(opp["vol"] * (FEES.get(opp["buy_ex"], 0.1) +
+                                                       FEES.get(opp["sell_ex"], 0.1)) / 100, 4)
+            honest_cycle_profit = round(opp["profit_usdt"] - rebalance_cost_est, 4)
+            stats["realized_trading_pnl"] = round(stats.get("realized_trading_pnl", 0.0) + honest_cycle_profit, 4)
+            stats["realized_trades_count"] = stats.get("realized_trades_count", 0) + 1
         if not real_result.get("success"):
             logger.error(f"РЕАЛЬНАЯ сделка не удалась: {real_result}")
             error = real_result.get("error", "")
@@ -3180,18 +3196,26 @@ async def handle_command(session, text, chat_id):
                 balance_block = "⚠️ Не удалось прочитать реальный баланс — см. /realbalance для деталей.\n"
             else:
                 per_ex = " | ".join(f"{ex}: ${v}" for ex, v in real["per_exchange"].items())
+                realized_pnl = stats.get("realized_trading_pnl", 0.0)
+                realized_n = stats.get("realized_trades_count", 0)
+                realized_line = (
+                    f"📊 Реализованная торговая прибыль (без учёта переоценки резерва): "
+                    f"{realized_pnl:+.4f} USDT за {realized_n} сделок\n"
+                )
                 if config["real_start_capital"]:
                     pnl_real = round(real["total"] - config["real_start_capital"], 2)
                     balance_block = (
                         f"💵 Реальный баланс: ${real['total']} ({per_ex})\n"
                         f"   Старт (зафиксирован): ${config['real_start_capital']} | "
-                        f"P&L: {pnl_real:+.2f}\n"
+                        f"P&L: {pnl_real:+.2f} (включает переоценку резерва по рынку)\n"
+                        f"{realized_line}"
                     )
                 else:
                     balance_block = (
                         f"💵 Реальный баланс: ${real['total']} ({per_ex})\n"
                         f"   💡 Стартовая точка не зафиксирована — `/setrealstart` "
                         f"чтобы считать P&L честно\n"
+                        f"{realized_line}"
                     )
             await send_tg(session,
                 f"📈 *СТАТИСТИКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
