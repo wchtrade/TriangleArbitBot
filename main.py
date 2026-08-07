@@ -26,7 +26,10 @@ config = {
     "simulation_mode":    True,
     "min_profit_pct":     0.3,
     "trade_usdt":         20.0,
-    "scan_interval":      10,
+    "scan_interval":      3,  # СНИЖЕНО (было 10): цена и так живая через
+        # WebSocket, интервал влияет только на частоту сверки/решения —
+        # короче интервал, больше шансов поймать мимолётное окно возможности.
+        # Настраивается командой /setinterval.
     "max_trades_per_min": 6,
     "stop_loss_usdt":     10.0,
     "daily_loss":         0.0,
@@ -2919,7 +2922,7 @@ async def handle_command(session, text, chat_id):
             f"/resetsim CONFIRM — сброс симуляции\n"
             f"/mode — переключить режим\n"
             f"/confirmreal /disablereal — гейт реальной торговли\n"
-            f"/setlot 20 /setprofit 0.3 /setstop 10"
+            f"/setlot 20 /setprofit 0.3 /setstop 10 /setinterval 3"
         )
 
     elif cmd == "/scancandidates":
@@ -3966,6 +3969,35 @@ async def handle_command(session, text, chat_id):
                 await send_tg(session, f"✅ Лот: ${config['trade_usdt']}")
             except Exception:
                 pass
+
+    elif cmd == "/setinterval":
+        # НОВОЕ: как часто bot СВЕРЯЕТ уже живые (обновляемые по WebSocket
+        # в реальном времени) локальные стаканы и принимает решение —
+        # не то же самое, что "как часто он видит цену" (цена и так всегда
+        # свежая через WS). Уменьшение интервала помогает ловить короткие
+        # окна возможности, которые могут закрываться быстрее, чем раз в
+        # 10 секунд, ценой чуть большей нагрузки на CPU (не на биржи —
+        # запросов к ним больше не становится, WS-соединения и так висят
+        # постоянно).
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущий интервал сканирования: {config['scan_interval']} сек\n\n"
+                f"Это НЕ задержка получения цены (она всегда свежая через WebSocket) — "
+                f"это как часто бот сверяет уже живые данные и решает, действовать ли. "
+                f"Меньше — больше шансов поймать короткое окно возможности.\n\n"
+                f"Пример: `/setinterval 3` (минимум 2 сек — разумный предел, "
+                f"чтобы не грузить CPU впустую)"
+            )
+            return
+        try:
+            val = int(parts[1])
+            if val < 2 or val > 60:
+                await send_tg(session, "❌ Разумный диапазон: 2-60 сек.")
+                return
+            config["scan_interval"] = val
+            await send_tg(session, f"✅ Интервал сканирования: {val} сек")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setinterval 3`")
 
     elif cmd == "/setprofit":
         if len(parts) > 1:
