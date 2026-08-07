@@ -67,7 +67,8 @@ config = {
         # нигде не отражаясь в видимой прибыли. Сбрасывается каждые сутки
         # автоматически (как и real_trades_today).
     "depth_limit":        50,      # сколько уровней стакана запрашиваем
-    "rebalance_target_lots": 1,    # ЗАФИКСИРОВАНО 05.08 (было 3): сколько лотов держать в резерве на каждую монету/USDT при авто-ребалансе — 1 лот достаточно и не требует избыточного капитала
+    "rebalance_target_lots": 1,    # ЗАФИКСИРОВАНО 05.08 (было 3): сколько лотов держать в резерве USDT на ПОКУПКУ при авто-ребалансе — 1 лот достаточно, эти деньги и так пополняются перед каждой сделкой
+    "sell_reserve_lots": 3,    # НОВОЕ 08.08: сколько лотов держать в резерве МОНЕТЫ на ПРОДАЖУ — здесь, наоборот, полезен запас на несколько сделок вперёд, чтобы не платить за докупку почти на каждой сделке. Настраивается через /setsellreserve
     "derating_factor":    0.25,    # реальность ≈ симуляция × 0.25 (ваша же оценка)
 
     # ===== ЭТАП 6: РЕАЛЬНОЕ ИСПОЛНЕНИЕ — ЖЁСТКИЙ ГЕЙТ =====
@@ -2153,9 +2154,20 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
     if balances is None:
         return None
 
-    real_lot = config["max_real_order_usdt"]  # $15 — жёсткий потолок реального ордера
+    real_lot = config["max_real_order_usdt"]  # жёсткий потолок реального ордера
     lots = config["rebalance_target_lots"]
-    coin_target_usd = real_lot * lots
+    # ИСПРАВЛЕНИЕ 08.08: раньше coin_target_usd (резерв монеты на ПРОДАЖУ) и
+    # usdt_target (резерв USDT на ПОКУПКУ) считались от одного и того же
+    # "lots" — но это разные по смыслу вещи. Резерв на покупку не нужно
+    # копить впрок: он и так пополняется из живых денег перед каждой
+    # сделкой. А вот резерв на продажу ИМЕННО стоит держать на несколько
+    # сделок вперёд — иначе (как и произошло на практике) почти каждая
+    # сделка выжигает почти весь резерв и требует дорогой платной докупки
+    # (топ-ап) буквально каждый раз, съедая всю тонкую маржу лишними
+    # комиссиями. sell_reserve_lots — отдельный множитель именно для
+    # резерва продажи, настраивается через /setsellreserve.
+    sell_lots = config.get("sell_reserve_lots", lots)
+    coin_target_usd = real_lot * sell_lots
     usdt_target = real_lot * lots
 
     def is_seller_for(sym: str) -> bool:
@@ -3375,6 +3387,24 @@ async def handle_command(session, text, chat_id):
                                     f"${config['max_real_order_usdt']*config['rebalance_target_lots']} в РЕАЛЬНОМ режиме)")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setrebalance 3`")
+
+    elif cmd == "/setsellreserve":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущий резерв ПРОДАЖИ: {config.get('sell_reserve_lots', config['rebalance_target_lots'])} лотов "
+                f"на монету (≈${config['max_real_order_usdt']*config.get('sell_reserve_lots', config['rebalance_target_lots'])} "
+                f"в реальном режиме).\n\n"
+                f"Это ОТДЕЛЬНО от `/setrebalance` (тот — резерв USDT на покупку). "
+                f"Держать здесь больше лотов полезно — не нужно докупать монету почти "
+                f"на каждой сделке.\n\n"
+                f"Пример: `/setsellreserve 3`")
+            return
+        try:
+            config["sell_reserve_lots"] = int(parts[1])
+            await send_tg(session, f"✅ Резерв продажи: {config['sell_reserve_lots']} лотов "
+                                    f"(≈${config['max_real_order_usdt']*config['sell_reserve_lots']} в реальном режиме)")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setsellreserve 3`")
 
     elif cmd == "/setbalancebuffer":
         if len(parts) < 2:
