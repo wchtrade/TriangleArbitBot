@@ -337,7 +337,7 @@ class BinanceLocalOrderBook:
         return {"bids": bids_sorted, "asks": asks_sorted}
 
     def is_healthy(self) -> bool:
-        return self.synced and (time.time() - self.last_event_time) < 10
+        return self.synced and (time.time() - self.last_event_time) < 90
 
     def stop(self):
         self._stop = True
@@ -565,7 +565,7 @@ class KuCoinLocalOrderBook:
         return {"bids": self.bids[:depth], "asks": self.asks[:depth]}
 
     def is_healthy(self) -> bool:
-        return self.synced and (time.time() - self.last_event_time) < 15
+        return self.synced and (time.time() - self.last_event_time) < 90
 
     def stop(self):
         self._stop = True
@@ -723,7 +723,7 @@ class HTXLocalOrderBook:
         return {"bids": self.bids[:depth], "asks": self.asks[:depth]}
 
     def is_healthy(self) -> bool:
-        return self.synced and (time.time() - self.last_event_time) < 15
+        return self.synced and (time.time() - self.last_event_time) < 90
 
     def stop(self):
         self._stop = True
