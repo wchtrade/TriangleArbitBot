@@ -1060,6 +1060,7 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
     # глубину стакана ниже.
     known_volume = coin_volumes.get(symbol)
     if known_volume is not None and known_volume < config["min_volume_usdt"]:
+        stats["volume_too_low_rejected"] = stats.get("volume_too_low_rejected", 0) + 1
         return None
 
     buy_fill  = walk_the_book(buy_ob["asks"], trade_usdt)
@@ -3102,7 +3103,9 @@ async def handle_command(session, text, chat_id):
                 f"🚫 Отклонено как неправдоподобный спред (>{config['max_plausible_spread_pct']}%): "
                 f"{stats.get('implausible_spread_rejected', 0)}\n"
                 f"🚫 Отклонено из-за тонкого стакана (<{config['min_depth_levels_required']} уровней): "
-                f"{stats.get('thin_book_rejected', 0)}\n\n"
+                f"{stats.get('thin_book_rejected', 0)}\n"
+                f"🚫 Отклонено из-за низкого 24h-объёма (<${config['min_volume_usdt']:,.0f}): "
+                f"{stats.get('volume_too_low_rejected', 0)}\n\n"
                 f"{balance_block}\n"
                 f"⚙️ Реальный лимит ордера: ${config['max_real_order_usdt']} | "
                 f"Порог: {config['min_profit_pct']}% | "
