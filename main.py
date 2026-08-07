@@ -1,4 +1,3 @@
-
 import asyncio
 import aiohttp
 import logging
@@ -4118,6 +4117,25 @@ async def scan_loop(session):
                             continue
                         if result["executed"]:
                             await send_tg(session, "✅ *ИСПОЛНЕНО*\n\n" + format_signal(opp))
+                            # НОВОЕ 07.08: после КАЖДОЙ успешной реальной сделки
+                            # монета/USDT на обеих биржах естественным образом
+                            # "перетекают" в форму, нужную для СЛЕДУЮЩЕЙ сделки
+                            # неправильно (биржа-покупатель тратит USDT, биржа-
+                            # продавец тратит запас монеты) — раньше это
+                            # выяснялось только на следующей попытке, с отказом
+                            # "insufficient_usdt_on_..." и ручным /rebalance.
+                            # Теперь ребалансируем сразу, не дожидаясь отказа.
+                            if not config["simulation_mode"]:
+                                now_ts = time.time()
+                                global _last_auto_rebalance_attempt
+                                if now_ts - _last_auto_rebalance_attempt > AUTO_REBALANCE_COOLDOWN:
+                                    _last_auto_rebalance_attempt = now_ts
+                                    rb_result = await real_auto_rebalance_all(session)
+                                    if CHAT_ID and (rb_result.get("applied") or rb_result.get("cross_exchange_needed")):
+                                        await send_tg(session, "⚖️ Авто-ребаланс после сделки:\n\n" +
+                                                       format_real_rebalance_result(rb_result))
+                                    if not rb_result.get("safe_to_resume", True):
+                                        config["paused"] = True
                         else:
                             reason = REASON_LABELS.get(result["reason"], result["reason"])
                             await send_tg(session,
