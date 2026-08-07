@@ -2377,8 +2377,34 @@ async def real_auto_rebalance_all(session) -> dict:
                 "note": f"Есть мелкий дефицит ниже ${CROSS_EXCHANGE_MIN_WORTH_TRANSFER} — "
                         f"перевод не стоит комиссии, торговля продолжается."}
 
+    # ИСПРАВЛЕНИЕ 07.08: раньше внутренний ребаланс (продажа лишней/чужой
+    # монеты обратно в USDT, докупка нужной) вызывался ТОЛЬКО для бирж с
+    # излишком — дефицитные биржи пропускались целиком. Но продажа монеты,
+    # которую бирже вообще не положено держать (например, KuCoin с $7.71 в
+    # IOST при новом направлении, где IOST должна быть только на Binance) —
+    # это БЕЗОПАСНАЯ операция, не требует новых денег, только освобождает
+    # то, что уже есть, просто в неправильной форме. Раньше эти деньги
+    # просто лежали мёртвым грузом, а бот требовал перевод СВЕРХУ, даже не
+    # попробовав сначала освободить то, что уже было на месте.
+    for ex, p in real_deficits.items():
+        applied.append(await apply_real_intra_exchange_rebalance(session, ex, p))
     for ex, p in surpluses.items():
         applied.append(await apply_real_intra_exchange_rebalance(session, ex, p))
+
+    # После продажи "чужой" монеты на дефицитных биржах реальный дефицит
+    # мог уменьшиться (или исчезнуть) — пересчитываем перед тем, как просить
+    # перевод, вместо того чтобы полагаться на цифры ДО этой продажи.
+    updated_plans = {}
+    for ex in real_deficits:
+        updated_plans[ex] = await real_exchange_rebalance_plan(session, ex)
+    real_deficits = {ex: p for ex, p in updated_plans.items() if p and
+                      -p["surplus"] >= CROSS_EXCHANGE_MIN_WORTH_TRANSFER}
+    if not real_deficits:
+        had_actions = any(a["actions"] for a in applied)
+        safe = True if not (dry_run and had_actions) else False
+        return {"fully_rebalanced": True, "applied": applied, "cross_exchange_needed": None,
+                "dry_run": dry_run, "safe_to_resume": safe,
+                "note": "Продажа лишней монеты на месте закрыла дефицит без перевода между биржами."}
 
     instructions = []
     remaining_surplus = {ex: p["surplus"] for ex, p in surpluses.items()}
