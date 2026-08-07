@@ -3544,11 +3544,23 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Пример: `/setmaxspread 5`")
 
     elif cmd == "/setreallot":
-        floor_val = max(MIN_ORDER_VALUE_USD.values())  # $10 (HTX) — ниже гарантированный отказ
+        # ИСПРАВЛЕНИЕ 08.08: раньше минимум лота считался от ВСЕХ бирж в
+        # словаре MIN_ORDER_VALUE_USD, включая HTX ($10) — даже если HTX
+        # сейчас не участвует в маршруте ни одной активной монеты (как
+        # сейчас, после удаления TRX). Теперь минимум считается только от
+        # бирж, которые ДЕЙСТВИТЕЛЬНО используются текущими монетами.
+        active_exchanges = set()
+        for sym in SYMBOLS:
+            for buy_ex, sell_ex in pairs_for_symbol(sym):
+                active_exchanges.add(buy_ex)
+                active_exchanges.add(sell_ex)
+        relevant_minimums = [MIN_ORDER_VALUE_USD.get(ex, 5.0) for ex in active_exchanges] or [5.0]
+        floor_val = max(relevant_minimums)
         if len(parts) < 2:
             await send_tg(session,
                 f"Текущий реальный лимит ордера: ${config['max_real_order_usdt']}\n"
-                f"Диапазон: от ${floor_val} до $15 (минимум биржи ↔ потолок безопасности).\n"
+                f"Диапазон: от ${floor_val} до $15 (минимум ДЕЙСТВУЮЩИХ бирж ↔ потолок безопасности).\n"
+                f"Активные биржи сейчас: {', '.join(sorted(active_exchanges)) or '—'}\n"
                 f"Пример: `/setreallot 10`")
             return
         try:
@@ -3561,8 +3573,9 @@ async def handle_command(session, text, chat_id):
             if new_val < floor_val:
                 await send_tg(session,
                     f"❌ Нельзя установить меньше ${floor_val} — это минимальная сумма ордера "
-                    f"у HTX. Сделка с лотом меньше этого будет ГАРАНТИРОВАННО отклонена биржей "
-                    f"(мы это уже проходили). Минимум — ${floor_val}.")
+                    f"среди бирж, которые СЕЙЧАС реально используются ({', '.join(sorted(active_exchanges))}). "
+                    f"Сделка с лотом меньше этого будет ГАРАНТИРОВАННО отклонена биржей. "
+                    f"Минимум — ${floor_val}.")
                 return
             config["max_real_order_usdt"] = new_val
             needed = round(new_val * config["rebalance_target_lots"] * 5, 2)
