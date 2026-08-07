@@ -2341,12 +2341,35 @@ async def real_auto_rebalance_all(session) -> dict:
         return {"fully_rebalanced": True, "applied": applied, "cross_exchange_needed": None,
                 "dry_run": dry_run, "safe_to_resume": safe}
 
+    # НОВОЕ 07.08: дефицит $0.10-2 технически существует, но переводить его
+    # между биржами экономически бессмысленно — комиссия сети (обычно ~$1
+    # на TRC-20) съест сумму перевода целиком или почти целиком. Раньше
+    # ЛЮБОЙ дефицит выше $0.10 останавливал торговлю и требовал перевода —
+    # бот раз за разом упирался в одну и ту же копеечную "недостачу" при
+    # каждом плановом ребалансе (раз в ~30 мин), заставляя вручную жать
+    # /go без какого-либо реального решения проблемы. Теперь останавливаем
+    # торговлю и просим перевод, только если сумма ДЕЙСТВИТЕЛЬНО стоит
+    # затраченной на неё комиссии.
+    CROSS_EXCHANGE_MIN_WORTH_TRANSFER = 2.0
+    real_deficits = {ex: p for ex, p in deficits.items()
+                      if -p["surplus"] >= CROSS_EXCHANGE_MIN_WORTH_TRANSFER}
+
+    if not real_deficits:
+        for ex, p in plans.items():
+            applied.append(await apply_real_intra_exchange_rebalance(session, ex, p))
+        had_actions = any(a["actions"] for a in applied)
+        safe = True if not (dry_run and had_actions) else False
+        return {"fully_rebalanced": True, "applied": applied, "cross_exchange_needed": None,
+                "dry_run": dry_run, "safe_to_resume": safe,
+                "note": f"Есть мелкий дефицит ниже ${CROSS_EXCHANGE_MIN_WORTH_TRANSFER} — "
+                        f"перевод не стоит комиссии, торговля продолжается."}
+
     for ex, p in surpluses.items():
         applied.append(await apply_real_intra_exchange_rebalance(session, ex, p))
 
     instructions = []
     remaining_surplus = {ex: p["surplus"] for ex, p in surpluses.items()}
-    for ex, p in sorted(deficits.items(), key=lambda kv: kv[1]["surplus"]):
+    for ex, p in sorted(real_deficits.items(), key=lambda kv: kv[1]["surplus"]):
         need = round(-p["surplus"], 2)
         source = max(remaining_surplus, key=remaining_surplus.get, default=None)
         if source and remaining_surplus[source] > 0:
