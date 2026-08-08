@@ -1192,6 +1192,18 @@ async def scan_all(session) -> Tuple[List[dict], List[str]]:
     ex_map = {"Binance": bn, "KuCoin": kc, "HTX": hx}
     signals = []
 
+    # ИСПРАВЛЕНИЕ 08.08 (найдено после 6 сделок подряд с растущим реальным
+    # минусом, хотя каждая карточка обещала честную прибыль в плюс): здесь
+    # ВСЕГДА использовался config["trade_usdt"] — старая, фиксированная на
+    # $20 симуляционная переменная, — даже в реальном режиме, где реальный
+    # размер ордера настраивается отдельно через /setreallot и может быть
+    # МЕНЬШЕ (сейчас $7). Карточка сделки считала прибыль так, будто
+    # торгуется $20, хотя реально исполнялось только $7 — прибыль на
+    # карточке была примерно втрое завышена относительно того, что
+    # происходило на бирже на самом деле.
+    scan_lot = (real_config["max_real_order_usdt"] if not config["simulation_mode"]
+                else config["trade_usdt"])
+
     hour = datetime.now().hour
     for sym in SYMBOLS:
         for buy_ex, sell_ex in pairs_for_symbol(sym):
@@ -1199,7 +1211,7 @@ async def scan_all(session) -> Tuple[List[dict], List[str]]:
             sob = ex_map.get(sell_ex, {}).get(sym)
             if not bob or not sob:
                 continue
-            opp = calc_arb_real(sym, buy_ex, bob, sell_ex, sob, config["trade_usdt"])
+            opp = calc_arb_real(sym, buy_ex, bob, sell_ex, sob, scan_lot)
             if opp:
                 signals.append(opp)
                 key = f"{buy_ex}→{sell_ex}"
