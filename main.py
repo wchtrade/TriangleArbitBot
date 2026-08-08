@@ -1201,7 +1201,7 @@ async def scan_all(session) -> Tuple[List[dict], List[str]]:
     # торгуется $20, хотя реально исполнялось только $7 — прибыль на
     # карточке была примерно втрое завышена относительно того, что
     # происходило на бирже на самом деле.
-    scan_lot = (real_config["max_real_order_usdt"] if not config["simulation_mode"]
+    scan_lot = (config["max_real_order_usdt"] if not config["simulation_mode"]
                 else config["trade_usdt"])
 
     hour = datetime.now().hour
@@ -4094,7 +4094,7 @@ async def handle_command(session, text, chat_id):
         # чем то, что реально сканирует и исполняет бот, и результаты не
         # совпадают между собой (именно так и было замечено — /top нашёл
         # сигнал, а /stats фонового цикла — нет).
-        top_lot = (real_config["max_real_order_usdt"] if not config["simulation_mode"]
+        top_lot = (config["max_real_order_usdt"] if not config["simulation_mode"]
                    else config["trade_usdt"])
         all_opps = []
         for sym in SYMBOLS:
