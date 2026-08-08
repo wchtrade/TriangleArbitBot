@@ -4089,13 +4089,20 @@ async def handle_command(session, text, chat_id):
         ex_map = {"Binance": bn, "KuCoin": kc, "HTX": hx}
         saved = config["min_profit_pct"]
         config["min_profit_pct"] = -999
+        # ИСПРАВЛЕНИЕ 08.08: тот же лот, что использует фоновый цикл реальной
+        # торговли — иначе /top показывает картину для другого объёма сделки,
+        # чем то, что реально сканирует и исполняет бот, и результаты не
+        # совпадают между собой (именно так и было замечено — /top нашёл
+        # сигнал, а /stats фонового цикла — нет).
+        top_lot = (real_config["max_real_order_usdt"] if not config["simulation_mode"]
+                   else config["trade_usdt"])
         all_opps = []
         for sym in SYMBOLS:
             for buy_ex, sell_ex in pairs_for_symbol(sym):
                 bob = ex_map.get(buy_ex, {}).get(sym)
                 sob = ex_map.get(sell_ex, {}).get(sym)
                 if bob and sob:
-                    opp = calc_arb_real(sym, buy_ex, bob, sell_ex, sob, config["trade_usdt"])
+                    opp = calc_arb_real(sym, buy_ex, bob, sell_ex, sob, top_lot)
                     if opp:
                         all_opps.append(opp)
         config["min_profit_pct"] = saved
