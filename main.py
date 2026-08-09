@@ -253,6 +253,10 @@ exchange_backoff_until: Dict[str, float] = {"Binance": 0.0, "KuCoin": 0.0, "HTX"
 # сумма ордера или что-то ещё. Теперь текст ответа биржи сохраняется здесь
 # и подставляется в сообщение об ошибке.
 _last_exchange_error: Dict[str, str] = {"Binance": "", "KuCoin": "", "HTX": ""}
+# НОВОЕ 09.08: цена последней реальной продажи по (биржа, монета) — нужна,
+# чтобы честно посчитать реальную стоимость сдвига курса при последующей
+# докупке резерва (не просто оценку по комиссии, как было раньше).
+_last_real_sell_price: Dict[Tuple[str, str], float] = {}
 
 
 def _remember_error(ex: str, detail) -> None:
@@ -1804,14 +1808,35 @@ async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: floa
     if result:
         stats["topup_success"] += 1
         stats["topup_cost_usdt"] = stats.get("topup_cost_usdt", 0.0) + usd_needed
+        # НОВОЕ 09.08: реальная стоимость сдвига курса между продажей и
+        # докупкой — вот что молчаливо съедало деньги. Раньше карточка
+        # сделки показывала фиксированную оценку по комиссии (~$0.011),
+        # а по факту докупка часто идёт ПОСЛЕ того, как курс монеты уже
+        # успел подрасти со времени последней продажи на этой же бирже —
+        # тогда докупка обходится дороже, чем принесла продажа. Это
+        # подтверждено выгрузкой Binance: -$1.98 только от этого эффекта
+        # за 2 дня, не считая комиссий.
+        last_sell = _last_real_sell_price.get((ex, symbol))
+        if last_sell and last_sell > 0:
+            bought_qty = shortfall_qty * 1.08
+            drift_cost = round((price_hint - last_sell) * bought_qty, 4)
+            stats["price_drift_cost_usdt"] = round(stats.get("price_drift_cost_usdt", 0.0) + drift_cost, 4)
+            stats["realized_trading_pnl"] = round(stats.get("realized_trading_pnl", 0.0) - drift_cost, 4)
+            logger.info(f"💧 Реальная стоимость сдвига курса при докупке {symbol}/{ex}: "
+                         f"{'+' if drift_cost < 0 else '-'}{abs(drift_cost):.4f} USDT "
+                         f"(докупка по {price_hint:.8f} против последней продажи по {last_sell:.8f})")
         logger.info(f"✅ Точечная докупка {symbol} на {ex}: ~${usd_needed} размещена "
                      f"(нехватка была {shortfall_qty:.2f} {symbol})")
         if CHAT_ID:
+            drift_line = ""
+            if last_sell and last_sell > 0:
+                drift_line = (f"💧 Реальная стоимость сдвига курса: "
+                               f"{'+' if drift_cost < 0 else '-'}{abs(drift_cost):.4f} USDT\n")
             await send_tg(session,
                 f"🔧 *Автодокупка*: не хватало {shortfall_qty:.2f} {symbol} на {ex} "
                 f"перед сделкой — докупил на ~${usd_needed} и продолжаю. "
                 f"(итого потрачено на автодокупки сегодня: ~${stats['topup_cost_usdt']:.2f} "
-                f"из лимита ${config['max_topup_spend_per_day']})")
+                f"из лимита ${config['max_topup_spend_per_day']})\n{drift_line}")
     else:
         logger.error(f"❌ Точечная докупка {symbol} на {ex} не удалась")
     return bool(result)
@@ -2004,6 +2029,14 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
             "emergency_close": bool(emergency),
             "buy_result": buy_result,
         }
+
+    # НОВОЕ 09.08: запоминаем реальную цену продажи для этой биржи+монеты —
+    # нужно, чтобы честно посчитать РЕАЛЬНУЮ (не оценочную по комиссии)
+    # стоимость последующей докупки резерва. Найдено по выгрузке Binance:
+    # между продажей и докупкой курс монеты успевает сдвинуться, и это
+    # реальная, а не бумажная потеря — за 2 дня набежало -$1.98 только на
+    # этом эффекте, и бот её никогда не видел и не показывал.
+    _last_real_sell_price[(sell_ex, symbol)] = opp["avg_sell_price"]
 
     return {"success": True, "buy_result": buy_result, "sell_result": sell_result, "vol": vol,
              "confirmed_qty": confirmed_qty}
@@ -3210,9 +3243,13 @@ async def handle_command(session, text, chat_id):
                 per_ex = " | ".join(f"{ex}: ${v}" for ex, v in real["per_exchange"].items())
                 realized_pnl = stats.get("realized_trading_pnl", 0.0)
                 realized_n = stats.get("realized_trades_count", 0)
+                drift_cost = stats.get("price_drift_cost_usdt", 0.0)
                 realized_line = (
-                    f"📊 Реализованная торговая прибыль (без учёта переоценки резерва): "
+                    f"📊 Реализованная торговая прибыль (без учёта переоценки резерва, "
+                    f"НО с учётом реальной стоимости докупки): "
                     f"{realized_pnl:+.4f} USDT за {realized_n} сделок\n"
+                    f"💧 Из них реальная стоимость сдвига курса при докупках: "
+                    f"{'+' if drift_cost < 0 else '-'}{abs(drift_cost):.4f} USDT\n"
                 )
                 if config["real_start_capital"]:
                     pnl_real = round(real["total"] - config["real_start_capital"], 2)
