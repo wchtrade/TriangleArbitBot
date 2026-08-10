@@ -2167,7 +2167,7 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     # между продажей и докупкой курс монеты успевает сдвинуться, и это
     # реальная, а не бумажная потеря — за 2 дня набежало -$1.98 только на
     # этом эффекте, и бот её никогда не видел и не показывал.
-    _last_real_sell_price[(sell_ex, symbol)] = opp["avg_sell_price"]
+    _last_real_sell_price[(sell_ex, symbol)] = opp["sell_price"]
 
     return {"success": True, "buy_result": buy_result, "sell_result": sell_result, "vol": vol,
              "confirmed_qty": confirmed_qty}
@@ -2873,12 +2873,20 @@ async def execute_trade(session, opp: dict) -> dict:
     real_result = None
     if not config["simulation_mode"] and is_real_trading_allowed():
         real_result = await execute_real_arbitrage(session, opp)
-        # НОВОЕ 10.08: прямое логирование каждой попытки — "Реальных сделок
-        # исполнено" (stats["trades"]) много дней подряд стоял на нуле,
-        # несмотря на подтверждённую реальную активность (проседание резерва,
-        # выгрузки Binance). Логика выглядит правильной на бумаге, но раз
-        # расхождение упорно повторяется — нужны прямые факты из логов,
-        # а не ещё одна гипотеза вслепую.
+        # НОВОЕ 10.08 (раунд 2): раньше диагностика шла только в Railway-логи
+        # (logger.info) — тишина в Telegram при этом сохранялась, а до
+        # логов Railway на практике трудно добраться быстро. Теперь то же
+        # самое сообщение уходит НАПРЯМУЮ в Telegram при КАЖДОЙ попытке,
+        # без вариантов пропустить — либо увидим success=True (и тогда
+        # ищем баг дальше, в коде ПОСЛЕ этой точки), либо success=False
+        # с конкретной причиной (и тогда сама сделка не проходит, а не
+        # только счётчик врёт).
+        if CHAT_ID:
+            await send_tg(session,
+                f"🔍 *Диагностика попытки сделки*\n"
+                f"success={real_result.get('success')}\n"
+                f"error={real_result.get('error')}\n"
+                f"vol={real_result.get('vol')}")
         logger.info(f"🔍 ДИАГНОСТИКА execute_real_arbitrage: success={real_result.get('success')} "
                      f"error={real_result.get('error')} symbol={opp.get('symbol')} "
                      f"buy_ex={opp.get('buy_ex')} sell_ex={opp.get('sell_ex')}")
