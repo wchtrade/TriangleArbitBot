@@ -1755,6 +1755,109 @@ MIN_ORDER_VALUE_USD = {"Binance": 5.0, "KuCoin": 1.0, "HTX": 10.0}  # НАХОД
 # впритык к минимуму: нужная докупка ($9.92) оказывалась ЧУТЬ ниже порога.
 
 
+async def top_up_usdt_via_coin_sale(session, ex: str, symbol: str, usdt_needed: float,
+                                     price_hint: float) -> bool:
+    """НОВОЕ 10.08: зеркальная функция к top_up_coin_reserve — но для
+    ПРОТИВОПОЛОЖНОЙ проблемы. Найдено по логам и выгрузке Binance: биржа,
+    которая только ПОКУПАЕТ монету (например, KuCoin в связке
+    KuCoin→Binance), с каждым циклом накапливает саму монету (9422 IOST на
+    KuCoin к утру 10.08!) и теряет USDT — а автодокупки для этого случая
+    просто не было, только для противоположной стороны (Binance, которая
+    теряет монету и накапливает USDT). Сделка попросту отклонялась с
+    "insufficient_usdt_on_..." и требовала ручного /rebalance.
+
+    ВАЖНО (пункт 4 запроса): перед продажей проверяем курс — если текущая
+    цена ЗАМЕТНО хуже (>0.5%) от price_hint (ожидаемой цены сделки), это
+    означает, что рынок только что резко дёрнулся, и продажа сейчас, скорее
+    всего, зафиксирует убыток вместо покрытия нехватки. В этом случае лучше
+    один раз пропустить попытку и подождать следующего скана, чем гарантированно
+    продать в минус."""
+    if is_backed_off(ex):
+        logger.warning(f"⛔ Автодокупка USDT на {ex}/{symbol} пропущена: биржа в бэкоффе")
+        return False
+    if not price_hint or price_hint <= 0:
+        logger.warning(f"⛔ Автодокупка USDT на {ex}/{symbol} пропущена: нет ориентировочной цены "
+                         f"(price_hint={price_hint})")
+        return False
+    if stats.get("topup_cost_usdt", 0.0) >= config["max_topup_spend_per_day"]:
+        logger.warning(f"⛔ Автодокупка USDT на {ex}/{symbol} пропущена: дневной лимит "
+                         f"(${config['max_topup_spend_per_day']}) исчерпан")
+        return False
+
+    balances = await get_real_balances(session, ex)
+    if not balances:
+        logger.warning(f"⛔ Автодокупка USDT на {ex}/{symbol} пропущена: не удалось прочитать баланс")
+        return False
+    have_coin = balances.get(symbol, 0.0)
+    if have_coin <= 0:
+        logger.warning(f"⛔ Автодокупка USDT на {ex}/{symbol} пропущена: нет накопленной "
+                         f"монеты для продажи (баланс {symbol}: {have_coin})")
+        return False
+
+    # +8% запас сверху, как и в зеркальной функции
+    coin_to_sell = round((usdt_needed * 1.08) / price_hint, 6)
+    if coin_to_sell > have_coin:
+        coin_to_sell = round(have_coin * 0.98, 6)  # не пытаемся продать больше, чем есть
+
+    # ПРОВЕРКА КУРСА (пункт 4): берём самую свежую цену прямо перед продажей,
+    # не полагаемся на price_hint, который мог устареть за секунды ожидания
+    fresh_ob = None
+    if ex == "Binance":
+        fresh_ob = await get_orderbook_binance(session, symbol)
+    elif ex == "KuCoin":
+        fresh_ob = await get_orderbook_kucoin(session, symbol)
+    elif ex == "HTX":
+        fresh_ob = await get_orderbook_htx(session, symbol)
+    if fresh_ob and fresh_ob.get("bids"):
+        fresh_bid = fresh_ob["bids"][0][0]
+        if fresh_bid < price_hint * 0.995:
+            # ИСПРАВЛЕНИЕ: раньше эта проверка только ЛОГИРОВАЛА
+            # предупреждение, но всё равно продавала дальше — сам смысл
+            # проверки курса терялся. Теперь реально пропускаем попытку.
+            logger.warning(f"⚠️ Пропускаю докупку USDT на {ex}/{symbol}: текущая цена "
+                             f"{fresh_bid:.8f} хуже ожидаемой {price_hint:.8f} более чем на 0.5% — "
+                             f"продажа сейчас зафиксирует убыток, жду лучшего момента")
+            return False
+        price_hint = fresh_bid  # используем самую свежую (не худшую) цену для расчёта
+
+    result = None
+    if ex == "Binance":
+        result = await place_order_binance(session, symbol, "SELL", coin_to_sell)
+    elif ex == "KuCoin":
+        result = await place_order_kucoin(session, symbol, "sell", coin_to_sell, use_funds=False)
+    elif ex == "HTX":
+        global _htx_account_id_cache
+        if not _htx_account_id_cache:
+            _htx_account_id_cache = await get_htx_account_id(session)
+        if _htx_account_id_cache:
+            result = await place_order_htx(session, _htx_account_id_cache, symbol, "sell-market", coin_to_sell)
+
+    if result:
+        stats["topup_attempts"] = stats.get("topup_attempts", 0) + 1
+        stats["topup_success"] = stats.get("topup_success", 0) + 1
+        usd_gained = coin_to_sell * price_hint
+        stats["topup_cost_usdt"] = stats.get("topup_cost_usdt", 0.0) + usd_gained
+        logger.info(f"✅ Докупка USDT на {ex} через продажу {coin_to_sell} {symbol} "
+                     f"(~${usd_gained:.2f})")
+        if CHAT_ID:
+            await send_tg(session,
+                f"🔧 *Автодокупка USDT*: не хватало ${usdt_needed:.2f} на {ex} "
+                f"перед сделкой — продал {coin_to_sell} {symbol} (~${usd_gained:.2f}) "
+                f"из накопленного избытка и продолжаю.")
+        return True
+    stats["topup_attempts"] = stats.get("topup_attempts", 0) + 1
+    logger.error(f"❌ Автодокупка USDT на {ex}/{symbol} не удалась: ордер на продажу "
+                  f"{coin_to_sell} {symbol} отклонён биржей "
+                  f"({_last_exchange_error.get(ex) or 'нет деталей'})")
+    if CHAT_ID:
+        await send_tg(session,
+            f"❌ *Автодокупка USDT не удалась*: пытался продать {coin_to_sell} {symbol} "
+            f"на {ex}, биржа отклонила ордер "
+            f"({_last_exchange_error.get(ex) or 'нет деталей'}). "
+            f"Нужен ручной /rebalance или перевод на {ex}.")
+    return False
+
+
 async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: float,
                                price_hint: float) -> bool:
     """ИСПРАВЛЕНИЕ 04.08: точечная мгновенная докупка нехватающей монеты.
@@ -1896,11 +1999,31 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
                          f"(свободно USDT: {available_usdt_on_buy_ex:.2f})")
             vol = shrunk_vol
         else:
-            return {"success": False,
-                    "error": f"insufficient_usdt_on_{buy_ex}: "
-                             f"нужно ~${vol} для лота, свободно ${available_usdt_on_buy_ex:.2f} "
-                             f"(меньше биржевого минимума ${required_min}) — "
-                             f"нужен ручной перевод USDT на {buy_ex} или /rebalance"}
+            # НОВОЕ 10.08: раньше здесь был мгновенный отказ с просьбой сделать
+            # /rebalance вручную. Найдено по логам: биржа-покупатель (buy_ex)
+            # структурно НАКАПЛИВАЕТ монету с каждым циклом (она покупает, но
+            # никогда не продаёт в этой схеме) и теряет USDT — а докупка
+            # (top_up_coin_reserve) раньше умела чинить только противоположную
+            # проблему (нехватку МОНЕТЫ на бирже-продавце). Пробуем зеркальную
+            # автодокупку — продать часть накопленной монеты на buy_ex, чтобы
+            # получить нужный USDT, с проверкой курса перед продажей.
+            usdt_shortfall = vol * usdt_buffer_mult - available_usdt_on_buy_ex
+            topped_up = await top_up_usdt_via_coin_sale(
+                session, buy_ex, symbol, usdt_shortfall, opp.get("buy_price", 0))
+            if topped_up:
+                buy_balances = await get_real_balances(session, buy_ex)
+                available_usdt_on_buy_ex = (buy_balances or {}).get("USDT", 0.0)
+                if available_usdt_on_buy_ex < vol * usdt_buffer_mult:
+                    vol = round(available_usdt_on_buy_ex / usdt_buffer_mult, 2)
+                    if vol < required_min:
+                        return {"success": False,
+                                "error": f"insufficient_usdt_on_{buy_ex}_even_after_topup"}
+            else:
+                return {"success": False,
+                        "error": f"insufficient_usdt_on_{buy_ex}: "
+                                 f"нужно ~${vol} для лота, свободно ${available_usdt_on_buy_ex:.2f} "
+                                 f"(меньше биржевого минимума ${required_min}) — "
+                                 f"нужен ручной перевод USDT на {buy_ex} или /rebalance"}
 
     # НАХОДКА 31.07: у каждой биржи своя НЕЗАВИСИМАЯ предзаведённая монета —
     # купленное на buy_ex физически не переносится на sell_ex. Раньше бот
@@ -4205,7 +4328,20 @@ async def handle_command(session, text, chat_id):
         if len(parts) > 1:
             try:
                 config["trade_usdt"] = float(parts[1])
-                await send_tg(session, f"✅ Лот: ${config['trade_usdt']}")
+                # ИСПРАВЛЕНИЕ 10.08: раньше это выглядело так, будто команда
+                # меняет реальный размер сделки — на деле она меняет ТОЛЬКО
+                # симуляционную переменную, реальный лот управляется отдельно
+                # через /setreallot. Из-за этого несколько раз подряд /setlot
+                # 5-6 "срабатывал" (бот подтверждал), но /realbalance
+                # продолжал требовать резерв под старый реальный лот — явное
+                # предупреждение теперь показывается всегда, чтобы не гадать.
+                warn = ""
+                if not config["simulation_mode"]:
+                    warn = (f"\n⚠️ Вы в РЕАЛЬНОМ режиме — эта команда меняет лот "
+                             f"только для симуляции и НЕ влияет на реальные сделки. "
+                             f"Для реального лота используйте `/setreallot` "
+                             f"(сейчас: ${config['max_real_order_usdt']})")
+                await send_tg(session, f"✅ Лот (симуляция): ${config['trade_usdt']}{warn}")
             except Exception:
                 pass
 
