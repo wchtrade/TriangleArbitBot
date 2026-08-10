@@ -25,6 +25,12 @@ CHAT_ID = None
 config = {
     "simulation_mode":    True,
     "min_profit_pct":     0.3,
+    "empirical_spread_crossing_pct": 0.34,  # НОВОЕ 10.08: измерено по факту
+        # исполнения (см. /stats 10.08) — стоимость пересечения bid/ask
+        # спреда Binance при докупке резерва. Используется в динамическом
+        # пороге compute_dynamic_min_profit_pct(). Настраивается вручную
+        # по мере накопления новой статистики.
+    "threshold_safety_margin_pct": 0.05,  # запас сверху динамического порога
     "trade_usdt":         20.0,
     "scan_interval":      3,  # СНИЖЕНО (было 10): цена и так живая через
         # WebSocket, интервал влияет только на частоту сверки/решения —
@@ -1065,6 +1071,26 @@ async def scan_triangles(session) -> List[dict]:
 # АРБИТРАЖ — расчёт на основе реальной глубины
 # =====================================================================
 
+def compute_dynamic_min_profit_pct(buy_ex: str, sell_ex: str) -> float:
+    """НОВОЕ 10.08: раньше min_profit_pct был фиксированным числом (0.18-0.3%),
+    учитывающим только комиссии buy+sell ОДНОЙ ноги арбитража — но не
+    стоимость последующего ребаланса резерва. Математически доказано
+    (см. диалог 10.08): при лоте $5.5 честный порог безубыточности с учётом
+    полного цикла — около 0.32%, а не 0.18%, из-за неизбежной периодической
+    докупки резерва, пересекающей собственный bid/ask спред биржи.
+    Порог теперь считается динамически из реальных комиссий и эмпирически
+    измеренной стоимости пересечения спреда, амортизированной на размер
+    резервного буфера (sell_reserve_lots) — чем больше буфер, тем реже
+    нужен ребаланс, тем ниже честный порог на одну сделку."""
+    buy_fee = FEES.get(buy_ex, 0.1)
+    sell_fee = FEES.get(sell_ex, 0.1)
+    spread_crossing_pct = config.get("empirical_spread_crossing_pct", 0.34)
+    lots = max(config.get("sell_reserve_lots", 3), 1)
+    amortized_rebalance = spread_crossing_pct / lots
+    safety_margin = config.get("threshold_safety_margin_pct", 0.05)
+    return round(buy_fee + sell_fee + amortized_rebalance + safety_margin, 4)
+
+
 def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob: Dict,
                    trade_usdt: float) -> Optional[dict]:
     # ИСПРАВЛЕНИЕ 04.08 (раунд 8): раньше отсутствие данных об объёме
@@ -1104,7 +1130,8 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
     gross = (sell_price - buy_price) / buy_price * 100
     net   = gross - buy_fee * 100 - sell_fee * 100
 
-    if net < config["min_profit_pct"]:
+    dynamic_min = compute_dynamic_min_profit_pct(buy_ex, sell_ex)
+    if net < max(config["min_profit_pct"], dynamic_min):
         return None
 
     # ИСПРАВЛЕНИЕ 05.08: раньше сигнал с ЛЮБЫМ спредом выше порога считался
@@ -2317,11 +2344,56 @@ async def get_valuation_price(session, ex: str, symbol: str) -> Optional[float]:
     return ob["bids"][0][0]
 
 
+async def get_misc_asset_price_usdt(session, ex: str, asset: str) -> Optional[float]:
+    """НОВОЕ 10.08: простая оценка цены ПОБОЧНОГО актива (BNB на Binance,
+    KCS на KuCoin — топливо для скидки на комиссию, не торгуемая монета) в
+    USDT через обычный REST-тикер. Найдено по прямому вопросу пользователя:
+    BNB и KCS читались с биржи, но НИКОГДА не суммировались в общий
+    капитал — вся потраченная на комиссию сумма была невидима для P&L.
+    Не использует WebSocket-инфраструктуру (та настроена только под
+    торгуемую монету) — вызывается редко, при подсчёте /stats, не в
+    горячем цикле сканирования."""
+    try:
+        if ex == "Binance":
+            async with session.get("https://api.binance.com/api/v3/ticker/price",
+                                    params={"symbol": f"{asset}USDT"},
+                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return float(data.get("price", 0)) or None
+        elif ex == "KuCoin":
+            async with session.get("https://api.kucoin.com/api/v1/market/orderbook/level1",
+                                    params={"symbol": f"{asset}-USDT"},
+                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    price = data.get("data", {}).get("price")
+                    return float(price) if price else None
+        elif ex == "HTX":
+            async with session.get("https://api.huobi.pro/market/detail/merged",
+                                    params={"symbol": f"{asset.lower()}usdt"},
+                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    tick = data.get("tick", {})
+                    return float(tick.get("close", 0)) or None
+    except Exception as e:
+        logger.warning(f"Не удалось оценить {asset} на {ex}: {e}")
+    return None
+
+
 async def get_total_real_capital(session) -> Optional[dict]:
     """Реальный совокупный капитал на всех трёх биржах — используется в /stats
-    вместо симуляционного SIM_START/sim_balances, когда бот в реальном режиме."""
+    вместо симуляционного SIM_START/sim_balances, когда бот в реальном режиме.
+    ИСПРАВЛЕНИЕ 10.08: раньше считались ТОЛЬКО USDT и торгуемая монета
+    (SYMBOLS) — любой другой актив (BNB на Binance, KCS на KuCoin — топливо
+    для скидки на комиссию) был полностью невидим для этого расчёта. Вся
+    сумма, потраченная на комиссию из этих запасов, никогда не появлялась
+    ни в "Реальном балансе", ни в P&L — реальная, но невидимая утечка
+    капитала. Теперь учитываем ЛЮБОЙ ненулевой актив на счету."""
     per_exchange = {}
     total = 0.0
+    misc_assets_value = {}
     for ex in ["Binance", "KuCoin", "HTX"]:
         balances = await get_real_balances(session, ex)
         if balances is None:
@@ -2333,9 +2405,19 @@ async def get_total_real_capital(session) -> Optional[dict]:
                 price = await get_valuation_price(session, ex, sym)
                 if price:
                     ex_total += qty * price
+        # НОВОЕ: любые другие ненулевые активы (BNB, KCS и т.п.)
+        other_assets = {a: q for a, q in balances.items()
+                         if a != "USDT" and a not in SYMBOLS and q > 0.00001}
+        for asset, qty in other_assets.items():
+            price = await get_misc_asset_price_usdt(session, ex, asset)
+            if price:
+                value = qty * price
+                ex_total += value
+                misc_assets_value[f"{ex}:{asset}"] = round(value, 4)
         per_exchange[ex] = round(ex_total, 2)
         total += ex_total
-    return {"total": round(total, 2), "per_exchange": per_exchange}
+    return {"total": round(total, 2), "per_exchange": per_exchange,
+            "misc_assets_value": misc_assets_value}
 
 
 async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
@@ -3418,6 +3500,15 @@ async def handle_command(session, text, chat_id):
                 balance_block = "⚠️ Не удалось прочитать реальный баланс — см. /realbalance для деталей.\n"
             else:
                 per_ex = " | ".join(f"{ex}: ${v}" for ex, v in real["per_exchange"].items())
+                # НОВОЕ 10.08: показываем стоимость "топливных" активов
+                # (BNB/KCS) отдельной строкой — раньше она была невидима.
+                misc = real.get("misc_assets_value", {})
+                misc_line = ""
+                if misc:
+                    misc_total = sum(misc.values())
+                    misc_parts = ", ".join(f"{k}: ${v:.2f}" for k, v in misc.items())
+                    misc_line = (f"⛽ Топливо на комиссию (учтено в балансе выше): "
+                                 f"${misc_total:.2f} ({misc_parts})\n")
                 realized_pnl = stats.get("realized_trading_pnl", 0.0)
                 realized_n = stats.get("realized_trades_count", 0)
                 drift_cost = stats.get("price_drift_cost_usdt", 0.0)
@@ -3427,6 +3518,7 @@ async def handle_command(session, text, chat_id):
                     f"{realized_pnl:+.4f} USDT за {realized_n} сделок\n"
                     f"💧 Из них реальная стоимость сдвига курса при докупках: "
                     f"{'+' if drift_cost < 0 else '-'}{abs(drift_cost):.4f} USDT\n"
+                    f"{misc_line}"
                 )
                 if config["real_start_capital"]:
                     pnl_real = round(real["total"] - config["real_start_capital"], 2)
@@ -3465,7 +3557,8 @@ async def handle_command(session, text, chat_id):
                 f"{stats.get('volume_too_low_rejected', 0)}\n\n"
                 f"{balance_block}\n"
                 f"⚙️ Реальный лимит ордера: ${config['max_real_order_usdt']} | "
-                f"Порог: {config['min_profit_pct']}% | "
+                f"Порог: {config['min_profit_pct']}% (ручной) / "
+                f"{compute_dynamic_min_profit_pct('KuCoin', 'Binance')}% (честный, с учётом ребаланса) | "
                 f"Буфер баланса: {config['balance_safety_buffer_pct']}% | "
                 f"Запас ребаланса: {config['rebalance_headroom_pct']}%"
             )
