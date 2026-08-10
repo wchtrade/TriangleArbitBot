@@ -2972,17 +2972,31 @@ async def execute_trade(session, opp: dict) -> dict:
                 stats["insufficient_balance_skips"] = stats.get("insufficient_balance_skips", 0) + 1
                 return {"executed": False, "reason": "insufficient_sim_balance"}
 
-    hour = datetime.now().hour
-    stats["hourly_profit"][hour] += profit
-    trade_history.append({
-        "id": len(trade_history) + 1,
-        "date": datetime.now().strftime("%Y-%m-%d"), "time": opp["time"],
-        "symbol": opp["symbol"], "buy_ex": opp["buy_ex"], "sell_ex": opp["sell_ex"],
-        "buy_price": opp["buy_price"], "sell_price": opp["sell_price"], "vol": opp["vol"],
-        "gross_pct": opp["gross_pct"], "net_pct": opp["net_pct"], "profit_usdt": profit,
-        "slippage_impact_pct": opp.get("slippage_impact_pct", 0),
-        "mode": "SIM" if config["simulation_mode"] else "REAL",
-    })
+    # НОВОЕ 10.08: "Реальных сделок исполнено" (stats["trades"]) много дней
+    # подряд стоял на нуле, несмотря на подтверждённую реальную активность.
+    # Раз обычное логирование не помогло найти причину — оборачиваем именно
+    # этот участок (запись истории + инкремент счётчиков) в защиту с прямым
+    # уведомлением в Telegram при ЛЮБОМ исключении, чтобы поймать проблему
+    # на первой же реальной сделке, без похода в Railway.
+    try:
+        hour = datetime.now().hour
+        stats["hourly_profit"][hour] += profit
+        trade_history.append({
+            "id": len(trade_history) + 1,
+            "date": datetime.now().strftime("%Y-%m-%d"), "time": opp["time"],
+            "symbol": opp["symbol"], "buy_ex": opp["buy_ex"], "sell_ex": opp["sell_ex"],
+            "buy_price": opp["buy_price"], "sell_price": opp["sell_price"], "vol": opp["vol"],
+            "gross_pct": opp["gross_pct"], "net_pct": opp["net_pct"], "profit_usdt": profit,
+            "slippage_impact_pct": opp.get("slippage_impact_pct", 0),
+            "mode": "SIM" if config["simulation_mode"] else "REAL",
+        })
+    except Exception as e:
+        logger.error(f"❌ ИСКЛЮЧЕНИЕ при записи истории сделки: {e}")
+        if CHAT_ID:
+            await send_tg(session,
+                f"❌ *Найдена причина бага со счётчиком!*\n"
+                f"Исключение при записи сделки в историю: `{type(e).__name__}: {e}`\n"
+                f"opp keys: `{list(opp.keys())}`")
     stats["trades"] += 1
     stats["profit"] += profit
     stats["trades_this_minute"] += 1
