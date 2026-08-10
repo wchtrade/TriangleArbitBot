@@ -127,7 +127,21 @@ SYMBOLS = ["TRX"]   # ИСПРАВЛЕНО 05.08: этот список — де
 QUOTE   = "USDT"
 BRIDGE  = "BTC"   # мост для треугольного арбитража: USDT -> COIN -> BTC -> USDT
 PAIRS   = [
-    ("KuCoin", "Binance"),
+    # ОТКЛЮЧЕНО 10.08 по решению: KuCoin→Binance убран из активной торговли.
+    # Причина — по данным TrialArbBot этот маршрут в среднем даёт маржу
+    # ~0.05%, почти всегда НИЖЕ честного порога (0.34%) — сделки там крайне
+    # редки. При капитале ~$24 держать резерв на трёх биржах одновременно
+    # означает распылять и без того скромный капитал на менее прибыльное
+    # направление. Ключи/подключение Binance НЕ трогаем — при желании
+    # вернуть просто раскомментируйте строку ниже.
+    # ("KuCoin", "Binance"),
+    #
+    # НОВОЕ 10.08: KuCoin→MEXC — по данным TrialArbBot именно эта связка
+    # стабильно показывает наибольшую и наиболее регулярную маржу (лучшая
+    # маржа 3.35%, 711 сделок, $296 P&L — на порядок активнее и прибыльнее
+    # KuCoin→Binance). Весь капитал сейчас сосредоточен именно здесь.
+    ("KuCoin", "MEXC"),
+    #
     # ИСПРАВЛЕНО 07.08 (было "Binance","KuCoin" — НАПРАВЛЕНИЕ БЫЛО ПЕРЕПУТАНО):
     # несколько дней подряд WorkerArbBot молчал (0 сигналов при ВСЕХ счётчиках
     # фильтров тоже на нуле — не тонкий стакан, не объём, не подозрительный
@@ -136,17 +150,14 @@ PAIRS   = [
     # стабильно подтверждал реальные сделки — но ВСЕГДА на маршруте
     # KuCoin→Binance (покупка на KuCoin, продажа на Binance), а не наоборот.
     # Бот честно считал правильно — просто проверял противоположное от
-    # реально работающего направление. Теперь исправлено.
+    # реально работающего направление. Актуально, если решите вернуть Binance.
     #
     # ИЗМЕНЕНО 05.08 по решению: HTX убрана из торговли полностью. За всю
     # сессию именно HTX была источником почти всех проблем — тонкие стаканы
     # на альткоинах (ZIL, ZK, RVN), цены, оторванные от реального рынка на
     # 15-45%, постоянная нехватка баланса из-за двойной роли на скромном
-    # капитале. Binance и KuCoin, наоборот, ни разу не подвели ни в одной
-    # проверке /depthcheck или /scancandidates — стабильно 50/50 и 20/20+
-    # уровней, разброс цены между ними — сотые доли процента.
-    # HTX остаётся подключена (ключи/баланс не трогаем), но сделок через
-    # неё больше не будет — при желании вернуть: добавить обратно строки
+    # капитале. HTX остаётся подключена (ключи/баланс не трогаем), но
+    # сделок через неё нет — при желании вернуть: добавить обратно строки
     # ("HTX","KuCoin"), ("KuCoin","HTX"), ("Binance","HTX").
 ]
 
@@ -167,7 +178,7 @@ def pairs_for_symbol(sym: str) -> List[Tuple[str, str]]:
     return PAIR_OVERRIDES.get(sym, DEFAULT_PAIRS)
 
 
-FEES = {"Binance": 0.10, "KuCoin": 0.10, "HTX": 0.20}
+FEES = {"Binance": 0.10, "KuCoin": 0.10, "HTX": 0.20, "MEXC": 0.10}
 SIM_START = 500.0
 
 # Раскладка $500 согласно ролям бирж в PAIRS:
@@ -205,7 +216,7 @@ stats = {
     "trades_this_minute": 0, "minute_start": datetime.now(),
     "pair_stats":   {f"{b}→{s}": 0 for b, s in PAIRS},
     "symbol_stats": {s: 0 for s in SYMBOLS},
-    "depth_fail":   {"Binance": 0, "KuCoin": 0, "HTX": 0},  # счётчик отказов стакана
+    "depth_fail":   {"Binance": 0, "KuCoin": 0, "HTX": 0, "MEXC": 0},  # счётчик отказов стакана
     "insufficient_liquidity": 0,  # сколько раз стакана не хватило на объём
     "volume_fetch_fail": 0,  # НОВОЕ 04.08: сколько раз не удалось получить 24h-объём с Binance
                               # (раньше это было полностью невидимо и тихо блокировало ВСЕ сигналы)
@@ -227,6 +238,8 @@ KUCOIN_SECRET  = os.environ.get("KUCOIN_API_SECRET", "")
 KUCOIN_PASS    = os.environ.get("KUCOIN_PASSPHRASE", "")
 HTX_KEY        = os.environ.get("HTX_API_KEY", "")
 HTX_SECRET     = os.environ.get("HTX_API_SECRET", "")
+MEXC_KEY       = os.environ.get("MEXC_API_KEY", "")
+MEXC_SECRET    = os.environ.get("MEXC_API_SECRET", "")
 REAL_TRADING_UNLOCKED = os.environ.get("REAL_TRADING_UNLOCKED", "")
 
 
@@ -244,7 +257,7 @@ REAL_TRADING_UNLOCKED = os.environ.get("REAL_TRADING_UNLOCKED", "")
 # период, все запросы к ней в это время пропускаются без попытки.
 # =====================================================================
 
-exchange_backoff_until: Dict[str, float] = {"Binance": 0.0, "KuCoin": 0.0, "HTX": 0.0}
+exchange_backoff_until: Dict[str, float] = {"Binance": 0.0, "KuCoin": 0.0, "HTX": 0.0, "MEXC": 0.0}
 
 # ИСПРАВЛЕНИЕ 04.08 (раунд 2): раньше при отказе размещения реального ордера
 # биржа возвращала подробный текст ошибки (например, точную причину отказа —
@@ -255,7 +268,7 @@ exchange_backoff_until: Dict[str, float] = {"Binance": 0.0, "KuCoin": 0.0, "HTX"
 # невозможно было понять, что именно не так — баланс, шаг лота, минимальная
 # сумма ордера или что-то ещё. Теперь текст ответа биржи сохраняется здесь
 # и подставляется в сообщение об ошибке.
-_last_exchange_error: Dict[str, str] = {"Binance": "", "KuCoin": "", "HTX": ""}
+_last_exchange_error: Dict[str, str] = {"Binance": "", "KuCoin": "", "HTX": "", "MEXC": ""}
 # НОВОЕ 09.08: цена последней реальной продажи по (биржа, монета) — нужна,
 # чтобы честно посчитать реальную стоимость сдвига курса при последующей
 # докупке резерва (не просто оценку по комиссии, как было раньше).
@@ -312,6 +325,36 @@ async def get_orderbook_binance_rest(session, symbol: str) -> Optional[Dict]:
     except Exception as e:
         stats["depth_fail"]["Binance"] += 1
         logger.error(f"Binance depth {symbol}: {e}")
+        return None
+
+
+async def get_orderbook_mexc_rest(session, symbol: str) -> Optional[Dict]:
+    """НОВОЕ 10.08: MEXC — REST-стакан, API идентичен по формату Binance
+    (тот же /api/v3/depth). Отдельного WebSocket-подключения для MEXC пока
+    нет (в отличие от Binance/KuCoin/HTX) — всегда работаем через REST.
+    Для нашего интервала сканирования (3 сек) и лота ($5) задержка REST
+    против WS несущественна."""
+    if is_backed_off("MEXC"):
+        return None
+    url = "https://api.mexc.com/api/v3/depth"
+    params = {"symbol": f"{symbol}{QUOTE}", "limit": config["depth_limit"]}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=6)) as r:
+            if r.status in (429, 418):
+                trigger_backoff("MEXC", r.status, r.headers.get("Retry-After"))
+                return None
+            if r.status != 200:
+                stats["depth_fail"]["MEXC"] = stats["depth_fail"].get("MEXC", 0) + 1
+                return None
+            data = await r.json()
+            bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
+            asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+            if not bids or not asks:
+                return None
+            return {"bids": bids, "asks": asks}
+    except Exception as e:
+        stats["depth_fail"]["MEXC"] = stats["depth_fail"].get("MEXC", 0) + 1
+        logger.error(f"MEXC depth {symbol}: {e}")
         return None
 
 
@@ -1188,18 +1231,19 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
     }
 
 
-async def fetch_all_orderbooks(session) -> Tuple[Dict, Dict, Dict, List[str]]:
+async def fetch_all_orderbooks(session) -> Tuple[Dict, Dict, Dict, Dict, List[str]]:
     tasks = {}
     for ex, fn in [("Binance", get_orderbook_binance),
                     ("KuCoin", get_orderbook_kucoin),
-                    ("HTX", get_orderbook_htx)]:
+                    ("HTX", get_orderbook_htx),
+                    ("MEXC", get_orderbook_mexc_rest)]:
         for sym in SYMBOLS:
             tasks[(ex, sym)] = fn(session, sym)
 
     keys = list(tasks.keys())
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-    books = {"Binance": {}, "KuCoin": {}, "HTX": {}}
+    books = {"Binance": {}, "KuCoin": {}, "HTX": {}, "MEXC": {}}
     for (ex, sym), res in zip(keys, results):
         if isinstance(res, Exception) or res is None:
             continue
@@ -1211,13 +1255,13 @@ async def fetch_all_orderbooks(session) -> Tuple[Dict, Dict, Dict, List[str]]:
             coin_volumes[sym] = volumes[sym]
 
     active = [ex for ex, d in books.items() if d]
-    return books["Binance"], books["KuCoin"], books["HTX"], active
+    return books["Binance"], books["KuCoin"], books["HTX"], books["MEXC"], active
 
 
 async def scan_all(session) -> Tuple[List[dict], List[str]]:
     stats["scans"] += 1
-    bn, kc, hx, active = await fetch_all_orderbooks(session)
-    ex_map = {"Binance": bn, "KuCoin": kc, "HTX": hx}
+    bn, kc, hx, mx, active = await fetch_all_orderbooks(session)
+    ex_map = {"Binance": bn, "KuCoin": kc, "HTX": hx, "MEXC": mx}
     signals = []
 
     # ИСПРАВЛЕНИЕ 08.08 (найдено после 6 сделок подряд с растущим реальным
@@ -1307,6 +1351,29 @@ async def get_binance_lot_step(session, symbol: str) -> float:
     return 1.0  # безопасный дефолт: округлит до целого, ордер хотя бы не отклонится по фильтру
 
 
+_mexc_lot_step_cache: Dict[str, float] = {}
+
+
+async def get_mexc_lot_step(session, symbol: str) -> float:
+    """НОВОЕ 10.08: формат exchangeInfo у MEXC идентичен Binance."""
+    if symbol in _mexc_lot_step_cache:
+        return _mexc_lot_step_cache[symbol]
+    try:
+        async with session.get("https://api.mexc.com/api/v3/exchangeInfo",
+                                params={"symbol": f"{symbol}{QUOTE}"},
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            for s in data.get("symbols", []):
+                for f in s.get("filters", []):
+                    if f["filterType"] == "LOT_SIZE":
+                        step = float(f["stepSize"])
+                        _mexc_lot_step_cache[symbol] = step
+                        return step
+    except Exception as e:
+        logger.error(f"MEXC lot step fetch {symbol}: {e}")
+    return 1.0
+
+
 async def get_kucoin_base_increment(session, symbol: str) -> float:
     if symbol in _kucoin_increment_cache:
         return _kucoin_increment_cache[symbol]
@@ -1359,6 +1426,9 @@ async def round_quantity_for_exchange(session, ex: str, symbol: str, raw_qty: fl
     if ex == "Binance":
         step = await get_binance_lot_step(session, symbol)
         result = _round_down_to_step(raw_qty, step)
+    elif ex == "MEXC":
+        step = await get_mexc_lot_step(session, symbol)
+        result = _round_down_to_step(raw_qty, step)
     elif ex == "KuCoin":
         inc = await get_kucoin_base_increment(session, symbol)
         result = _round_down_to_step(raw_qty, inc)
@@ -1401,6 +1471,28 @@ async def wait_for_binance_fill(session, symbol: str, order_id, timeout: float =
                     return None
         except Exception as e:
             logger.error(f"Binance fill check {symbol}: {e}")
+        await asyncio.sleep(0.3)
+    return None
+
+
+async def wait_for_mexc_fill(session, symbol: str, order_id, timeout: float = 3.0) -> Optional[float]:
+    """НОВОЕ 10.08: идентично wait_for_binance_fill — тот же формат ответа."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ts = int(time.time() * 1000)
+        params = {"symbol": f"{symbol}{QUOTE}", "orderId": order_id, "timestamp": ts, "recvWindow": 5000}
+        params["signature"] = sign_binance(params, MEXC_SECRET)
+        headers = {"X-MEXC-APIKEY": MEXC_KEY}
+        try:
+            async with session.get("https://api.mexc.com/api/v3/order", params=params,
+                                    headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                data = await r.json()
+                if data.get("status") == "FILLED":
+                    return float(data.get("executedQty", 0))
+                if data.get("status") in ("CANCELED", "REJECTED", "EXPIRED"):
+                    return None
+        except Exception as e:
+            logger.error(f"MEXC fill check {symbol}: {e}")
         await asyncio.sleep(0.3)
     return None
 
@@ -1468,6 +1560,11 @@ async def confirm_fill_and_get_qty(session, ex: str, buy_result: dict) -> Option
         if buy_result.get("status") == "FILLED":
             return float(buy_result.get("executedQty", 0))  # уже пришло сразу в ответе
         return await wait_for_binance_fill(session, buy_result.get("symbol", "")[:-len(QUOTE)], order_id)
+    elif ex == "MEXC":
+        order_id = buy_result.get("orderId")
+        if buy_result.get("status") == "FILLED":
+            return float(buy_result.get("executedQty", 0))
+        return await wait_for_mexc_fill(session, buy_result.get("symbol", "")[:-len(QUOTE)], order_id)
     elif ex == "KuCoin":
         order_id = buy_result.get("data", {}).get("orderId")
         if not order_id:
@@ -1523,6 +1620,42 @@ async def place_order_binance(session, symbol: str, side: str, quote_usdt: float
     except Exception as e:
         logger.error(f"Binance order exception: {e}")
         _remember_error("Binance", e)
+        return None
+
+
+async def place_order_mexc(session, symbol: str, side: str, quote_usdt: float) -> Optional[dict]:
+    """НОВОЕ 10.08: MARKET-ордер на MEXC. Формат идентичен Binance
+    (тот же /api/v3/order, те же параметры quoteOrderQty/quantity)."""
+    if is_backed_off("MEXC"):
+        logger.error("MEXC в бэкоффе — реальный ордер НЕ отправлен")
+        return None
+    url = "https://api.mexc.com/api/v3/order"
+    ts = int(time.time() * 1000)
+    params = {
+        "symbol": f"{symbol}{QUOTE}", "side": side, "type": "MARKET",
+        "timestamp": ts, "recvWindow": 5000,
+    }
+    if side == "BUY":
+        params["quoteOrderQty"] = round(quote_usdt, 2)
+    else:
+        params["quantity"] = quote_usdt
+    params["signature"] = sign_binance(params, MEXC_SECRET)
+    headers = {"X-MEXC-APIKEY": MEXC_KEY}
+    try:
+        async with session.post(url, params=params, headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status in (429, 418):
+                trigger_backoff("MEXC", r.status, r.headers.get("Retry-After"))
+                return None
+            data = await r.json()
+            if r.status != 200:
+                logger.error(f"MEXC order failed: {data}")
+                _remember_error("MEXC", data.get("msg", data))
+                return None
+            return data
+    except Exception as e:
+        logger.error(f"MEXC order exception: {e}")
+        _remember_error("MEXC", e)
         return None
 
 
@@ -1773,7 +1906,7 @@ _last_auto_rebalance_attempt: float = 0.0
 AUTO_REBALANCE_COOLDOWN = 30  # сек — не пытаться ребалансить чаще, чем раз в 30 сек
 
 
-MIN_ORDER_VALUE_USD = {"Binance": 5.0, "KuCoin": 1.0, "HTX": 10.0}  # НАХОДКА 02.08:
+MIN_ORDER_VALUE_USD = {"Binance": 5.0, "KuCoin": 1.0, "HTX": 10.0, "MEXC": 1.0}  # НАХОДКА 02.08:
 # HTX отклоняет любой ордер дешевле $10 ("order-value-min-error") — именно
 # поэтому ребаланс молча не мог докупить ZK на HTX, когда цель ($10) была
 # впритык к минимуму: нужная докупка ($9.92) оказывалась ЧУТЬ ниже порога.
@@ -1838,6 +1971,8 @@ async def top_up_usdt_via_coin_sale(session, ex: str, symbol: str, usdt_needed: 
     fresh_ob = None
     if ex == "Binance":
         fresh_ob = await get_orderbook_binance(session, symbol)
+    elif ex == "MEXC":
+        fresh_ob = await get_orderbook_mexc_rest(session, symbol)
     elif ex == "KuCoin":
         fresh_ob = await get_orderbook_kucoin(session, symbol)
     elif ex == "HTX":
@@ -1857,6 +1992,8 @@ async def top_up_usdt_via_coin_sale(session, ex: str, symbol: str, usdt_needed: 
     result = None
     if ex == "Binance":
         result = await place_order_binance(session, symbol, "SELL", coin_to_sell)
+    elif ex == "MEXC":
+        result = await place_order_mexc(session, symbol, "SELL", coin_to_sell)
     elif ex == "KuCoin":
         result = await place_order_kucoin(session, symbol, "sell", coin_to_sell, use_funds=False)
     elif ex == "HTX":
@@ -1933,6 +2070,8 @@ async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: floa
     result = None
     if ex == "Binance":
         result = await place_order_binance(session, symbol, "BUY", usd_needed)
+    elif ex == "MEXC":
+        result = await place_order_mexc(session, symbol, "BUY", usd_needed)
     elif ex == "KuCoin":
         result = await place_order_kucoin(session, symbol, "buy", usd_needed, use_funds=True)
     elif ex == "HTX":
@@ -2319,6 +2458,32 @@ async def get_real_balances_htx(session) -> Optional[Dict[str, float]]:
         return None
 
 
+async def get_real_balances_mexc(session) -> Optional[Dict[str, float]]:
+    """НОВОЕ 10.08: формат ответа MEXC идентичен Binance (/api/v3/account)."""
+    if is_backed_off("MEXC"):
+        return None
+    url = "https://api.mexc.com/api/v3/account"
+    ts = int(time.time() * 1000)
+    params = {"timestamp": ts, "recvWindow": 5000}
+    params["signature"] = sign_binance(params, MEXC_SECRET)
+    headers = {"X-MEXC-APIKEY": MEXC_KEY}
+    try:
+        async with session.get(url, params=params, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status in (429, 418):
+                trigger_backoff("MEXC", r.status, r.headers.get("Retry-After"))
+                return None
+            data = await r.json()
+            if r.status != 200:
+                logger.error(f"MEXC balance fetch failed: {data}")
+                _remember_error("MEXC", data)
+                return None
+            return {b["asset"]: float(b["free"]) for b in data.get("balances", [])}
+    except Exception as e:
+        logger.error(f"MEXC balance exception: {e}")
+        return None
+
+
 async def get_real_balances(session, ex: str) -> Optional[Dict[str, float]]:
     if ex == "Binance":
         return await get_real_balances_binance(session)
@@ -2326,6 +2491,8 @@ async def get_real_balances(session, ex: str) -> Optional[Dict[str, float]]:
         return await get_real_balances_kucoin(session)
     elif ex == "HTX":
         return await get_real_balances_htx(session)
+    elif ex == "MEXC":
+        return await get_real_balances_mexc(session)
     return None
 
 
@@ -2333,6 +2500,8 @@ async def get_valuation_price(session, ex: str, symbol: str) -> Optional[float]:
     """Best bid как консервативная оценка стоимости позиции (если продавать)."""
     if ex == "Binance":
         ob = await get_orderbook_binance(session, symbol)
+    elif ex == "MEXC":
+        ob = await get_orderbook_mexc_rest(session, symbol)
     elif ex == "KuCoin":
         ob = await get_orderbook_kucoin(session, symbol)
     elif ex == "HTX":
@@ -2377,6 +2546,13 @@ async def get_misc_asset_price_usdt(session, ex: str, asset: str) -> Optional[fl
                     data = await r.json()
                     tick = data.get("tick", {})
                     return float(tick.get("close", 0)) or None
+        elif ex == "MEXC":
+            async with session.get("https://api.mexc.com/api/v3/ticker/price",
+                                    params={"symbol": f"{asset}USDT"},
+                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return float(data.get("price", 0)) or None
     except Exception as e:
         logger.warning(f"Не удалось оценить {asset} на {ex}: {e}")
     return None
@@ -2394,9 +2570,15 @@ async def get_total_real_capital(session) -> Optional[dict]:
     per_exchange = {}
     total = 0.0
     misc_assets_value = {}
-    for ex in ["Binance", "KuCoin", "HTX"]:
+    for ex in ["Binance", "KuCoin", "HTX", "MEXC"]:
+        # MEXC — необязательна, пока не заданы ключи в Railway (иначе
+        # авторизация 401 сломала бы ВЕСЬ /stats, а не только строку MEXC)
+        if ex == "MEXC" and not MEXC_KEY:
+            continue
         balances = await get_real_balances(session, ex)
         if balances is None:
+            if ex == "MEXC":
+                continue  # не валим весь расчёт из-за временного сбоя MEXC
             return None
         ex_total = balances.get("USDT", 0.0)
         for sym in SYMBOLS:
@@ -2552,6 +2734,8 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
             if not dry_run:
                 if ex == "Binance":
                     result = await place_order_binance(session, sym, "SELL", qty_to_sell)
+                elif ex == "MEXC":
+                    result = await place_order_mexc(session, sym, "SELL", qty_to_sell)
                 elif ex == "KuCoin":
                     result = await place_order_kucoin(session, sym, "sell", qty_to_sell, use_funds=False)
                 elif ex == "HTX":
@@ -2592,6 +2776,8 @@ async def apply_real_intra_exchange_rebalance(session, ex: str, plan: dict) -> d
             if not dry_run:
                 if ex == "Binance":
                     result = await place_order_binance(session, sym, "BUY", deficit_usd)
+                elif ex == "MEXC":
+                    result = await place_order_mexc(session, sym, "BUY", deficit_usd)
                 elif ex == "KuCoin":
                     result = await place_order_kucoin(session, sym, "buy", deficit_usd, use_funds=True)
                 elif ex == "HTX":
@@ -2609,7 +2795,9 @@ async def real_auto_rebalance_all(session) -> dict:
     МЕЖДУ биржами — только инструкция, как и в симуляции, автоперевод
     между биржами не делаем никогда."""
     plans = {}
-    for ex in ["Binance", "KuCoin", "HTX"]:
+    for ex in ["Binance", "KuCoin", "HTX", "MEXC"]:
+        if ex == "MEXC" and not MEXC_KEY:
+            continue  # MEXC ещё не настроена — не участвует в ребалансе
         p = await real_exchange_rebalance_plan(session, ex)
         if p is None:
             return {"fully_rebalanced": False, "error": f"could_not_fetch_balance_{ex}",
@@ -3440,10 +3628,10 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"Пример: `/depthcheck BONK`\nДоступно: {', '.join(SYMBOLS)}")
             return
         sym = parts[1].upper()
-        await send_tg(session, f"🔍 Запрашиваю реальный стакан {sym} с трёх бирж...")
-        bn, kc, hx, active = await fetch_all_orderbooks(session)
+        await send_tg(session, f"🔍 Запрашиваю реальный стакан {sym} с четырёх бирж...")
+        bn, kc, hx, mx, active = await fetch_all_orderbooks(session)
         msg = f"📖 *Стакан {sym}USDT*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        for ex, books in [("Binance", bn), ("KuCoin", kc), ("HTX", hx)]:
+        for ex, books in [("Binance", bn), ("KuCoin", kc), ("HTX", hx), ("MEXC", mx)]:
             ob = books.get(sym)
             if not ob:
                 msg += f"❌ *{ex}:* не удалось получить (отказов подряд: {stats['depth_fail'][ex]})\n\n"
@@ -3804,8 +3992,8 @@ async def handle_command(session, text, chat_id):
             )
             return
         ex_name = parts[1]
-        if ex_name not in ("Binance", "KuCoin", "HTX"):
-            await send_tg(session, "❌ Биржа должна быть одной из: Binance, KuCoin, HTX")
+        if ex_name not in ("Binance", "KuCoin", "HTX", "MEXC"):
+            await send_tg(session, "❌ Биржа должна быть одной из: Binance, KuCoin, HTX, MEXC")
             return
         if parts[2].lower() == "reset":
             config["rebalance_headroom_overrides"].pop(ex_name, None)
@@ -4075,7 +4263,7 @@ async def handle_command(session, text, chat_id):
         real_liquidated = {}
         real_liquidation_failed = []
         if not config["simulation_mode"]:
-            for ex in ["Binance", "KuCoin", "HTX"]:
+            for ex in ["Binance", "KuCoin", "HTX", "MEXC"]:
                 real_balances = await get_real_balances(session, ex)
                 if not real_balances:
                     continue
@@ -4088,6 +4276,8 @@ async def handle_command(session, text, chat_id):
                 result = None
                 if ex == "Binance":
                     result = await place_order_binance(session, sym, "SELL", sell_qty)
+                elif ex == "MEXC":
+                    result = await place_order_mexc(session, sym, "SELL", sell_qty)
                 elif ex == "KuCoin":
                     result = await place_order_kucoin(session, sym, "sell", sell_qty, use_funds=False)
                 elif ex == "HTX":
@@ -4135,9 +4325,11 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "⚠️ Бот в режиме симуляции — на реальных биржах продавать нечего "
                                     "(переключитесь `/mode`, если нужно продать реальный остаток).")
             return
-        await send_tg(session, f"📡 Проверяю реальный остаток {sym} на трёх биржах...")
+        await send_tg(session, f"📡 Проверяю реальный остаток {sym} на четырёх биржах...")
         sold, failed, none_found = {}, [], []
-        for ex in ["Binance", "KuCoin", "HTX"]:
+        for ex in ["Binance", "KuCoin", "HTX", "MEXC"]:
+            if ex == "MEXC" and not MEXC_KEY:
+                continue
             real_balances = await get_real_balances(session, ex)
             if not real_balances:
                 failed.append(f"{ex}: не удалось прочитать баланс")
@@ -4153,6 +4345,8 @@ async def handle_command(session, text, chat_id):
             result = None
             if ex == "Binance":
                 result = await place_order_binance(session, sym, "SELL", sell_qty)
+            elif ex == "MEXC":
+                result = await place_order_mexc(session, sym, "SELL", sell_qty)
             elif ex == "KuCoin":
                 result = await place_order_kucoin(session, sym, "sell", sell_qty, use_funds=False)
             elif ex == "HTX":
@@ -4194,8 +4388,8 @@ async def handle_command(session, text, chat_id):
             )
             return
         ex_name = parts[1]
-        if ex_name not in ("Binance", "KuCoin", "HTX"):
-            await send_tg(session, "❌ Биржа должна быть одной из: Binance, KuCoin, HTX")
+        if ex_name not in ("Binance", "KuCoin", "HTX", "MEXC"):
+            await send_tg(session, "❌ Биржа должна быть одной из: Binance, KuCoin, HTX, MEXC")
             return
         try:
             val = float(parts[2])
@@ -4225,7 +4419,9 @@ async def handle_command(session, text, chat_id):
 
     elif cmd == "/realbalance":
         await send_tg(session, "📡 Читаю реальные балансы и считаю план по каждой бирже...")
-        for ex in ["Binance", "KuCoin", "HTX"]:
+        for ex in ["Binance", "KuCoin", "HTX", "MEXC"]:
+            if ex == "MEXC" and not MEXC_KEY:
+                continue
             plan = await real_exchange_rebalance_plan(session, ex)
             if plan is None:
                 await send_tg(session, f"🔴 *{ex}*: не удалось получить баланс")
@@ -4392,8 +4588,8 @@ async def handle_command(session, text, chat_id):
 
     elif cmd == "/top":
         await send_tg(session, "📊 Сканирую без порога (реальная глубина)...")
-        bn, kc, hx, active = await fetch_all_orderbooks(session)
-        ex_map = {"Binance": bn, "KuCoin": kc, "HTX": hx}
+        bn, kc, hx, mx, active = await fetch_all_orderbooks(session)
+        ex_map = {"Binance": bn, "KuCoin": kc, "HTX": hx, "MEXC": mx}
         saved = config["min_profit_pct"]
         config["min_profit_pct"] = -999
         # ИСПРАВЛЕНИЕ 08.08: тот же лот, что использует фоновый цикл реальной
