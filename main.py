@@ -1795,9 +1795,19 @@ async def top_up_usdt_via_coin_sale(session, ex: str, symbol: str, usdt_needed: 
         return False
 
     # +8% запас сверху, как и в зеркальной функции
-    coin_to_sell = round((usdt_needed * 1.08) / price_hint, 6)
+    coin_to_sell = (usdt_needed * 1.08) / price_hint
     if coin_to_sell > have_coin:
-        coin_to_sell = round(have_coin * 0.98, 6)  # не пытаемся продать больше, чем есть
+        coin_to_sell = have_coin * 0.98  # не пытаемся продать больше, чем есть
+    # ИСПРАВЛЕНИЕ 10.08: раньше округлял просто до 6 знаков после запятой —
+    # для IOST/USDT на KuCoin это дало "Order size increment invalid"
+    # (нужен другой шаг округления, обычно целые числа для дешёвых монет).
+    # Используем ту же функцию правильного округления под конкретную биржу,
+    # что уже применяется для аварийного закрытия позиции.
+    coin_to_sell = await round_quantity_for_exchange(session, ex, symbol, coin_to_sell)
+    if coin_to_sell <= 0:
+        logger.warning(f"⛔ Автодокупка USDT на {ex}/{symbol} пропущена: после округления "
+                         f"под правила биржи количество получилось нулевым")
+        return False
 
     # ПРОВЕРКА КУРСА (пункт 4): берём самую свежую цену прямо перед продажей,
     # не полагаемся на price_hint, который мог устареть за секунды ожидания
