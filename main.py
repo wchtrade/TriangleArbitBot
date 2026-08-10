@@ -54,12 +54,11 @@ config = {
         # уровни, теперь честно считает ОБЩУЮ глубину стакана, как /verify
         # и /scancandidates). 10 — разумный минимум, чтобы отсечь реально
         # тонкие стаканы, не отбраковывая здоровые (там обычно 20-50+).
-    "max_topup_spend_per_day": 40.0,  # ПОВЫШЕНО 10.08 (было 20.0): с 10.08
-        # докупка работает в ОБЕ стороны (монета на бирже-продавце + USDT на
-        # бирже-покупателе через продажу монеты) — обе тратят из одного
-        # общего лимита, и $20 стало не хватать буквально за час активной
-        # торговли (потрачено $21.97 к середине дня). Настраивается
-        # командой /setmaxtopup.
+    "max_topup_spend_per_day": 100.0,  # ПОВЫШЕНО 10.08 (раунд 2, было 40.0):
+        # докупка теперь восстанавливает СРАЗУ весь целевой резерв (не по
+        # чуть-чуть под каждую сделку) — отдельные докупки стали крупнее
+        # (~$19 за раз вместо ~$5-6), хоть и реже. Старый лимит $40 мог бы
+        # заблокировать буквально 2 полных докупки за день.
         # НОВОЕ 05.08: дневной потолок трат на автодокупки — 04.08 они
         # съели $8.66 за один вечер на одной и той же проблемной паре,
         # нигде не отражаясь в видимой прибыли. Сбрасывается каждые сутки
@@ -2059,7 +2058,18 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     buffer_mult = 1 + config["balance_safety_buffer_pct"] / 100
     required_with_buffer = qty_needed_estimate * buffer_mult
     if available_on_sell_ex < required_with_buffer:
-        shortfall = round(required_with_buffer - available_on_sell_ex, 4)
+        # ИСПРАВЛЕНИЕ 10.08: раньше докупали ТОЛЬКО нехватку под ТЕКУЩУЮ
+        # сделку — резерв никогда не восстанавливался до полного целевого
+        # объёма (3 лота), только латался впритык каждый раз. Найдено по
+        # выгрузке Binance: за день продано на 35544 IOST больше, чем
+        # куплено обратно — резерв структурно "худел", несмотря на то что
+        # докупка формально срабатывала. Теперь докупаем СРАЗУ до полного
+        # целевого резерва (headroom_pct% сверху) — реже, но основательнее,
+        # догоняя темп продаж, а не постоянно отставая от него на полшага.
+        headroom_mult = 1 + config["rebalance_headroom_pct"] / 100
+        full_target_qty = (config["max_real_order_usdt"] * config["sell_reserve_lots"]
+                            / opp["sell_price"] * headroom_mult)
+        shortfall = round(max(required_with_buffer, full_target_qty) - available_on_sell_ex, 4)
         topped = await top_up_coin_reserve(session, sell_ex, symbol, shortfall, opp["sell_price"])
         if topped:
             await asyncio.sleep(1.5)  # даём бирже время зачислить монету на баланс
@@ -2114,7 +2124,12 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     fresh_sell_balances = await get_real_balances(session, sell_ex)
     fresh_available = (fresh_sell_balances or {}).get(symbol, 0.0)
     if fresh_available < sell_qty:
-        shortfall = round(sell_qty - fresh_available, 4)
+        # ИСПРАВЛЕНИЕ 10.08: та же логика, что и на первом рубеже — топим
+        # до полного целевого резерва, а не только под текущую сделку.
+        headroom_mult = 1 + config["rebalance_headroom_pct"] / 100
+        full_target_qty = (config["max_real_order_usdt"] * config["sell_reserve_lots"]
+                            / opp["sell_price"] * headroom_mult)
+        shortfall = round(max(sell_qty, full_target_qty) - fresh_available, 4)
         topped = await top_up_coin_reserve(session, sell_ex, symbol, shortfall, opp["sell_price"])
         if topped:
             await asyncio.sleep(1.5)
