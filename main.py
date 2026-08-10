@@ -2875,6 +2875,15 @@ async def execute_trade(session, opp: dict) -> dict:
     real_result = None
     if not config["simulation_mode"] and is_real_trading_allowed():
         real_result = await execute_real_arbitrage(session, opp)
+        # НОВОЕ 10.08: прямое логирование каждой попытки — "Реальных сделок
+        # исполнено" (stats["trades"]) много дней подряд стоял на нуле,
+        # несмотря на подтверждённую реальную активность (проседание резерва,
+        # выгрузки Binance). Логика выглядит правильной на бумаге, но раз
+        # расхождение упорно повторяется — нужны прямые факты из логов,
+        # а не ещё одна гипотеза вслепую.
+        logger.info(f"🔍 ДИАГНОСТИКА execute_real_arbitrage: success={real_result.get('success')} "
+                     f"error={real_result.get('error')} symbol={opp.get('symbol')} "
+                     f"buy_ex={opp.get('buy_ex')} sell_ex={opp.get('sell_ex')}")
         if real_result.get("success"):
             # НОВОЕ 08.08: раньше единственная метрика P&L была "Реальный
             # баланс" целиком — а это ОБЩАЯ рыночная стоимость портфеля,
