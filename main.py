@@ -4495,25 +4495,20 @@ async def scan_loop(session):
                             continue
                         if result["executed"]:
                             await send_tg(session, "✅ *ИСПОЛНЕНО*\n\n" + format_signal(opp))
-                            # НОВОЕ 07.08: после КАЖДОЙ успешной реальной сделки
-                            # монета/USDT на обеих биржах естественным образом
-                            # "перетекают" в форму, нужную для СЛЕДУЮЩЕЙ сделки
-                            # неправильно (биржа-покупатель тратит USDT, биржа-
-                            # продавец тратит запас монеты) — раньше это
-                            # выяснялось только на следующей попытке, с отказом
-                            # "insufficient_usdt_on_..." и ручным /rebalance.
-                            # Теперь ребалансируем сразу, не дожидаясь отказа.
-                            if not config["simulation_mode"]:
-                                now_ts = time.time()
-                                global _last_auto_rebalance_attempt
-                                if now_ts - _last_auto_rebalance_attempt > AUTO_REBALANCE_COOLDOWN:
-                                    _last_auto_rebalance_attempt = now_ts
-                                    rb_result = await real_auto_rebalance_all(session)
-                                    if CHAT_ID and (rb_result.get("applied") or rb_result.get("cross_exchange_needed")):
-                                        await send_tg(session, "⚖️ Авто-ребаланс после сделки:\n\n" +
-                                                       format_real_rebalance_result(rb_result))
-                                    if not rb_result.get("safe_to_resume", True):
-                                        config["paused"] = True
+                            # УБРАНО 10.08: раньше здесь после КАЖДОЙ успешной
+                            # сделки запускался полный авто-ребаланс — задумывался
+                            # как подстраховка от нехватки баланса на следующей
+                            # попытке. На практике (подтверждено выгрузкой Binance)
+                            # это заставляло Binance немедленно выкупать обратно
+                            # монету на всю полученную от продажи выручку — то
+                            # есть пересекать собственный bid/ask спред биржи на
+                            # КАЖДОМ цикле (~0.34% за раз, сопоставимо со всей
+                            # маржой сделки!). Кулдаун в 30 сек не спасал, так как
+                            # сделки идут раз в ~2 минуты — защита не срабатывала
+                            # НИ РАЗУ. Теперь полагаемся на точечные докупки
+                            # (top_up_coin_reserve / top_up_usdt_via_coin_sale),
+                            # которые срабатывают только когда РЕАЛЬНО не хватает,
+                            # а не "на всякий случай" после каждой сделки.
                         else:
                             reason = REASON_LABELS.get(result["reason"], result["reason"])
                             await send_tg(session,
