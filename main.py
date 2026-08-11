@@ -2261,6 +2261,8 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     buy_result = None
     if buy_ex == "Binance":
         buy_result = await place_order_binance(session, symbol, "BUY", vol)
+    elif buy_ex == "MEXC":
+        buy_result = await place_order_mexc(session, symbol, "BUY", vol)
     elif buy_ex == "KuCoin":
         buy_result = await place_order_kucoin(session, symbol, "buy", vol, use_funds=True)
     elif buy_ex == "HTX":
@@ -2320,6 +2322,8 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     sell_result = None
     if sell_ex == "Binance":
         sell_result = await place_order_binance(session, symbol, "SELL", sell_qty)
+    elif sell_ex == "MEXC":
+        sell_result = await place_order_mexc(session, symbol, "SELL", sell_qty)
     elif sell_ex == "KuCoin":
         sell_result = await place_order_kucoin(session, symbol, "sell", sell_qty, use_funds=False)
     elif sell_ex == "HTX":
@@ -2337,6 +2341,8 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
         if emergency_qty > 0:
             if buy_ex == "Binance":
                 emergency = await place_order_binance(session, symbol, "SELL", emergency_qty)
+            elif buy_ex == "MEXC":
+                emergency = await place_order_mexc(session, symbol, "SELL", emergency_qty)
             elif buy_ex == "KuCoin":
                 emergency = await place_order_kucoin(session, symbol, "sell", emergency_qty, use_funds=False)
             elif buy_ex == "HTX":
