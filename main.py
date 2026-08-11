@@ -1482,7 +1482,7 @@ async def wait_for_mexc_fill(session, symbol: str, order_id, timeout: float = 3.
         ts = int(time.time() * 1000)
         params = {"symbol": f"{symbol}{QUOTE}", "orderId": order_id, "timestamp": ts, "recvWindow": 5000}
         params["signature"] = sign_binance(params, MEXC_SECRET)
-        headers = {"X-MEXC-APIKEY": MEXC_KEY}
+        headers = {"X-MEXC-APIKEY": MEXC_KEY, "Content-Type": "application/json"}
         try:
             async with session.get("https://api.mexc.com/api/v3/order", params=params,
                                     headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as r:
@@ -1625,7 +1625,14 @@ async def place_order_binance(session, symbol: str, side: str, quote_usdt: float
 
 async def place_order_mexc(session, symbol: str, side: str, quote_usdt: float) -> Optional[dict]:
     """НОВОЕ 10.08: MARKET-ордер на MEXC. Формат идентичен Binance
-    (тот же /api/v3/order, те же параметры quoteOrderQty/quantity)."""
+    (тот же /api/v3/order, те же параметры quoteOrderQty/quantity).
+
+    ИСПРАВЛЕНИЕ 11.08: первая же реальная попытка упала с
+    {'code': 700013, 'msg': 'Invalid content Type.'} — с февраля 2024 MEXC
+    ОБЯЗАТЕЛЬНО требует заголовок Content-Type: application/json на всех
+    POST/PUT/DELETE запросах, даже когда сами параметры передаются в
+    строке запроса (как у Binance), а не в теле. Без этого заголовка
+    биржа отклоняет запрос ещё до проверки подписи/прав ключа."""
     if is_backed_off("MEXC"):
         logger.error("MEXC в бэкоффе — реальный ордер НЕ отправлен")
         return None
@@ -1640,7 +1647,7 @@ async def place_order_mexc(session, symbol: str, side: str, quote_usdt: float) -
     else:
         params["quantity"] = quote_usdt
     params["signature"] = sign_binance(params, MEXC_SECRET)
-    headers = {"X-MEXC-APIKEY": MEXC_KEY}
+    headers = {"X-MEXC-APIKEY": MEXC_KEY, "Content-Type": "application/json"}
     try:
         async with session.post(url, params=params, headers=headers,
                                  timeout=aiohttp.ClientTimeout(total=10)) as r:
@@ -2466,7 +2473,7 @@ async def get_real_balances_mexc(session) -> Optional[Dict[str, float]]:
     ts = int(time.time() * 1000)
     params = {"timestamp": ts, "recvWindow": 5000}
     params["signature"] = sign_binance(params, MEXC_SECRET)
-    headers = {"X-MEXC-APIKEY": MEXC_KEY}
+    headers = {"X-MEXC-APIKEY": MEXC_KEY, "Content-Type": "application/json"}
     try:
         async with session.get(url, params=params, headers=headers,
                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
