@@ -124,6 +124,15 @@ SYMBOLS = ["TRX"]   # ИСПРАВЛЕНО 05.08: этот список — де
     # (50/50 и 50/20 уровней на всех трёх биржах, разброс цены 0.04%) —
     # меняйте этот список, только когда осознанно переключаетесь на другую
     # монету навсегда, а не через /addcoin в чате (это временно, до рестарта).
+
+# НОВОЕ 11.08: отдельный, НЕЗАВИСИМЫЙ список монет для треугольного
+# арбитража (/triangle) — не пересекается с SYMBOLS (реальная торговля).
+# Раньше /triangle проверял только то, что уже настроено для основной
+# торговли — а это чистая идея-разведка, не должна случайно втягивать
+# новую монету в реальные сделки через побочную дверь. Настраивается
+# через /addtriangle и /removetriangle.
+TRIANGLE_SYMBOLS: List[str] = []
+
 QUOTE   = "USDT"
 BRIDGE  = "BTC"   # мост для треугольного арбитража: USDT -> COIN -> BTC -> USDT
 PAIRS   = [
@@ -227,6 +236,13 @@ stats = {
     "topup_success":  0,
 }
 trade_history: List[dict] = []
+# НОВОЕ 11.08: история P&L во времени — для скользящего среднего за час в
+# /stats. Каждая проверка P&L (не чаще раз в минуту) добавляет точку
+# (время, значение); старые точки (>1 часа) вычищаются, чтобы список не
+# рос бесконечно. Цель — не устранить рыночный шум резерва (это его
+# реальное свойство), а перестать показывать РЕЗКИЕ скачки одного снятого
+# момента, вместо этого честно показывать усреднённый тренд за последний час.
+pnl_history: List[Tuple[float, float]] = []  # (timestamp, pnl_real)
 last_signal_time: Dict[str, float] = {}
 coin_volumes: Dict[str, float] = {}
 triangle_history: List[dict] = []
@@ -1099,7 +1115,7 @@ async def scan_triangles(session) -> List[dict]:
     if not config["triangular_enabled"]:
         return []
     found = []
-    for sym in SYMBOLS:
+    for sym in TRIANGLE_SYMBOLS:
         try:
             res = await calc_triangle(session, sym, config["trade_usdt"])
             if res:
@@ -2571,6 +2587,21 @@ async def get_misc_asset_price_usdt(session, ex: str, asset: str) -> Optional[fl
     return None
 
 
+def record_pnl_and_get_hour_avg(pnl_now: float) -> float:
+    """НОВОЕ 11.08: добавляет текущую точку P&L в историю, вычищает точки
+    старше часа, возвращает среднее за последний час. Не заменяет честный
+    мгновенный P&L — просто даёт спокойный, менее дёргающийся ориентир
+    рядом с ним."""
+    now_ts = time.time()
+    pnl_history.append((now_ts, pnl_now))
+    cutoff = now_ts - 3600
+    while pnl_history and pnl_history[0][0] < cutoff:
+        pnl_history.pop(0)
+    if not pnl_history:
+        return pnl_now
+    return sum(p for _, p in pnl_history) / len(pnl_history)
+
+
 async def get_total_real_capital(session) -> Optional[dict]:
     """Реальный совокупный капитал на всех трёх биржах — используется в /stats
     вместо симуляционного SIM_START/sim_balances, когда бот в реальном режиме.
@@ -3723,10 +3754,13 @@ async def handle_command(session, text, chat_id):
                 )
                 if config["real_start_capital"]:
                     pnl_real = round(real["total"] - config["real_start_capital"], 2)
+                    hour_avg = round(record_pnl_and_get_hour_avg(pnl_real), 2)
                     balance_block = (
                         f"💵 Реальный баланс: ${real['total']} ({per_ex})\n"
                         f"   Старт (зафиксирован): ${config['real_start_capital']} | "
                         f"P&L: {pnl_real:+.2f} (включает переоценку резерва по рынку)\n"
+                        f"   📉 Среднее P&L за последний час: {hour_avg:+.2f} "
+                        f"(спокойнее, чем моментальное число — меньше рыночного шума)\n"
                         f"{realized_line}"
                     )
                 else:
@@ -4502,8 +4536,43 @@ async def handle_command(session, text, chat_id):
         msg += "\n💡 REST-фоллбэк подключается автоматически, если WS ещё не готов."
         await send_tg(session, msg)
 
+    elif cmd == "/addtriangle":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Добавляет монету в список для /triangle (НЕ влияет на "
+                f"реальную торговлю — отдельный список).\n"
+                f"Сейчас: {', '.join(TRIANGLE_SYMBOLS) if TRIANGLE_SYMBOLS else '(пусто)'}\n"
+                f"Пример: `/addtriangle ETH`")
+            return
+        sym = parts[1].upper()
+        if sym in TRIANGLE_SYMBOLS:
+            await send_tg(session, f"⚠️ {sym} уже в списке треугольника.")
+            return
+        TRIANGLE_SYMBOLS.append(sym)
+        await send_tg(session, f"✅ Добавлено в треугольник: {sym}\n"
+                                 f"Текущий список: {', '.join(TRIANGLE_SYMBOLS)}")
+
+    elif cmd == "/removetriangle":
+        if len(parts) < 2:
+            await send_tg(session, "Пример: `/removetriangle ETH`")
+            return
+        sym = parts[1].upper()
+        if sym not in TRIANGLE_SYMBOLS:
+            await send_tg(session, f"⚠️ {sym} не в списке треугольника.")
+            return
+        TRIANGLE_SYMBOLS.remove(sym)
+        await send_tg(session, f"✅ Удалено из треугольника: {sym}\n"
+                                 f"Текущий список: {', '.join(TRIANGLE_SYMBOLS) if TRIANGLE_SYMBOLS else '(пусто)'}")
+
     elif cmd == "/triangle":
-        await send_tg(session, "🔺 Сканирую треугольный арбитраж на Binance...")
+        if not TRIANGLE_SYMBOLS:
+            await send_tg(session,
+                "⚠️ Список монет для треугольника пуст.\n"
+                "Добавьте хотя бы одну: `/addtriangle ETH`\n"
+                "Это отдельный список, не влияет на реальную торговлю.")
+            return
+        await send_tg(session, f"🔺 Сканирую треугольный арбитраж на Binance "
+                                 f"({', '.join(TRIANGLE_SYMBOLS)})...")
         results = await scan_triangles(session)
         if not results:
             await send_tg(session,
