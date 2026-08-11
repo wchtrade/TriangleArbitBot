@@ -85,6 +85,14 @@ config = {
     "real_rebalance_dry_run": True,  # ПО УМОЛЧАНИЮ включено: первый реальный ребаланс
                                        # только показывает план, не размещает ордера,
                                        # пока вы явно не отключите через /rebalancelive
+    "periodic_rebalance_hours": 4.0,  # НОВОЕ 11.08: раз в сколько часов запускать
+        # ФОНОВЫЙ, автоматический полный ребаланс — НЕ после каждой сделки (это
+        # убрали 10.08, слишком часто пересекало спред биржи), а по таймеру,
+        # независимо от торговых событий. Цель — периодически "подстригать"
+        # резерв обратно к целевому значению: если цена выросла, излишек
+        # продаётся в USDT, фиксируя часть роста; если упала — резерв
+        # пополняется как обычно. Настраивается через /setperiodicrebalance,
+        # 0 — выключить полностью.
     "real_trades_today":    0,
     "real_start_capital":   None,  # фиксируется командой /setrealstart, для честного P&L в реальном режиме
     "max_real_trades_per_day": 200,  # поднято с 20 - для круглосуточной работы; /setmaxtrades меняет
@@ -4075,6 +4083,30 @@ async def handle_command(session, text, chat_id):
         except ValueError:
             await send_tg(session, "❌ Пример: `/setmaxtopup 20`")
 
+    elif cmd == "/setperiodicrebalance":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущий интервал фонового ребаланса: каждые "
+                f"{config['periodic_rebalance_hours']}ч (0 = выключено)\n\n"
+                f"Это ОТДЕЛЬНЫЙ механизм от ребаланса после сделки (тот убран 10.08) — "
+                f"срабатывает по таймеру, не по событию, специально чтобы периодически "
+                f"фиксировать рост резерва в USDT, не пересекая спред слишком часто.\n\n"
+                f"Пример: `/setperiodicrebalance 4`"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0:
+                await send_tg(session, "❌ Не может быть отрицательным.")
+                return
+            config["periodic_rebalance_hours"] = val
+            if val == 0:
+                await send_tg(session, "✅ Периодический ребаланс выключен.")
+            else:
+                await send_tg(session, f"✅ Периодический ребаланс: каждые {val}ч.")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setperiodicrebalance 4`")
+
     elif cmd == "/setminvolume":
         # НОВОЕ 06.08: раньше этот порог (по умолчанию $100,000 24h-объёма
         # на Binance) можно было изменить только через деплой. Обнаружено,
@@ -4844,6 +4876,33 @@ async def polling_loop(session):
         await asyncio.sleep(1)
 
 
+async def periodic_rebalance_loop(session):
+    """НОВОЕ 11.08: фоновый, привязанный к ВРЕМЕНИ (не к сделкам) полный
+    ребаланс — раз в config['periodic_rebalance_hours'] часов. Отличие от
+    убранного 10.08 механизма "ребаланс после каждой сделки": там триггер
+    был СОБЫТИЕМ (каждая сделка, слишком часто — раз в ~2 минуты), здесь
+    триггер ВРЕМЯ (по умолчанию раз в 4 часа) — достаточно редко, чтобы не
+    пересекать спред биржи зря, но достаточно часто, чтобы периодически
+    "подстригать" резерв обратно к цели: если цена резерва выросла —
+    излишек продаётся в USDT, фиксируя часть роста в стабильной форме."""
+    await asyncio.sleep(300)  # даём боту 5 минут на старте устаканиться, прежде чем первый прогон
+    while True:
+        hours = config.get("periodic_rebalance_hours", 0)
+        if hours <= 0:
+            await asyncio.sleep(600)
+            continue
+        try:
+            if not config["simulation_mode"] and not config["paused"]:
+                logger.info(f"Периодический ребаланс (раз в {hours}ч): запускаю...")
+                rb_result = await real_auto_rebalance_all(session)
+                if CHAT_ID and (rb_result.get("applied") or rb_result.get("cross_exchange_needed")):
+                    await send_tg(session, "⏰ *Периодический ребаланс* (по таймеру, не от сделки):\n\n" +
+                                   format_real_rebalance_result(rb_result))
+        except Exception as e:
+            logger.error(f"Periodic rebalance loop error: {e}")
+        await asyncio.sleep(hours * 3600)
+
+
 async def scan_loop(session):
     await asyncio.sleep(15)
     while True:
@@ -4944,7 +5003,7 @@ async def main():
             start_kucoin_ws_book(session, sym)
             start_htx_ws_book(session, sym)
         logger.info(f"WS-стаканы запущены на Binance/KuCoin/HTX для {SYMBOLS}")
-        await asyncio.gather(polling_loop(session), scan_loop(session))
+        await asyncio.gather(polling_loop(session), scan_loop(session), periodic_rebalance_loop(session))
 
 
 if __name__ == "__main__":
