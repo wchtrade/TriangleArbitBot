@@ -93,6 +93,11 @@ config = {
         # продаётся в USDT, фиксируя часть роста; если упала — резерв
         # пополняется как обычно. Настраивается через /setperiodicrebalance,
         # 0 — выключить полностью.
+    "profit_lock_interval_sec": 300,  # НОВОЕ 12.08: как часто (в секундах)
+        # проверять курсовой плюс для немедленной фиксации в USDT — по
+        # умолчанию раз в 5 минут. Отдельно и НЕЗАВИСИМО от
+        # periodic_rebalance_hours (тот реже, но полный, эта чаще, но
+        # только фиксирует плюс, никогда не докупает при минусе).
     "real_trades_today":    0,
     "real_start_capital":   None,  # фиксируется командой /setrealstart, для честного P&L в реальном режиме
     "max_real_trades_per_day": 200,  # поднято с 20 - для круглосуточной работы; /setmaxtrades меняет
@@ -4107,6 +4112,31 @@ async def handle_command(session, text, chat_id):
         except ValueError:
             await send_tg(session, "❌ Пример: `/setperiodicrebalance 4`")
 
+    elif cmd == "/setprofitlock":
+        if len(parts) < 2:
+            cur = config.get("profit_lock_interval_sec", 300)
+            await send_tg(session,
+                f"Текущий интервал фиксации курсового плюса: каждые {cur} сек "
+                f"(0 = выключено)\n\n"
+                f"При ЛЮБОМ реальном плюсе на резерве (стоит дороже цели) — "
+                f"сразу продаёт излишек в USDT. При минусе НИЧЕГО не делает, "
+                f"просто ждёт (докупка дефицита — отдельный, реактивный механизм).\n\n"
+                f"Пример: `/setprofitlock 300` (раз в 5 минут)"
+            )
+            return
+        try:
+            val = int(parts[1])
+            if val < 0:
+                await send_tg(session, "❌ Не может быть отрицательным.")
+                return
+            config["profit_lock_interval_sec"] = val
+            if val == 0:
+                await send_tg(session, "✅ Фиксация курсового плюса выключена.")
+            else:
+                await send_tg(session, f"✅ Фиксация курсового плюса: проверка каждые {val} сек.")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setprofitlock 300`")
+
     elif cmd == "/setminvolume":
         # НОВОЕ 06.08: раньше этот порог (по умолчанию $100,000 24h-объёма
         # на Binance) можно было изменить только через деплой. Обнаружено,
@@ -4903,6 +4933,93 @@ async def periodic_rebalance_loop(session):
         await asyncio.sleep(hours * 3600)
 
 
+async def lock_in_profit_only(session, ex: str, plan: dict) -> List[dict]:
+    """НОВОЕ 12.08: облегчённая версия apply_real_intra_exchange_rebalance —
+    ТОЛЬКО продажа излишка (фиксация курсового плюса в USDT), НИКОГДА не
+    докупает при дефиците. По прямому запросу пользователя: "при минусе
+    просто ждать" — эта функция реализует именно половину логики, не
+    трогая вторую. Переиспользует ту же проверенную защиту (порог $1,
+    минимум ордера биржи, потолок в 3x лимита сделки, округление под шаг
+    лота) — просто без секции докупки дефицита."""
+    dry_run = config["real_rebalance_dry_run"]
+    actions = []
+    coin_targets = plan["coin_targets"]
+    threshold = 1.0
+    min_order = MIN_ORDER_VALUE_USD.get(ex, 5.0)
+
+    for sym, value in plan["coin_values"].items():
+        coin_target = coin_targets.get(sym, 0.0)
+        if value <= coin_target + threshold:
+            continue  # плюса нет (или он меньше \$1) — ничего не делаем, просто ждём
+        qty = plan["balances_qty"].get(sym, 0)
+        price = value / qty if qty else None
+        if not price:
+            continue
+        excess_usd = value - coin_target
+        max_single_sell_usd = config["max_real_order_usdt"] * 3
+        if excess_usd > max_single_sell_usd:
+            excess_usd = max_single_sell_usd
+        if excess_usd < min_order:
+            if value >= min_order:
+                excess_usd = value
+            else:
+                continue
+        qty_to_sell_raw = min(excess_usd / price, qty * 0.98)
+        qty_to_sell = qty_to_sell_raw if dry_run else \
+            await round_quantity_for_exchange(session, ex, sym, qty_to_sell_raw)
+        if not dry_run and qty_to_sell <= 0:
+            continue
+        result = "DRY_RUN" if dry_run else None
+        if not dry_run:
+            if ex == "Binance":
+                result = await place_order_binance(session, sym, "SELL", qty_to_sell)
+            elif ex == "MEXC":
+                result = await place_order_mexc(session, sym, "SELL", qty_to_sell)
+            elif ex == "KuCoin":
+                result = await place_order_kucoin(session, sym, "sell", qty_to_sell, use_funds=False)
+            elif ex == "HTX":
+                if _htx_account_id_cache:
+                    result = await place_order_htx(session, _htx_account_id_cache, sym, "sell-market", qty_to_sell)
+        actions.append({"ex": ex, "symbol": sym, "usd_estimate": round(excess_usd, 2),
+                         "success": bool(result), "dry_run": dry_run})
+    return actions
+
+
+async def profit_lock_loop(session):
+    """НОВОЕ 12.08: по прямому запросу пользователя — следит за P&L ЧАСТО
+    (не раз в 4 часа, как periodic_rebalance_loop) и, как только на КАКОЙ-
+    ЛИБО бирже резерв стоит дороже цели (реальный курсовой плюс), сразу
+    продаёт излишек в USDT, фиксируя прибыль. При минусе — ничего не
+    делает, просто ждёт (докупка дефицита остаётся на существующих
+    реактивных механизмах внутри самой сделки, не здесь). Работает НЕЗАВИСИМО
+    от periodic_rebalance_loop (тот по-прежнему держит редкий, полный
+    ребаланс как подстраховку на случай, если эта проверка что-то пропустит)."""
+    await asyncio.sleep(180)  # 3 минуты на старте, чтобы бот успел прочитать первый баланс
+    while True:
+        try:
+            if not config["simulation_mode"] and not config["paused"]:
+                all_actions = []
+                for ex in ["Binance", "KuCoin", "HTX", "MEXC"]:
+                    if ex == "MEXC" and not MEXC_KEY:
+                        continue
+                    plan = await real_exchange_rebalance_plan(session, ex)
+                    if plan is None:
+                        continue
+                    actions = await lock_in_profit_only(session, ex, plan)
+                    all_actions.extend(actions)
+                if all_actions and CHAT_ID:
+                    lines = "\n".join(
+                        f"  {'✅' if a['success'] else '❌'} {a['ex']}/{a['symbol']}: "
+                        f"зафиксировано ~${a['usd_estimate']}"
+                        + (" (DRY RUN — не реальный ордер)" if a["dry_run"] else "")
+                        for a in all_actions
+                    )
+                    await send_tg(session, f"💰 *Курсовой плюс зафиксирован в USDT:*\n\n{lines}")
+        except Exception as e:
+            logger.error(f"Profit lock loop error: {e}")
+        await asyncio.sleep(config.get("profit_lock_interval_sec", 300))  # по умолчанию раз в 5 минут
+
+
 async def scan_loop(session):
     await asyncio.sleep(15)
     while True:
@@ -5003,7 +5120,8 @@ async def main():
             start_kucoin_ws_book(session, sym)
             start_htx_ws_book(session, sym)
         logger.info(f"WS-стаканы запущены на Binance/KuCoin/HTX для {SYMBOLS}")
-        await asyncio.gather(polling_loop(session), scan_loop(session), periodic_rebalance_loop(session))
+        await asyncio.gather(polling_loop(session), scan_loop(session),
+                              periodic_rebalance_loop(session), profit_lock_loop(session))
 
 
 if __name__ == "__main__":
