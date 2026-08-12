@@ -4938,19 +4938,24 @@ async def lock_in_profit_only(session, ex: str, plan: dict) -> List[dict]:
     ТОЛЬКО продажа излишка (фиксация курсового плюса в USDT), НИКОГДА не
     докупает при дефиците. По прямому запросу пользователя: "при минусе
     просто ждать" — эта функция реализует именно половину логики, не
-    трогая вторую. Переиспользует ту же проверенную защиту (порог $1,
-    минимум ордера биржи, потолок в 3x лимита сделки, округление под шаг
-    лота) — просто без секции докупки дефицита."""
+    трогая вторую.
+
+    ИСПРАВЛЕНИЕ 12.08 (тот же день): изначально скопировал порог $1 из
+    старого 4-часового механизма — но там он был уместен (редкие большие
+    ребалансы), а здесь при частой проверке (раз в 5 минут) на капитале
+    ~$22 излишек редко успевает дорасти до $1 (это почти 5% всего
+    портфеля). Единственный реальный гейт теперь — минимальный размер
+    ордера БИРЖИ (min_order): излишек меньше этого — просто ждём дальше,
+    не пытаясь продать искусственно урезанную или, того хуже, всю позицию."""
     dry_run = config["real_rebalance_dry_run"]
     actions = []
     coin_targets = plan["coin_targets"]
-    threshold = 1.0
     min_order = MIN_ORDER_VALUE_USD.get(ex, 5.0)
 
     for sym, value in plan["coin_values"].items():
         coin_target = coin_targets.get(sym, 0.0)
-        if value <= coin_target + threshold:
-            continue  # плюса нет (или он меньше \$1) — ничего не делаем, просто ждём
+        if value <= coin_target:
+            continue  # плюса нет вообще — ничего не делаем, просто ждём
         qty = plan["balances_qty"].get(sym, 0)
         price = value / qty if qty else None
         if not price:
@@ -4960,10 +4965,12 @@ async def lock_in_profit_only(session, ex: str, plan: dict) -> List[dict]:
         if excess_usd > max_single_sell_usd:
             excess_usd = max_single_sell_usd
         if excess_usd < min_order:
-            if value >= min_order:
-                excess_usd = value
-            else:
-                continue
+            # ИСПРАВЛЕНИЕ 12.08: НЕ продаём весь резерв целиком, если излишек
+            # меньше минимума биржи (в отличие от редкого 4-часового
+            # ребаланса, где это уместно) — здесь это разрушило бы сам смысл
+            # готового резерва для мгновенной торговли, срабатывая каждые
+            # 5 минут. Просто ждём, пока излишек сам не подрастёт достаточно.
+            continue
         qty_to_sell_raw = min(excess_usd / price, qty * 0.98)
         qty_to_sell = qty_to_sell_raw if dry_run else \
             await round_quantity_for_exchange(session, ex, sym, qty_to_sell_raw)
