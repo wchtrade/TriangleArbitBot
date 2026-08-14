@@ -98,6 +98,16 @@ config = {
         # умолчанию раз в 5 минут. Отдельно и НЕЗАВИСИМО от
         # periodic_rebalance_hours (тот реже, но полный, эта чаще, но
         # только фиксирует плюс, никогда не докупает при минусе).
+    "max_drawdown_pct": 5.0,  # НОВОЕ 14.08: предохранитель от чрезмерного
+        # курсового минуса — по прямому запросу пользователя. Если общий
+        # P&L (включая переоценку резерва) упадёт ниже этого % от
+        # стартового капитала — бот САМ ставится на паузу и присылает
+        # предупреждение, вместо того чтобы молча продолжать копить
+        # непонятно насколько глубокий минус. Не устраняет сам курсовой
+        # шум (это невозможно без потери чего-то другого — уже обсуждали),
+        # но ограничивает МАКСИМАЛЬНУЮ глубину, прежде чем человек об этом
+        # узнает и сможет решить, что делать. 0 — выключить полностью.
+        # Настраивается через /setmaxdrawdown.
     "real_trades_today":    0,
     "real_start_capital":   None,  # фиксируется командой /setrealstart, для честного P&L в реальном режиме
     "max_real_trades_per_day": 200,  # поднято с 20 - для круглосуточной работы; /setmaxtrades меняет
@@ -2095,6 +2105,31 @@ async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: floa
     if stats.get("topup_cost_usdt", 0.0) >= config["max_topup_spend_per_day"]:
         logger.error(f"⛔ Дневной лимит трат на автодокупки (${config['max_topup_spend_per_day']}) "
                       f"исчерпан — докупка {symbol} на {ex} пропущена")
+        return False
+
+    # НОВОЕ 14.08: найден и воспроизведён замкнутый круг — если MEXC (или
+    # любая продающая биржа) истощила резерв монеты, ей НЕЧЕМ торговать,
+    # значит она не зарабатывает новый USDT от продаж, а докупить монету
+    # не на что, потому что своего USDT тоже не хватает. Автодокупка
+    # проваливалась 17 раз подряд именно по этой причине — биржа честно
+    # отвечала отказом на BUY-ордер, для которого физически не было
+    # средств, а не из-за проблем с API/подписью. Проверяем ЗАРАНЕЕ,
+    # хватает ли своего USDT — если нет, предупреждаем явно (не молчим,
+    # как раньше) и НЕ тратим время/лимит на заведомо обречённую попытку.
+    own_balances = await get_real_balances(session, ex)
+    own_usdt = (own_balances or {}).get("USDT", 0.0)
+    est_cost = shortfall_qty * price_hint * 1.08
+    if own_usdt < est_cost:
+        logger.error(f"⛔ Докупка {symbol} на {ex} невозможна: своего USDT ${own_usdt:.2f}, "
+                      f"нужно ~${est_cost:.2f} — на бирже физически не хватает средств "
+                      f"(замкнутый круг: биржа не продаёт -> не зарабатывает USDT -> "
+                      f"не может докупить монету). Нужен ручной /rebalance или перевод.")
+        if CHAT_ID:
+            await send_tg(session,
+                f"🔴 *Замкнутый круг на {ex}*: не хватает {symbol} для торговли "
+                f"({shortfall_qty:.0f} шт), но и своего USDT (${own_usdt:.2f}) не хватает, "
+                f"чтобы это докупить (нужно ~${est_cost:.2f}). Биржа сама себя не вытащит — "
+                f"нужен `/rebalance` или ручной перевод USDT на {ex} прямо сейчас.")
         return False
 
     stats["topup_attempts"] += 1
@@ -4137,6 +4172,33 @@ async def handle_command(session, text, chat_id):
         except ValueError:
             await send_tg(session, "❌ Пример: `/setprofitlock 300`")
 
+    elif cmd == "/setmaxdrawdown":
+        if len(parts) < 2:
+            cur = config.get("max_drawdown_pct", 0)
+            await send_tg(session,
+                f"Текущий порог предохранителя: -{cur}% от старта (0 = выключено)\n\n"
+                f"Если общий P&L упадёт ниже этого порога — бот САМ ставится на "
+                f"паузу и присылает предупреждение, вместо того чтобы молча "
+                f"продолжать при уже болезненном минусе. Не устраняет курсовой "
+                f"шум резерва (это невозможно без потери чего-то другого) — "
+                f"только ограничивает, насколько глубоко он может утянуть "
+                f"капитал, прежде чем вы об этом узнаете.\n\n"
+                f"Пример: `/setmaxdrawdown 5` (пауза при -5% от старта)"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0:
+                await send_tg(session, "❌ Не может быть отрицательным.")
+                return
+            config["max_drawdown_pct"] = val
+            if val == 0:
+                await send_tg(session, "✅ Предохранитель от минуса выключен.")
+            else:
+                await send_tg(session, f"✅ Предохранитель: пауза при общем P&L ниже -{val}% от старта.")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setmaxdrawdown 5`")
+
     elif cmd == "/setminvolume":
         # НОВОЕ 06.08: раньше этот порог (по умолчанию $100,000 24h-объёма
         # на Binance) можно было изменить только через деплой. Обнаружено,
@@ -5042,6 +5104,53 @@ async def profit_lock_loop(session):
         await asyncio.sleep(config.get("profit_lock_interval_sec", 300))  # по умолчанию раз в 5 минут
 
 
+async def drawdown_guard_loop(session):
+    """НОВОЕ 14.08: предохранитель от чрезмерного курсового минуса — по
+    прямому запросу пользователя. Не устраняет сам курсовой шум резерва
+    (мы честно обсудили — это невозможно без потери чего-то другого), но
+    ограничивает МАКСИМАЛЬНУЮ глубину, прежде чем человек об этом узнает.
+    Проверяет каждые 5 минут (та же частота, что и profit_lock_loop) —
+    если общий P&L (реальный баланс минус зафиксированный старт) упадёт
+    ниже config['max_drawdown_pct']% от стартового капитала — бот САМ
+    ставится на паузу и явно предупреждает, вместо того чтобы молча
+    продолжать торговать при уже болезненном минусе. Не срабатывает
+    повторно на каждой проверке подряд — только один раз при пересечении
+    порога, чтобы не спамить одним и тем же предупреждением."""
+    await asyncio.sleep(200)
+    already_warned = False
+    while True:
+        try:
+            pct = config.get("max_drawdown_pct", 0)
+            if (pct > 0 and not config["simulation_mode"] and not config["paused"]
+                    and config.get("real_start_capital")):
+                real = await get_total_real_capital(session)
+                if real:
+                    pnl = real["total"] - config["real_start_capital"]
+                    pnl_pct = pnl / config["real_start_capital"] * 100
+                    if pnl_pct <= -pct:
+                        if not already_warned:
+                            config["paused"] = True
+                            already_warned = True
+                            if CHAT_ID:
+                                await send_tg(session,
+                                    f"🛑 *ПРЕДОХРАНИТЕЛЬ СРАБОТАЛ — торговля поставлена на паузу*\n\n"
+                                    f"Общий P&L: {pnl:+.2f} USDT ({pnl_pct:+.1f}% от старта "
+                                    f"${config['real_start_capital']}) — превышен порог "
+                                    f"-{pct}%.\n\n"
+                                    f"Это может быть как реальная торговая потеря, так и "
+                                    f"обычный курсовой шум резерва — проверьте `/stats` и "
+                                    f"`/realbalance`, прежде чем решать, что делать дальше. "
+                                    f"`/go` возобновит торговлю вручную, когда будете готовы.\n\n"
+                                    f"Настройка порога: `/setmaxdrawdown` (сейчас {pct}%)")
+                    else:
+                        already_warned = False  # P&L восстановился выше порога — снимаем флаг,
+                                                  # чтобы предупреждение могло сработать снова,
+                                                  # если минус повторится в будущем
+        except Exception as e:
+            logger.error(f"Drawdown guard loop error: {e}")
+        await asyncio.sleep(300)
+
+
 async def scan_loop(session):
     await asyncio.sleep(15)
     while True:
@@ -5143,7 +5252,8 @@ async def main():
             start_htx_ws_book(session, sym)
         logger.info(f"WS-стаканы запущены на Binance/KuCoin/HTX для {SYMBOLS}")
         await asyncio.gather(polling_loop(session), scan_loop(session),
-                              periodic_rebalance_loop(session), profit_lock_loop(session))
+                              periodic_rebalance_loop(session), profit_lock_loop(session),
+                              drawdown_guard_loop(session))
 
 
 if __name__ == "__main__":
