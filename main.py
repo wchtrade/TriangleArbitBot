@@ -266,6 +266,36 @@ trade_history: List[dict] = []
 # реальное свойство), а перестать показывать РЕЗКИЕ скачки одного снятого
 # момента, вместо этого честно показывать усреднённый тренд за последний час.
 pnl_history: List[Tuple[float, float]] = []  # (timestamp, pnl_real)
+# НОВОЕ 15.08: история РЫНОЧНОЙ ЦЕНЫ монеты (не P&L) — по прямому запросу
+# пользователя после обсуждения, что честное "прогнозирование" цены
+# невозможно, но ОПИСАТЕЛЬНЫЙ тренд за последние часы — можно. Это НЕ
+# предсказание будущего, а честный взгляд назад: росла или падала цена
+# за последние 24 часа. Хранит точки за последние 24 часа, вычищает старые.
+price_history: List[Tuple[float, float]] = []  # (timestamp, mid_price)
+
+
+def record_price_and_get_trend() -> Optional[dict]:
+    """Записывает текущую цену IOST (среднюю между best bid/ask на бирже
+    продажи), вычищает точки старше 24 часов, возвращает честное описание
+    тренда: было — сейчас — % изменения. НЕ предсказывает, куда пойдёт
+    цена дальше — только показывает, что происходило до сих пор."""
+    if not price_history:
+        return None
+    now_ts = time.time()
+    cutoff = now_ts - 86400
+    while price_history and price_history[0][0] < cutoff:
+        price_history.pop(0)
+    if len(price_history) < 2:
+        return None
+    oldest_price = price_history[0][1]
+    newest_price = price_history[-1][1]
+    change_pct = (newest_price - oldest_price) / oldest_price * 100
+    hours_span = (price_history[-1][0] - price_history[0][0]) / 3600
+    return {
+        "oldest": oldest_price, "newest": newest_price,
+        "change_pct": round(change_pct, 3), "hours_span": round(hours_span, 1),
+    }
+
 last_signal_time: Dict[str, float] = {}
 coin_volumes: Dict[str, float] = {}
 triangle_history: List[dict] = []
@@ -3803,12 +3833,29 @@ async def handle_command(session, text, chat_id):
                 if config["real_start_capital"]:
                     pnl_real = round(real["total"] - config["real_start_capital"], 2)
                     hour_avg = round(record_pnl_and_get_hour_avg(pnl_real), 2)
+                    # НОВОЕ 15.08: записываем текущую рыночную цену монеты
+                    # (не P&L) — честный тренд за 24ч, не предсказание.
+                    trend_line = ""
+                    if SYMBOLS:
+                        price_now = await get_valuation_price(session, "MEXC", SYMBOLS[0])
+                        if price_now:
+                            price_history.append((time.time(), price_now))
+                            trend = record_price_and_get_trend()
+                            if trend:
+                                icon = "📈" if trend["change_pct"] > 0 else "📉" if trend["change_pct"] < 0 else "➡️"
+                                trend_line = (
+                                    f"   {icon} Цена {SYMBOLS[0]} за последние {trend['hours_span']}ч: "
+                                    f"`{trend['oldest']}` → `{trend['newest']}` "
+                                    f"({trend['change_pct']:+.2f}%) — это ОПИСАНИЕ прошлого, "
+                                    f"не прогноз на будущее\n"
+                                )
                     balance_block = (
                         f"💵 Реальный баланс: ${real['total']} ({per_ex})\n"
                         f"   Старт (зафиксирован): ${config['real_start_capital']} | "
                         f"P&L: {pnl_real:+.2f} (включает переоценку резерва по рынку)\n"
                         f"   📉 Среднее P&L за последний час: {hour_avg:+.2f} "
                         f"(спокойнее, чем моментальное число — меньше рыночного шума)\n"
+                        f"{trend_line}"
                         f"{realized_line}"
                     )
                 else:
