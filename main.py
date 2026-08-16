@@ -3308,8 +3308,19 @@ async def execute_trade(session, opp: dict) -> dict:
             # невозможно понять, торговля ли в минусе или просто цена
             # резерва просела. Теперь считаем РЕАЛИЗОВАННУЮ прибыль отдельно,
             # независимо от рыночной переоценки резерва.
+            # НОВОЕ 16.08: раньше rebalance_cost_est учитывал ТОЛЬКО торговые
+            # комиссии (buy_fee+sell_fee) — но реальная стоимость ПОСЛЕДУЮЩЕГО
+            # ребаланса (докупки резерва) складывается из комиссии ПЛЮС
+            # пересечения bid-ask спреда биржи, которое РАСТЁТ при волатильности
+            # (найдено 16.08: во время быстрого ралли RVN разрыв между
+            # заявленной и реальной прибылью составил ~\$1.47 за сессию —
+            # карточка попросту не учитывала расширение спреда при волатильном
+            # рынке). Теперь явно добавляем настраиваемую оценку пересечения
+            # спреда (/setcrossingcost) поверх комиссий.
+            spread_crossing_est = opp["vol"] * config.get("empirical_spread_crossing_pct", 0.34) / 100
             rebalance_cost_est = round(opp["vol"] * (FEES.get(opp["buy_ex"], 0.1) +
-                                                       FEES.get(opp["sell_ex"], 0.1)) / 100, 4)
+                                                       FEES.get(opp["sell_ex"], 0.1)) / 100
+                                        + spread_crossing_est, 4)
             honest_cycle_profit = round(opp["profit_usdt"] - rebalance_cost_est, 4)
             stats["realized_trading_pnl"] = round(stats.get("realized_trading_pnl", 0.0) + honest_cycle_profit, 4)
             stats["realized_trades_count"] = stats.get("realized_trades_count", 0) + 1
@@ -3578,8 +3589,13 @@ def format_signal(opp: dict) -> str:
         # 0.1778% ребаланс "съедал" почти половину показанной прибыли —
         # не убыток, но карточка вводила в заблуждение, выглядя вдвое
         # прибыльнее, чем цикл сделка+ребаланс даёт по факту.
+        # НОВОЕ 16.08: та же поправка, что и в execute_trade — добавляем
+        # оценку пересечения спреда (настраивается /setcrossingcost),
+        # не только комиссии.
+        spread_crossing_est = opp["vol"] * config.get("empirical_spread_crossing_pct", 0.34) / 100
         rebalance_cost = round(opp["vol"] * (FEES.get(opp["buy_ex"], 0.1) +
-                                              FEES.get(opp["sell_ex"], 0.1)) / 100, 4)
+                                              FEES.get(opp["sell_ex"], 0.1)) / 100
+                                + spread_crossing_est, 4)
         honest_profit = round(opp["profit_usdt"] - rebalance_cost, 4)
         profit_line = (
             f"💰 Прибыль сделки (до исполнения): `{opp['profit_usdt']} USDT`\n"
@@ -4291,6 +4307,32 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Потолок правдоподобного спреда: {val}%")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setmaxspread 5`")
+
+    elif cmd == "/setcrossingcost":
+        if len(parts) < 2:
+            cur = config.get("empirical_spread_crossing_pct", 0.34)
+            await send_tg(session,
+                f"Текущая оценка стоимости пересечения спреда при докупках: {cur}%\n\n"
+                f"Используется для: (1) честного порога прибыльности сделки, "
+                f"(2) оценки \"стоимости ребаланса\" в карточке каждой сделки.\n\n"
+                f"⚠️ НАЙДЕНО 16.08: эта оценка была откалибрована на СПОКОЙНОМ рынке. "
+                f"Во время сильной волатильности (движение цены на несколько % в час) "
+                f"биржи расширяют bid-ask спред, и реальная стоимость докупки может "
+                f"быть в разы выше — карточка сделки в такие моменты завышает "
+                f"показанную прибыль.\n\n"
+                f"Пример: `/setcrossingcost 1.5` (повысить во время волатильности)"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0 or val > 20:
+                await send_tg(session, "❌ Разумный диапазон: 0-20%.")
+                return
+            config["empirical_spread_crossing_pct"] = val
+            await send_tg(session, f"✅ Оценка стоимости пересечения спреда: {val}%\n"
+                                    f"Честный порог и карточки сделок теперь пересчитываются с этим значением.")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setcrossingcost 1.5`")
 
     elif cmd == "/setreallot":
         # ИСПРАВЛЕНИЕ 08.08: раньше минимум лота считался от ВСЕХ бирж в
