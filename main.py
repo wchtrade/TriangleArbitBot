@@ -4456,6 +4456,12 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Нельзя удалить последнюю монету из списка.")
             return
         SYMBOLS.remove(sym)
+        # НОВОЕ 16.08 (найдено при формальном аудите): очищаем историю цены —
+        # иначе после смены монеты индикатор тренда сравнивает цену НОВОЙ
+        # монеты со старой точкой от УДАЛЁННОЙ (как случилось при IOST->STORJ:
+        # "+7646%" — абсурд, старая цена IOST осталась в истории и
+        # сравнивалась с ценой STORJ).
+        price_history.clear()
         stop_binance_ws_book(sym)
         stop_kucoin_ws_book(sym)
         stop_htx_ws_book(sym)
