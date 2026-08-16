@@ -3279,6 +3279,15 @@ async def execute_trade(session, opp: dict) -> dict:
 
     real_result = None
     if not config["simulation_mode"] and is_real_trading_allowed():
+        # НОВОЕ 16.08: по прямому запросу пользователя — вместо ТОЛЬКО оценки
+        # (комиссии + предполагаемая стоимость спреда), берём РЕАЛЬНЫЙ баланс
+        # ДО сделки, даём ей полностью исполниться (включая любые вызванные
+        # ею докупки/ребалансы), и берём РЕАЛЬНЫЙ баланс ПОСЛЕ — разница между
+        # ними это ФАКТИЧЕСКИЙ результат, без каких-либо предположений о
+        # комиссиях или спреде. Не заменяет оценку в карточке (та приходит
+        # мгновенно, до знания об исполнении) — дополняет её вторым,
+        # безусловно точным числом чуть позже.
+        capital_before = await get_total_real_capital(session)
         real_result = await execute_real_arbitrage(session, opp)
         # НОВОЕ 10.08 (раунд 2): раньше диагностика шла только в Railway-логи
         # (logger.info) — тишина в Telegram при этом сохранялась, а до
@@ -3324,6 +3333,29 @@ async def execute_trade(session, opp: dict) -> dict:
             honest_cycle_profit = round(opp["profit_usdt"] - rebalance_cost_est, 4)
             stats["realized_trading_pnl"] = round(stats.get("realized_trading_pnl", 0.0) + honest_cycle_profit, 4)
             stats["realized_trades_count"] = stats.get("realized_trades_count", 0) + 1
+
+            # НОВОЕ 16.08: ФАКТИЧЕСКИЙ результат — не оценка. Сравниваем
+            # реальный баланс до и после (включая любые докупки, случившиеся
+            # ВНУТРИ execute_real_arbitrage — они уже произошли к этому моменту).
+            # Небольшая задержка перед снимком "после" — даём биржам полностью
+            # отразить исполнение на балансе (та же логика, что и в других
+            # местах кода после докупок).
+            if capital_before is not None:
+                await asyncio.sleep(1.0)
+                capital_after = await get_total_real_capital(session)
+                if capital_after is not None:
+                    factual_delta = round(capital_after["total"] - capital_before["total"], 4)
+                    stats["factual_realized_pnl"] = round(stats.get("factual_realized_pnl", 0.0) + factual_delta, 4)
+                    stats["factual_trades_count"] = stats.get("factual_trades_count", 0) + 1
+                    if CHAT_ID:
+                        diff_from_estimate = round(factual_delta - honest_cycle_profit, 4)
+                        await send_tg(session,
+                            f"📐 *ФАКТИЧЕСКИЙ результат цикла* (реальный баланс до/после, "
+                            f"не оценка):\n"
+                            f"   До: ${capital_before['total']} → После: ${capital_after['total']}\n"
+                            f"   Фактически: `{factual_delta:+.4f} USDT`\n"
+                            f"   (оценка в карточке была: `{honest_cycle_profit:+.4f}` — "
+                            f"разница `{diff_from_estimate:+.4f}`)")
         if not real_result.get("success"):
             logger.error(f"РЕАЛЬНАЯ сделка не удалась: {real_result}")
             error = real_result.get("error", "")
@@ -3838,12 +3870,24 @@ async def handle_command(session, text, chat_id):
                 realized_pnl = stats.get("realized_trading_pnl", 0.0)
                 realized_n = stats.get("realized_trades_count", 0)
                 drift_cost = stats.get("price_drift_cost_usdt", 0.0)
+                # НОВОЕ 16.08: ФАКТИЧЕСКИЙ результат (реальный баланс до/после
+                # каждой сделки) — не оценка, единственное безусловно точное
+                # число. Показываем рядом с оценочным для сравнения.
+                factual_pnl = stats.get("factual_realized_pnl", 0.0)
+                factual_n = stats.get("factual_trades_count", 0)
+                factual_line = ""
+                if factual_n > 0:
+                    factual_line = (
+                        f"📐 Фактический результат (реальный баланс до/после, "
+                        f"не оценка): {factual_pnl:+.4f} USDT за {factual_n} сделок\n"
+                    )
                 realized_line = (
                     f"📊 Реализованная торговая прибыль (без учёта переоценки резерва, "
                     f"НО с учётом реальной стоимости докупки): "
                     f"{realized_pnl:+.4f} USDT за {realized_n} сделок\n"
                     f"💧 Из них реальная стоимость сдвига курса при докупках: "
                     f"{'+' if drift_cost < 0 else '-'}{abs(drift_cost):.4f} USDT\n"
+                    f"{factual_line}"
                     f"{misc_line}"
                 )
                 if config["real_start_capital"]:
