@@ -108,6 +108,18 @@ config = {
         # но ограничивает МАКСИМАЛЬНУЮ глубину, прежде чем человек об этом
         # узнает и сможет решить, что делать. 0 — выключить полностью.
         # Настраивается через /setmaxdrawdown.
+    "max_volatility_pct_15min": 3.0,  # НОВОЕ 16.08: по прямому запросу
+        # пользователя после дня с диким ралли RVN (+9%/час) и ДВУМЯ
+        # подряд фактически убыточными сделками, несмотря на красивый
+        # спред на бумаге — оказалось, что при сильной волатильности
+        # реальное исполнение расходится с расчётным спредом (цена уходит,
+        # пока обе ноги сделки исполняются). Если цена монеты движется
+        # больше этого % за последние 15 минут — бот САМ ставится на
+        # паузу до тех пор, пока волатильность не спадёт обратно. Не
+        # возобновляет торговлю автоматически (только предупреждает и
+        # ставит на паузу/снимает предупреждение) — решение возобновить
+        # остаётся за человеком. 0 — выключить. Настраивается через
+        # /setmaxvolatility.
     "real_trades_today":    0,
     "real_start_capital":   None,  # фиксируется командой /setrealstart, для честного P&L в реальном режиме
     "max_real_trades_per_day": 200,  # поднято с 20 - для круглосуточной работы; /setmaxtrades меняет
@@ -4306,6 +4318,35 @@ async def handle_command(session, text, chat_id):
         except ValueError:
             await send_tg(session, "❌ Пример: `/setmaxdrawdown 5`")
 
+    elif cmd == "/setmaxvolatility":
+        if len(parts) < 2:
+            cur = config.get("max_volatility_pct_15min", 0)
+            await send_tg(session,
+                f"Текущий порог волатильности: {cur}% за 15 минут (0 = выключено)\n\n"
+                f"Если цена монеты сдвинется больше этого % за последние 15 минут — "
+                f"бот САМ ставится на паузу. При сильной волатильности расчётный "
+                f"спред перестаёт отражать реальность (цена уходит, пока обе ноги "
+                f"сделки исполняются) — именно так 16.08 карточка дважды подряд "
+                f"обещала плюс, а по факту вышел минус.\n\n"
+                f"Не возобновляет торговлю сам — только предупреждает, когда "
+                f"волатильность спадает, решение о `/go` остаётся за вами.\n\n"
+                f"Пример: `/setmaxvolatility 3` (пауза при движении >3% за 15 мин)"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0:
+                await send_tg(session, "❌ Не может быть отрицательным.")
+                return
+            config["max_volatility_pct_15min"] = val
+            if val == 0:
+                await send_tg(session, "✅ Предохранитель волатильности выключен.")
+            else:
+                await send_tg(session, f"✅ Предохранитель волатильности: пауза при движении "
+                                        f"цены больше {val}% за 15 минут.")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setmaxvolatility 3`")
+
     elif cmd == "/setminvolume":
         # НОВОЕ 06.08: раньше этот порог (по умолчанию $100,000 24h-объёма
         # на Binance) можно было изменить только через деплой. Обнаружено,
@@ -5290,6 +5331,81 @@ async def drawdown_guard_loop(session):
         await asyncio.sleep(300)
 
 
+def get_recent_price_volatility_pct(minutes: int = 15) -> Optional[float]:
+    """НОВОЕ 16.08: считает МАКСИМАЛЬНОЕ движение цены (в любую сторону)
+    за последние N минут из уже существующей price_history — та же
+    инфраструктура, что и честный индикатор тренда в /stats. Возвращает
+    None, если данных ещё недостаточно (например, только что запустились)."""
+    if len(price_history) < 2:
+        return None
+    now_ts = time.time()
+    cutoff = now_ts - minutes * 60
+    recent = [p for ts, p in price_history if ts >= cutoff]
+    if len(recent) < 2:
+        return None
+    lo, hi = min(recent), max(recent)
+    if lo <= 0:
+        return None
+    return round((hi - lo) / lo * 100, 3)
+
+
+async def volatility_guard_loop(session):
+    """НОВОЕ 16.08: по прямому запросу пользователя, после дня с диким
+    ралли RVN (+9%/час) и ДВУМЯ подряд фактически убыточными сделками,
+    несмотря на красивый спред на бумаге. Идея: при сильной волатильности
+    цена уходит, пока обе ноги сделки исполняются — расчётный спред
+    перестаёт отражать реальность. Проверяет каждые 2 минуты (чаще, чем
+    drawdown_guard — волатильность может измениться быстро); если
+    движение цены за последние 15 минут превышает порог — ставит
+    торговлю на паузу и предупреждает. НЕ возобновляет автоматически —
+    только явно сообщает, когда волатильность спадает обратно, оставляя
+    решение о `/go` за человеком."""
+    await asyncio.sleep(120)
+    already_warned = False
+    while True:
+        try:
+            pct_threshold = config.get("max_volatility_pct_15min", 0)
+            if pct_threshold > 0 and not config["simulation_mode"]:
+                # НОВОЕ 16.08: записываем цену САМИ, не полагаясь на то,
+                # что пользователь вызовет /stats — иначе предохранитель
+                # был бы слеп, пока никто не смотрит в чат.
+                if SYMBOLS:
+                    price_now = await get_valuation_price(session, "MEXC", SYMBOLS[0])
+                    if price_now:
+                        price_history.append((time.time(), price_now))
+                vol = get_recent_price_volatility_pct(15)
+                if vol is not None:
+                    if vol > pct_threshold:
+                        if not already_warned:
+                            was_already_paused = config["paused"]
+                            config["paused"] = True
+                            already_warned = True
+                            if CHAT_ID:
+                                await send_tg(session,
+                                    f"🌪 *ПРЕДОХРАНИТЕЛЬ ВОЛАТИЛЬНОСТИ СРАБОТАЛ — "
+                                    f"торговля поставлена на паузу*\n\n"
+                                    f"Цена монеты сдвинулась на {vol}% за последние 15 минут "
+                                    f"(порог: {pct_threshold}%).\n\n"
+                                    f"При такой скорости движения расчётный спред может не "
+                                    f"отражать то, что реально достанется при исполнении — "
+                                    f"именно это уже дважды подряд случилось 16.08 (карточка "
+                                    f"обещала плюс, по факту вышел минус).\n\n"
+                                    f"Бот сам напишет, когда волатильность спадёт. `/go` "
+                                    f"возобновит вручную, если решите не ждать.\n\n"
+                                    f"Настройка порога: `/setmaxvolatility` (сейчас {pct_threshold}%)")
+                    else:
+                        if already_warned and CHAT_ID:
+                            await send_tg(session,
+                                f"✅ *Волатильность успокоилась*: {vol}% за 15 минут "
+                                f"(было выше {pct_threshold}%).\n\n"
+                                f"Можно рассмотреть `/go`, если готовы возобновить торговлю — "
+                                f"решение за вами, автоматически бот не возобновляет.")
+                        already_warned = False
+        except Exception as e:
+            logger.error(f"Volatility guard loop error: {e}")
+        await asyncio.sleep(120)
+
+
 async def scan_loop(session):
     await asyncio.sleep(15)
     while True:
@@ -5392,7 +5508,7 @@ async def main():
         logger.info(f"WS-стаканы запущены на Binance/KuCoin/HTX для {SYMBOLS}")
         await asyncio.gather(polling_loop(session), scan_loop(session),
                               periodic_rebalance_loop(session), profit_lock_loop(session),
-                              drawdown_guard_loop(session))
+                              drawdown_guard_loop(session), volatility_guard_loop(session))
 
 
 if __name__ == "__main__":
