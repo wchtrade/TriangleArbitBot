@@ -25,11 +25,13 @@ CHAT_ID = None
 config = {
     "simulation_mode":    True,
     "min_profit_pct":     0.3,
-    "empirical_spread_crossing_pct": 0.34,  # НОВОЕ 10.08: измерено по факту
-        # исполнения (см. /stats 10.08) — стоимость пересечения bid/ask
-        # спреда Binance при докупке резерва. Используется в динамическом
-        # пороге compute_dynamic_min_profit_pct(). Настраивается вручную
-        # по мере накопления новой статистики.
+    "empirical_spread_crossing_pct": 3.34,  # ОБНОВЛЕНО 17.08: старое значение
+        # 0.34% было измерено 10.08 на КОНКРЕТНОЙ ситуации (Binance) и давно
+        # устарело. Вечером 16.08 два свежих факт-замера на СПОКОЙНОМ рынке
+        # RVN дали средний разрыв 1.84% сверх уже применённых 1.5% — то есть
+        # реальная стоимость ближе к 3.34%. Теперь дополнительно есть
+        # АВТОКАЛИБРОВКА (см. execute_trade) — это значение будет само
+        # подстраиваться по ходу дела, это лишь безопасная стартовая точка.
     "threshold_safety_margin_pct": 0.05,  # запас сверху динамического порога
     "trade_usdt":         20.0,
     "scan_interval":      3,  # СНИЖЕНО (было 10): цена и так живая через
@@ -3359,8 +3361,50 @@ async def execute_trade(session, opp: dict) -> dict:
                     factual_delta = round(capital_after["total"] - capital_before["total"], 4)
                     stats["factual_realized_pnl"] = round(stats.get("factual_realized_pnl", 0.0) + factual_delta, 4)
                     stats["factual_trades_count"] = stats.get("factual_trades_count", 0) + 1
+                    diff_from_estimate = round(factual_delta - honest_cycle_profit, 4)
+
+                    # НОВОЕ 17.08: САМОКАЛИБРОВКА — по прямому запросу пользователя
+                    # после вечера, когда даже "спокойный" рынок (движение цены <1%)
+                    # дал 2 сделки подряд с реальным минусом при оценке crossingcost=1.5%.
+                    # Вместо ручного гадания — копим ПОСЛЕДНИЕ N расхождений между
+                    # оценкой и фактом и СРЕДНЕЕ добавляем к текущему crossingcost.
+                    # Пересчитывается каждые CALIBRATION_WINDOW сделок, не на каждой —
+                    # чтобы не дёргаться от одного шумного результата.
+                    gap_history = stats.setdefault("crossing_gap_history_pct", [])
+                    gap_pct = diff_from_estimate / opp["vol"] * 100 if opp["vol"] else 0
+                    gap_history.append(gap_pct)
+                    CALIBRATION_WINDOW = 3
+                    if len(gap_history) >= CALIBRATION_WINDOW:
+                        avg_gap = sum(gap_history[-CALIBRATION_WINDOW:]) / CALIBRATION_WINDOW
+                        if avg_gap < 0:  # систематически хуже оценки — поднимаем crossingcost
+                            old_cc = config.get("empirical_spread_crossing_pct", 0.34)
+                            new_cc = round(old_cc + abs(avg_gap), 2)
+                            config["empirical_spread_crossing_pct"] = new_cc
+                            if CHAT_ID:
+                                await send_tg(session,
+                                    f"🎛 *Автокалибровка*: последние {CALIBRATION_WINDOW} сделки в среднем "
+                                    f"на {avg_gap:.2f}% хуже оценки — crossingcost поднят с "
+                                    f"{old_cc}% до {new_cc}%. Честный порог автоматически станет строже.")
+                            gap_history.clear()
+
+                    # НОВОЕ 17.08: автопауза, если ДАЖЕ ПОСЛЕ калибровки продолжаем
+                    # терять — значит проблема не в оценке, а в чём-то более глубоком,
+                    # человеку нужно разобраться, а не продолжать пытаться вслепую.
+                    consecutive_losses = stats.get("consecutive_factual_losses", 0)
+                    if factual_delta < 0:
+                        consecutive_losses += 1
+                    else:
+                        consecutive_losses = 0
+                    stats["consecutive_factual_losses"] = consecutive_losses
+                    if consecutive_losses >= 5:
+                        config["paused"] = True
+                        if CHAT_ID:
+                            await send_tg(session,
+                                f"🛑 *5 сделок подряд в реальном минусе* (даже после "
+                                f"автокалибровки) — торговля остановлена. Это не шум, "
+                                f"нужен ручной разбор, прежде чем продолжать `/go`.")
+
                     if CHAT_ID:
-                        diff_from_estimate = round(factual_delta - honest_cycle_profit, 4)
                         await send_tg(session,
                             f"📐 *ФАКТИЧЕСКИЙ результат цикла* (реальный баланс до/после, "
                             f"не оценка):\n"
