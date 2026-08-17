@@ -126,6 +126,18 @@ config = {
     "real_start_capital":   None,  # фиксируется командой /setrealstart, для честного P&L в реальном режиме
     "max_real_trades_per_day": 200,  # поднято с 20 - для круглосуточной работы; /setmaxtrades меняет
 
+    # ===== НОВОЕ 17.08 (по итогам анализа логов реальных сделок ONE) =====
+    # Прямое измерение по логам показало: между обнаружением сигнала и
+    # стартом реального исполнения проходило 5-9 секунд — почти всё это
+    # время уходило на СИНХРОННУЮ докупку резерва ВНУТРИ execute_real_
+    # arbitrage (на критическом пути самой сделки). На волатильной монете
+    # за эти секунды цена успевает уйти, съедая спред, который был на
+    # сигнале. reserve_watchdog_loop (см. ниже) докупает резерв ЗАРАНЕЕ,
+    # в фоне, чтобы preflight-проверка в момент сделки в большинстве
+    # случаев проходила мгновенно, без докупки на критическом пути.
+    "reserve_watchdog_interval_sec": 90,   # как часто проверять резерв заранее
+    "reserve_watchdog_trigger_frac": 0.6,  # докупать, если резерв ниже этой доли от цели
+
     # ===== ЭТАП 4: ТРЕУГОЛЬНЫЙ АРБИТРАЖ =====
     "triangular_enabled": True,
 
@@ -4409,6 +4421,54 @@ async def handle_command(session, text, chat_id):
         except ValueError:
             await send_tg(session, "❌ Пример: `/setmaxvolatility 3`")
 
+    elif cmd == "/setwatchdoginterval":
+        # НОВОЕ 17.08: как часто reserve_watchdog_loop заранее проверяет и
+        # докупает резерв, ДО того как он понадобится для сделки — чтобы
+        # избежать 5-9 сек задержки на докупку в момент самой сделки
+        # (найдено по логам реальных сделок ONE 17.08).
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущий интервал проверки резерва заранее: "
+                f"{config.get('reserve_watchdog_interval_sec', 90)} сек\n\n"
+                f"Раз в этот интервал бот проверяет резерв монеты на бирже "
+                f"продажи и докупает его ЗАРАНЕЕ, если он опускается ниже "
+                f"порога (см. `/setwatchdogtrigger`) — чтобы в момент самой "
+                f"сделки НЕ пришлось докупать синхронно (это и создавало "
+                f"задержку 5-9 сек, найденную в логах 17.08).\n\n"
+                f"Пример: `/setwatchdoginterval 60`"
+            )
+            return
+        try:
+            val = int(parts[1])
+            if val < 10:
+                await send_tg(session, "❌ Не меньше 10 сек — иначе слишком часто дёргаем API бирж.")
+                return
+            config["reserve_watchdog_interval_sec"] = val
+            await send_tg(session, f"✅ Интервал проверки резерва заранее: {val} сек")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setwatchdoginterval 60`")
+
+    elif cmd == "/setwatchdogtrigger":
+        if len(parts) < 2:
+            cur = config.get("reserve_watchdog_trigger_frac", 0.6)
+            await send_tg(session,
+                f"Текущий порог срабатывания: {cur*100:.0f}% от целевого резерва\n\n"
+                f"Если резерв монеты на бирже продажи опускается ниже этой доли "
+                f"от цели (`max_real_order_usdt × sell_reserve_lots`) — бот "
+                f"докупает его ЗАРАНЕЕ, в фоне, не дожидаясь попытки сделки.\n\n"
+                f"Пример: `/setwatchdogtrigger 70` (докупать раньше, при 70% от цели)"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val <= 0 or val > 100:
+                await send_tg(session, "❌ Разумный диапазон: 1-100%.")
+                return
+            config["reserve_watchdog_trigger_frac"] = val / 100
+            await send_tg(session, f"✅ Порог срабатывания: {val:.0f}% от целевого резерва")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setwatchdogtrigger 70`")
+
     elif cmd == "/setminvolume":
         # НОВОЕ 06.08: раньше этот порог (по умолчанию $100,000 24h-объёма
         # на Binance) можно было изменить только через деплой. Обнаружено,
@@ -5237,6 +5297,64 @@ async def periodic_rebalance_loop(session):
         await asyncio.sleep(hours * 3600)
 
 
+async def reserve_watchdog_loop(session):
+    """НОВОЕ 17.08 (по итогам анализа логов реальных сделок ONE, прямой
+    запрос пользователя): прямое измерение по логам Railway показало
+    задержку 5-9 секунд между обнаружением сигнала (лог "Скан #N:
+    сигналов=1") и стартом реального исполнения — почти всё это время
+    уходило на СИНХРОННУЮ докупку резерва ВНУТРИ execute_real_arbitrage
+    ("Уменьшаю объём сделки...", "Точечная докупка..." в логе), то есть
+    НА КРИТИЧЕСКОМ ПУТИ самой сделки. На волатильной монете (та же ONE
+    двигалась на ~1% за минуты) за эти секунды цена успевает уйти,
+    съедая спред, который был зафиксирован на сигнале — отсюда
+    систематический факт-минус даже когда карточка обещала плюс.
+
+    Этот цикл проверяет резерв монеты на КАЖДОЙ бирже-продавце ЗАРАНЕЕ,
+    часто (по умолчанию раз в 90 сек — гораздо чаще, чем
+    periodic_rebalance_loop раз в 4 часа), и докупает его ДО того, как
+    он понадобится для сделки. Цель — чтобы preflight-проверка внутри
+    execute_real_arbitrage в подавляющем большинстве случаев видела уже
+    достаточный резерв и НЕ запускала синхронную докупку в момент сделки,
+    сокращая задержку критического пути до долей секунды.
+
+    Использует ТУ ЖЕ функцию top_up_coin_reserve, что и реактивная
+    докупка внутри сделки — просто вызывает её ЗАРАНЕЕ, а не по факту
+    нехватки в момент попытки. Дневной лимит max_topup_spend_per_day
+    общий для обоих механизмов — реактивная докупка внутри сделки
+    сработает реже, но общие траты на докупки не увеличатся бесконтрольно."""
+    await asyncio.sleep(60)
+    while True:
+        interval = config.get("reserve_watchdog_interval_sec", 90)
+        try:
+            if not config["simulation_mode"] and not config["paused"]:
+                for sym in list(SYMBOLS):
+                    for buy_ex, sell_ex in pairs_for_symbol(sym):
+                        try:
+                            balances = await get_real_balances(session, sell_ex)
+                            if balances is None:
+                                continue
+                            have = balances.get(sym, 0.0)
+                            price = await get_valuation_price(session, sell_ex, sym)
+                            if not price or price <= 0:
+                                continue
+                            headroom_mult = 1 + get_headroom_pct(sell_ex) / 100
+                            target_qty = (config["max_real_order_usdt"] * config.get("sell_reserve_lots", 3)
+                                          / price * headroom_mult)
+                            trigger_frac = config.get("reserve_watchdog_trigger_frac", 0.6)
+                            if target_qty > 0 and have < target_qty * trigger_frac:
+                                shortfall = round(target_qty - have, 4)
+                                if shortfall > 0:
+                                    logger.info(f"🛡 Reserve watchdog: {sell_ex}/{sym} резерв {have:.2f} "
+                                                 f"ниже {trigger_frac*100:.0f}% от цели {target_qty:.2f} — "
+                                                 f"докупаю ЗАРАНЕЕ, не дожидаясь попытки сделки")
+                                    await top_up_coin_reserve(session, sell_ex, sym, shortfall, price)
+                        except Exception as e:
+                            logger.error(f"Reserve watchdog {sell_ex}/{sym}: {e}")
+        except Exception as e:
+            logger.error(f"Reserve watchdog loop error: {e}")
+        await asyncio.sleep(interval)
+
+
 async def lock_in_profit_only(session, ex: str, plan: dict) -> List[dict]:
     """НОВОЕ 12.08: облегчённая версия apply_real_intra_exchange_rebalance —
     ТОЛЬКО продажа излишка (фиксация курсового плюса в USDT), НИКОГДА не
@@ -5570,7 +5688,8 @@ async def main():
         logger.info(f"WS-стаканы запущены на Binance/KuCoin/HTX для {SYMBOLS}")
         await asyncio.gather(polling_loop(session), scan_loop(session),
                               periodic_rebalance_loop(session), profit_lock_loop(session),
-                              drawdown_guard_loop(session), volatility_guard_loop(session))
+                              drawdown_guard_loop(session), volatility_guard_loop(session),
+                              reserve_watchdog_loop(session))
 
 
 if __name__ == "__main__":
