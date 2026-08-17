@@ -138,6 +138,12 @@ config = {
     "reserve_watchdog_interval_sec": 90,   # как часто проверять резерв заранее
     "reserve_watchdog_trigger_frac": 0.6,  # докупать, если резерв ниже этой доли от цели
 
+    # НОВОЕ 17.08: порог волатильности ЗА ПОСЛЕДНЮЮ МИНУТУ, проверяется
+    # прямо перед КАЖДОЙ попыткой реальной сделки (см. execute_trade) —
+    # быстрее и точнее, чем фоновый предохранитель max_volatility_pct_15min
+    # (тот проверяет раз в 2 минуты и реагирует постфактум). 0 — выключить.
+    "pre_trade_max_volatility_pct_1min": 0.5,
+
     # ===== ЭТАП 4: ТРЕУГОЛЬНЫЙ АРБИТРАЖ =====
     "triangular_enabled": True,
 
@@ -1387,6 +1393,15 @@ async def scan_all(session) -> Tuple[List[dict], List[str]]:
             sob = ex_map.get(sell_ex, {}).get(sym)
             if not bob or not sob:
                 continue
+            # НОВОЕ 17.08: пишем цену на КАЖДОМ скане (не только когда
+            # пользователь вызывает /stats или раз в 120 сек в volatility_
+            # guard_loop) — нужна ПЛОТНАЯ история, чтобы честно проверять
+            # мгновенную волатильность за последнюю минуту ПЕРЕД каждой
+            # конкретной попыткой сделки (см. execute_trade), а не только
+            # за 15 минут фоновым предохранителем, который реагирует
+            # только постфактум.
+            if sob.get("bids"):
+                price_history.append((time.time(), sob["bids"][0][0]))
             opp = calc_arb_real(sym, buy_ex, bob, sell_ex, sob, scan_lot)
             if opp:
                 signals.append(opp)
@@ -3317,6 +3332,23 @@ async def execute_trade(session, opp: dict) -> dict:
     if not can_trade():
         return {"executed": False, "reason": "paused_or_stoploss"}
 
+    # НОВОЕ 17.08 (по итогам дня — 3 из 3 реальных сделок на ONE в факт-
+    # минус, несмотря на то, что скорость исполнения и порог входа уже
+    # чинили по отдельности): проверяем волатильность ЗА ПОСЛЕДНЮЮ МИНУТУ
+    # прямо перед КАЖДОЙ попыткой реальной сделки — не только фоновым
+    # предохранителем раз в 15 минут (тот реагирует постфактум, слишком
+    # медленно для секундных движений). Если цена уже дёргалась за
+    # последние 60 сек больше порога — очень вероятно, что она продолжит
+    # двигаться, пока бот исполняет обе ноги, и спред на карточке уже не
+    # будет соответствовать реальности к моменту сделки.
+    if not config["simulation_mode"]:
+        pre_trade_vol = get_recent_price_volatility_pct(1)
+        pre_trade_threshold = config.get("pre_trade_max_volatility_pct_1min", 0.5)
+        if pre_trade_vol is not None and pre_trade_threshold > 0 and pre_trade_vol > pre_trade_threshold:
+            logger.info(f"⏭ Пропуск попытки: волатильность за 1 мин {pre_trade_vol}% "
+                         f"выше порога {pre_trade_threshold}% — цена слишком дёргается прямо сейчас")
+            return {"executed": False, "reason": "pre_trade_volatility_too_high"}
+
     real_result = None
     if not config["simulation_mode"] and is_real_trading_allowed():
         # НОВОЕ 16.08: по прямому запросу пользователя — вместо ТОЛЬКО оценки
@@ -3557,6 +3589,7 @@ REASON_LABELS = {
     "paused_or_stoploss":      "⏸ пауза или сработал стоп-лосс",
     "insufficient_sim_balance": "💰 не хватает баланса, авто-ребаланс не смог покрыть (см. сообщение выше)",
     "insufficient_sim_balance_cross_exchange": "🔴 нужен ручной перевод между биржами — торговля на паузе",
+    "pre_trade_volatility_too_high": "🌪 цена дёргается прямо сейчас (за последнюю минуту) — пропущено на всякий случай",
     None: "",
 }
 
@@ -4468,6 +4501,42 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Порог срабатывания: {val:.0f}% от целевого резерва")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setwatchdogtrigger 70`")
+
+    elif cmd == "/setpretradevolatility":
+        # НОВОЕ 17.08: порог мгновенной волатильности (за 1 минуту),
+        # проверяется прямо перед КАЖДОЙ попыткой реальной сделки — не
+        # только фоновым 15-минутным предохранителем. Найдено по факту:
+        # 3 из 3 сделок на ONE 17.08 ушли в реальный минус именно из-за
+        # того, что цена продолжала двигаться в момент исполнения.
+        if len(parts) < 2:
+            cur = config.get("pre_trade_max_volatility_pct_1min", 0.5)
+            await send_tg(session,
+                f"Текущий порог мгновенной волатильности: {cur}% за 1 минуту "
+                f"(0 = выключено)\n\n"
+                f"Проверяется прямо ПЕРЕД каждой попыткой реальной сделки — если "
+                f"цена уже дёргалась за последнюю минуту больше этого % — "
+                f"попытка пропускается (в /stats и логах это видно как "
+                f"pre_trade_volatility_too_high).\n\n"
+                f"Это БЫСТРЕЕ, чем `/setmaxvolatility` (тот проверяет раз в "
+                f"2 минуты и ставит на паузу ВСЮ торговлю за 15-минутное "
+                f"окно) — этот же порог просто пропускает ОДНУ конкретную "
+                f"попытку, не останавливая бота целиком.\n\n"
+                f"Пример: `/setpretradevolatility 0.5`"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0:
+                await send_tg(session, "❌ Не может быть отрицательным.")
+                return
+            config["pre_trade_max_volatility_pct_1min"] = val
+            if val == 0:
+                await send_tg(session, "✅ Проверка мгновенной волатильности выключена.")
+            else:
+                await send_tg(session, f"✅ Порог мгновенной волатильности: {val}% за 1 минуту "
+                                        f"(проверяется перед каждой попыткой сделки)")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setpretradevolatility 0.5`")
 
     elif cmd == "/setminvolume":
         # НОВОЕ 06.08: раньше этот порог (по умолчанию $100,000 24h-объёма
