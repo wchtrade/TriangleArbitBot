@@ -271,6 +271,15 @@ stats = {
     "hourly_profit":  defaultdict(float),
     "topup_attempts": 0,   # НОВОЕ: сколько раз сработала точечная автодокупка
     "topup_success":  0,
+    # ===== НОВОЕ (патч по итогам аудита 17.08): видимость неудачных ног сделки =====
+    # Раньше stats["trades"] рос ТОЛЬКО при success=True — падения второй ноги
+    # (продажа) и аварийные закрытия были полностью невидимы в /stats, из-за
+    # чего "0 сделок исполнено" маскировало реальную, убыточную активность на
+    # бирже (подтверждено выпиской KuCoin и скриншотами истории ордеров 17.08).
+    "buy_leg_failures": 0,             # первая нога (покупка) не прошла
+    "sell_leg_failures": 0,            # вторая нога (продажа) не прошла
+    "emergency_closes_attempted": 0,   # сколько раз пришлось аварийно закрывать позицию
+    "emergency_closes_succeeded": 0,   # из них — сколько реально закрылось
 }
 trade_history: List[dict] = []
 # НОВОЕ 11.08: история P&L во времени — для скользящего среднего за час в
@@ -2380,6 +2389,7 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
             buy_result = await place_order_htx(session, _htx_account_id_cache, symbol, "buy-market", vol)
 
     if not buy_result:
+        stats["buy_leg_failures"] += 1  # НОВОЕ (патч 17.08): видимость в /stats
         return {"success": False,
                 "error": f"buy_leg_failed_on_{buy_ex}: {_last_exchange_error.get(buy_ex) or 'нет деталей от биржи'}"}
 
@@ -2441,11 +2451,13 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
             sell_result = await place_order_htx(session, _htx_account_id_cache, symbol, "sell-market", sell_qty)
 
     if not sell_result:
+        stats["sell_leg_failures"] += 1  # НОВОЕ (патч 17.08): видимость в /stats
         # АВАРИЙНОЕ ЗАКРЫТИЕ: продаём купленное обратно на бирже покупки,
         # чтобы не остаться с открытой направленной позицией. Округляем
         # под правила ИМЕННО buy_ex (это другая биржа с другим шагом лота).
         emergency_qty = await round_quantity_for_exchange(session, buy_ex, symbol, confirmed_qty)
         emergency = None
+        stats["emergency_closes_attempted"] += 1  # НОВОЕ (патч 17.08)
         if emergency_qty > 0:
             if buy_ex == "Binance":
                 emergency = await place_order_binance(session, symbol, "SELL", emergency_qty)
@@ -2456,6 +2468,8 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
             elif buy_ex == "HTX":
                 if _htx_account_id_cache:
                     emergency = await place_order_htx(session, _htx_account_id_cache, symbol, "sell-market", emergency_qty)
+        if emergency:
+            stats["emergency_closes_succeeded"] += 1  # НОВОЕ (патч 17.08)
         return {
             "success": False,
             "error": f"sell_leg_failed_on_{sell_ex}: {_last_exchange_error.get(sell_ex) or 'нет деталей от биржи'}",
@@ -4001,6 +4015,10 @@ async def handle_command(session, text, chat_id):
                 f"{stats.get('thin_book_rejected', 0)}\n"
                 f"🚫 Отклонено из-за низкого 24h-объёма (<${config['min_volume_usdt']:,.0f}): "
                 f"{stats.get('volume_too_low_rejected', 0)}\n\n"
+                f"⚠️ Неудачных первых ног (buy): {stats.get('buy_leg_failures', 0)}\n"
+                f"⚠️ Неудачных вторых ног (sell): {stats.get('sell_leg_failures', 0)}\n"
+                f"🚨 Аварийных закрытий: {stats.get('emergency_closes_succeeded', 0)}/"
+                f"{stats.get('emergency_closes_attempted', 0)} (успех/попытка)\n\n"
                 f"{balance_block}\n"
                 f"⚙️ Реальный лимит ордера: ${config['max_real_order_usdt']} | "
                 f"Порог: {config['min_profit_pct']}% (ручной) / "
