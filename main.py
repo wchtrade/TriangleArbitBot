@@ -2326,7 +2326,17 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     # ("trade account balance is not enough"). Теперь: если свободных USDT
     # чуть меньше vol — сделка автоматически уменьшается до того, что
     # реально есть (не ниже биржевого минимума), вместо полного отказа.
-    buy_balances = await get_real_balances(session, buy_ex)
+    # НОВОЕ 18.08 (по итогам разбора реальной эрозии на каждой сделке —
+    # прямой запрос пользователя "как это исправить"): раньше проверка
+    # баланса buy_ex и sell_ex шла ПОСЛЕДОВАТЕЛЬНО — два отдельных
+    # сетевых запроса подряд, каждый по 200-500мс. На волатильном рынке
+    # это заметная доля времени между сигналом и реальной покупкой, за
+    # которую цена успевает уйти. Запускаем оба запроса ОДНОВРЕМЕННО —
+    # экономим один полный сетевой круг на каждой попытке сделки.
+    buy_balances, sell_balances = await asyncio.gather(
+        get_real_balances(session, buy_ex),
+        get_real_balances(session, sell_ex),
+    )
     if buy_balances is None:
         return {"success": False, "error": f"could_not_verify_buy_balance_on_{buy_ex}"}
     available_usdt_on_buy_ex = buy_balances.get("USDT", 0.0)
@@ -2380,7 +2390,7 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     # купленное на buy_ex физически не переносится на sell_ex. Раньше бот
     # покупал вслепую, не проверив, хватит ли монеты на sell_ex для продажи —
     # отсюда застревания. Теперь проверяем РЕАЛЬНЫЙ баланс sell_ex ДО покупки.
-    sell_balances = await get_real_balances(session, sell_ex)
+    # (получен уже ВЫШЕ, параллельно с buy_balances — второй запрос не нужен)
     if sell_balances is None:
         return {"success": False, "error": f"could_not_verify_sell_balance_on_{sell_ex}"}
     # ИСПРАВЛЕНИЕ 04.08 (раунд 3, КОРНЕВАЯ ПРИЧИНА): раньше здесь бралась
