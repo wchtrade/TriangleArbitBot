@@ -344,6 +344,13 @@ config["min_execution_erosion_estimate_pct"] = 2.7  # стартовая оце�
     # взято среднее). Используется, пока не накопится хотя бы 3 реальных
     # измерения — дальше расчёт идёт по факту, эта константа больше не нужна.
 
+# НОВОЕ 18.08: использовать ли KuCoin HF (High-Frequency) аккаунт вместо
+# обычного trade — ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО. Реальное поведение бота не
+# меняется, пока пользователь явно не проверит /testhfbalance (баланс
+# читается верно) и не включит /setusehf on. Без этого — весь новый HF-код
+# существует в файле, но НИКОГДА не вызывается в реальной торговле.
+config["use_kucoin_hf"] = False
+
 
 def record_execution_erosion(net_pct_at_signal: float, factual_delta: float, vol: float) -> None:
     """Вызывать после КАЖДОЙ реальной сделки с известным factual_delta.
@@ -2685,6 +2692,108 @@ async def get_real_balances_kucoin(session) -> Optional[Dict[str, float]]:
         return None
 
 
+# ═══════════════════════════════════════════════════════════════
+# НОВОЕ 18.08 (по прямому запросу пользователя — попытка ускорить ногу
+# покупки на KuCoin через HF (High-Frequency) аккаунт, официально
+# заявленный биржей как более быстрый путь исполнения при той же схеме
+# аутентификации). ВАЖНО: формат запроса баланса НЕ подтверждён
+# документацией со 100% уверенностью — использован тот же проверенный
+# endpoint /api/v1/accounts (как для обычного "trade"), просто с другим
+# ожидаемым значением type ("trade_hf"), это наиболее вероятный формат
+# по структуре документации KuCoin, но НЕ гарантирован.
+#
+# БЕЗОПАСНОСТЬ: эта функция и её результат НЕ используются в реальной
+# торговле, пока пользователь явно не проверит её командой /testhfbalance
+# и не включит /setusehf on. По умолчанию (use_kucoin_hf=False) код ниже
+# просто не вызывается вообще — реальное поведение бота НЕ меняется.
+# ═══════════════════════════════════════════════════════════════
+
+async def get_real_balances_kucoin_hf(session) -> Optional[Dict[str, float]]:
+    """Баланс trade_hf аккаунта — тот же endpoint /api/v1/accounts, что и
+    обычный trade, просто фильтруем по type=='trade_hf' вместо 'trade'.
+    Возвращает None при любой ошибке или неожиданном формате — НИКОГДА не
+    гадает и не додумывает данные, чтобы не исказить реальную торговлю."""
+    if is_backed_off("KuCoin"):
+        return None
+    endpoint = "/api/v1/accounts"
+    url = f"https://api.kucoin.com{endpoint}"
+    ts = str(int(time.time() * 1000))
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "GET", endpoint, "")
+    headers = {
+        "KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2",
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status in (429, 418):
+                trigger_backoff("KuCoin", r.status, r.headers.get("Retry-After"))
+                return None
+            data = await r.json()
+            if r.status != 200 or data.get("code") != "200000":
+                logger.error(f"KuCoin HF balance fetch failed: {data}")
+                return None
+            result = {}
+            found_hf_type = False
+            for acc in data.get("data", []):
+                if acc.get("type") == "trade_hf":
+                    found_hf_type = True
+                    result[acc["currency"]] = float(acc["available"])
+            if not found_hf_type:
+                logger.error("KuCoin HF balance: тип 'trade_hf' не найден в ответе — "
+                              "либо ещё не переведены средства, либо формат отличается "
+                              "от ожидаемого. Полный ответ: " + str(data)[:500])
+                return None
+            return result
+    except Exception as e:
+        logger.error(f"KuCoin HF balance exception: {e}")
+        return None
+
+
+async def place_order_kucoin_hf(session, symbol: str, side: str, funds_or_size: float,
+                                  use_funds: bool = True) -> Optional[dict]:
+    """Размещение ордера через HF-эндпоинт — /api/v1/hf/orders. Формат
+    ЭТОГО эндпоинта (в отличие от баланса) подтверждён документацией
+    напрямую. Та же схема подписи, что и у обычного place_order_kucoin."""
+    if is_backed_off("KuCoin"):
+        logger.error("KuCoin в бэкоффе — HF-ордер НЕ отправлен")
+        return None
+    endpoint = "/api/v1/hf/orders"
+    url = f"https://api.kucoin.com{endpoint}"
+    ts = str(int(time.time() * 1000))
+    body_dict = {
+        "clientOid": str(int(time.time() * 1000000)),
+        "side": side.lower(), "symbol": f"{symbol}-{QUOTE}", "type": "market",
+    }
+    if use_funds:
+        body_dict["funds"] = str(round(funds_or_size, 4))
+    else:
+        body_dict["size"] = str(funds_or_size)
+
+    body_str = json.dumps(body_dict)
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "POST", endpoint, body_str)
+    headers = {
+        "KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.post(url, data=body_str, headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status in (429, 418):
+                trigger_backoff("KuCoin", r.status, r.headers.get("Retry-After"))
+                return None
+            data = await r.json()
+            if r.status != 200 or data.get("code") != "200000":
+                logger.error(f"KuCoin HF order failed: {data}")
+                _remember_error("KuCoin", data.get("msg", data))
+                return None
+            return data
+    except Exception as e:
+        logger.error(f"KuCoin HF order exception: {e}")
+        _remember_error("KuCoin", e)
+        return None
+
+
 async def get_real_balances_htx(session) -> Optional[Dict[str, float]]:
     if is_backed_off("HTX"):
         return None
@@ -4689,6 +4798,42 @@ async def handle_command(session, text, chat_id):
                                      f"(будет использоваться, пока не накопится 3+ реальных сделки)")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setminerosion 2.5`")
+
+    elif cmd == "/testhfbalance":
+        # НОВОЕ 18.08: БЕЗОПАСНАЯ диагностическая команда — только ЧИТАЕТ
+        # баланс trade_hf аккаунта на KuCoin, НИЧЕГО не меняет и не
+        # торгует. Нужна, чтобы проверить, что формат ответа биржи
+        # действительно содержит type=='trade_hf' (это не подтверждено
+        # документацией на 100%), ПРЕЖДЕ чем что-либо реально включать в
+        # торговую логику. Полное подключение HF-аккаунта в реальную
+        # торговлю ЕЩЁ НЕ РЕАЛИЗОВАНО — сначала нужно подтвердить формат
+        # здесь, потом отдельно переносить логику ребаланса/watchdog.
+        await send_tg(session, "📡 Проверяю баланс trade_hf аккаунта на KuCoin (только чтение, ничего не меняю)...")
+        hf_balance = await get_real_balances_kucoin_hf(session)
+        if hf_balance is None:
+            await send_tg(session,
+                "🔴 *Не удалось прочитать баланс trade_hf.*\n\n"
+                "Либо на HF-аккаунте ещё нет средств (переведите хотя бы "
+                "$1 через приложение KuCoin: Активы → Перевод → из Spot в "
+                "Pro/HF аккаунт), либо формат ответа биржи отличается от "
+                "ожидаемого. Смотри детали в логах Railway (поиск "
+                "\"KuCoin HF balance\") — там будет полный сырой ответ биржи."
+            )
+            return
+        if not hf_balance:
+            await send_tg(session,
+                "✅ Формат ответа распознан правильно (type='trade_hf' найден), "
+                "но баланс пустой — переведите средства на HF-аккаунт через "
+                "приложение KuCoin, потом проверьте снова."
+            )
+            return
+        balance_str = ", ".join(f"{k}: {v}" for k, v in hf_balance.items())
+        await send_tg(session,
+            f"✅ *Баланс trade_hf распознан успешно:*\n{balance_str}\n\n"
+            f"Формат подтверждён. Полное подключение HF в реальную торговлю "
+            f"(ребаланс, watchdog, докупки) — отдельный шаг, ещё не сделан, "
+            f"чтобы не создать рассинхрон между обычным и HF балансом."
+        )
 
     elif cmd == "/setpretradevolatility":
         # НОВОЕ 17.08: порог мгновенной волатильности (за 1 минуту),
