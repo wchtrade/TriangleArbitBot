@@ -351,6 +351,11 @@ config["min_execution_erosion_estimate_pct"] = 2.7  # стартовая оце�
 # существует в файле, но НИКОГДА не вызывается в реальной торговле.
 config["use_kucoin_hf"] = False
 
+# НОВОЕ 18.08 (по прямому запросу — "дай 5 вещей, которые дадут +", №1):
+# лимитные IOC-ордера вместо рыночных — строго безопаснее (худший исход:
+# сделка не состоится, а не состоится ПЛОХО). ПО УМОЛЧАНИЮ ВКЛЮЧЕНО.
+config["use_limit_ioc_orders"] = True
+
 
 def record_execution_erosion(net_pct_at_signal: float, factual_delta: float, vol: float) -> None:
     """Вызывать после КАЖДОЙ реальной сделки с известным factual_delta.
@@ -1925,6 +1930,100 @@ async def place_order_kucoin(session, symbol: str, side: str, funds_or_size: flo
         return None
 
 
+# ═══════════════════════════════════════════════════════════════
+# НОВОЕ 18.08 (по прямому запросу пользователя — "дай 5 вещей, которые
+# дадут +"; пункт №1, самый значимый): рыночный (MARKET) ордер исполняется
+# по ЛЮБОЙ цене, какая есть на бирже в момент прихода запроса — не по той,
+# что была зафиксирована на сигнале. Именно это, по нашим сегодняшним
+# измерениям, съедало $0.09-0.12 почти на каждой сделке (~2.3-3.4% от
+# объёма), даже когда сам спред на входе был честным и не аномальным.
+#
+# Лимитный ордер с IOC (Immediate-or-Cancel) — противоположная гарантия:
+# биржа исполнит его ТОЛЬКО по указанной цене или лучше; всё, что не
+# исполнилось мгновенно по этой цене — отменяется (частичное исполнение
+# возможно, неисполненный остаток просто не размещается в стакан). Это
+# превращает "гарантированный мелкий убыток от проскальзывания" в
+# "либо сделка ровно по расчёту, либо сделка не состоялась вообще" —
+# именно то, что нужно, когда каждая проигранная копейка на счету.
+# ═══════════════════════════════════════════════════════════════
+
+async def place_order_kucoin_limit_ioc(session, symbol: str, side: str,
+                                         price: float, size: float) -> Optional[dict]:
+    """Лимитный IOC-ордер на KuCoin. price — предельная цена (для BUY —
+    не хуже этой, для SELL — не хуже этой), size — количество МОНЕТЫ
+    (не USDT, в отличие от market-версии) — должно быть уже округлено
+    под шаг лота биржи (round_quantity_for_exchange) ДО вызова."""
+    if is_backed_off("KuCoin"):
+        logger.error("KuCoin в бэкоффе — лимитный ордер НЕ отправлен")
+        return None
+    endpoint = "/api/v1/orders"
+    url = f"https://api.kucoin.com{endpoint}"
+    ts = str(int(time.time() * 1000))
+    body_dict = {
+        "clientOid": str(int(time.time() * 1000000)),
+        "side": side.lower(), "symbol": f"{symbol}-{QUOTE}", "type": "limit",
+        "price": str(price), "size": str(size), "timeInForce": "IOC",
+    }
+    import json
+    body_str = json.dumps(body_dict)
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "POST", endpoint, body_str)
+    headers = {
+        "KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.post(url, data=body_str, headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status in (429, 418):
+                trigger_backoff("KuCoin", r.status, r.headers.get("Retry-After"))
+                return None
+            data = await r.json()
+            if r.status != 200 or data.get("code") != "200000":
+                logger.error(f"KuCoin limit-IOC order failed: {data}")
+                _remember_error("KuCoin", data.get("msg", data))
+                return None
+            return data
+    except Exception as e:
+        logger.error(f"KuCoin limit-IOC order exception: {e}")
+        _remember_error("KuCoin", e)
+        return None
+
+
+async def place_order_mexc_limit_ioc(session, symbol: str, side: str,
+                                       price: float, quantity: float) -> Optional[dict]:
+    """Лимитный IOC-ордер на MEXC. Формат идентичен Binance (type=LIMIT,
+    timeInForce=IOC, price+quantity обязательны)."""
+    if is_backed_off("MEXC"):
+        logger.error("MEXC в бэкоффе — лимитный ордер НЕ отправлен")
+        return None
+    url = "https://api.mexc.com/api/v3/order"
+    ts = int(time.time() * 1000)
+    params = {
+        "symbol": f"{symbol}{QUOTE}", "side": side, "type": "LIMIT",
+        "timeInForce": "IOC", "quantity": quantity, "price": price,
+        "timestamp": ts, "recvWindow": 5000,
+    }
+    params["signature"] = sign_binance(params, MEXC_SECRET)
+    headers = {"X-MEXC-APIKEY": MEXC_KEY, "Content-Type": "application/json"}
+    try:
+        async with session.post(url, params=params, headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status in (429, 418):
+                trigger_backoff("MEXC", r.status, r.headers.get("Retry-After"))
+                return None
+            data = await r.json()
+            if r.status != 200:
+                logger.error(f"MEXC limit-IOC order failed: {data}")
+                _remember_error("MEXC", data.get("msg", data))
+                return None
+            return data
+    except Exception as e:
+        logger.error(f"MEXC limit-IOC order exception: {e}")
+        _remember_error("MEXC", e)
+        return None
+
+
 async def place_order_htx(session, account_id: str, symbol: str, side: str,
                             amount: float) -> Optional[dict]:
     """MARKET ордер на HTX. side: 'buy-market' или 'sell-market'.
@@ -2515,13 +2614,39 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
                              f"{'(автодокупка не удалась)' if not topped else '(даже после автодокупки)'}"}
 
     # --- НОГА 1: ПОКУПКА ---
+    # НОВОЕ 18.08: лимитный IOC вместо рыночного, если включено (по
+    # умолчанию ВКЛЮЧЕНО — это строго безопаснее рыночного: худший исход
+    # лимитного IOC — сделка просто не состоится, а не состоится ПЛОХО).
+    # Пока реализовано только для KuCoin (текущая буксирующая биржа
+    # покупки) и MEXC (текущая биржа продажи) — остальные биржи по-прежнему
+    # используют старые market-функции без изменений.
     buy_result = None
+    use_limit_ioc = config.get("use_limit_ioc_orders", True)
     if buy_ex == "Binance":
         buy_result = await place_order_binance(session, symbol, "BUY", vol)
     elif buy_ex == "MEXC":
         buy_result = await place_order_mexc(session, symbol, "BUY", vol)
     elif buy_ex == "KuCoin":
-        buy_result = await place_order_kucoin(session, symbol, "buy", vol, use_funds=True)
+        if use_limit_ioc and opp.get("buy_price"):
+            coins_estimate = vol / opp["buy_price"]
+            limit_size = await round_quantity_for_exchange(session, "KuCoin", symbol, coins_estimate)
+            if limit_size > 0:
+                buy_result = await place_order_kucoin_limit_ioc(
+                    session, symbol, "buy", opp["buy_price"], limit_size)
+            if not buy_result:
+                # Лимитный IOC не прошёл (цена уже хуже расчётной) — это
+                # ОЖИДАЕМОЕ, безопасное поведение самой защиты, не сбой.
+                # НЕ откатываемся на market — если лимитный не прошёл,
+                # значит цена реально ушла, и market только зафиксировал
+                # бы тот самый убыток, которого мы стараемся избежать.
+                stats["buy_leg_failures"] += 1
+                stats["limit_ioc_not_filled"] = stats.get("limit_ioc_not_filled", 0) + 1
+                return {"success": False,
+                        "error": f"limit_ioc_buy_not_filled_on_{buy_ex}: "
+                                 f"цена ушла хуже расчётной ({opp['buy_price']}) — "
+                                 f"пропускаем вместо покупки по проскальзыванию"}
+        else:
+            buy_result = await place_order_kucoin(session, symbol, "buy", vol, use_funds=True)
     elif buy_ex == "HTX":
         if not _htx_account_id_cache:
             _htx_account_id_cache = await get_htx_account_id(session)
@@ -2581,7 +2706,17 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     if sell_ex == "Binance":
         sell_result = await place_order_binance(session, symbol, "SELL", sell_qty)
     elif sell_ex == "MEXC":
-        sell_result = await place_order_mexc(session, symbol, "SELL", sell_qty)
+        if use_limit_ioc and opp.get("sell_price"):
+            sell_result = await place_order_mexc_limit_ioc(
+                session, symbol, "SELL", opp["sell_price"], sell_qty)
+            # ВАЖНО: если лимитный IOC на продажу не прошёл — здесь НЕЛЬЗЯ
+            # просто "пропустить", как на покупке — первая нога УЖЕ куплена,
+            # позиция открыта. Ниже по коду в любом случае сработает
+            # аварийное закрытие market-ордером (это уже правильно и не
+            # трогается) — лимитный IOC тут даёт только ШАНС продать без
+            # проскальзывания, а не заменяет защиту от зависшей позиции.
+        else:
+            sell_result = await place_order_mexc(session, symbol, "SELL", sell_qty)
     elif sell_ex == "KuCoin":
         sell_result = await place_order_kucoin(session, symbol, "sell", sell_qty, use_funds=False)
     elif sell_ex == "HTX":
@@ -4799,7 +4934,38 @@ async def handle_command(session, text, chat_id):
         except ValueError:
             await send_tg(session, "❌ Пример: `/setminerosion 2.5`")
 
-    elif cmd == "/testhfbalance":
+    elif cmd == "/setlimitioc":
+        # НОВОЕ 18.08: главный переключатель фикса эрозии исполнения —
+        # лимитные IOC ордера вместо рыночных на KuCoin (покупка) и MEXC
+        # (продажа). on (по умолчанию) — безопаснее: сделка либо ровно по
+        # расчётной цене, либо не состоится вовсе. off — старое поведение
+        # (market, гарантированное исполнение, но с проскальзыванием).
+        if len(parts) < 2:
+            cur = config.get("use_limit_ioc_orders", True)
+            not_filled = stats.get("limit_ioc_not_filled", 0)
+            await send_tg(session,
+                f"Текущий режим: {'✅ ON — лимитные IOC (KuCoin покупка + MEXC продажа)' if cur else '❌ OFF — рыночные ордера (старое поведение)'}\n\n"
+                f"Не исполнено из-за ушедшей цены (защита сработала): {not_filled}\n\n"
+                f"ON (рекомендуется): цена фиксируется на уровне сигнала — либо "
+                f"исполнится ровно по расчёту, либо не исполнится вовсе (без "
+                f"проскальзывания). OFF: старое поведение — гарантированное "
+                f"исполнение market-ордером, но по любой цене, включая худшую.\n\n"
+                f"Пример: `/setlimitioc on` или `/setlimitioc off`"
+            )
+            return
+        val = parts[1].lower()
+        if val in ("on", "1", "true", "вкл"):
+            config["use_limit_ioc_orders"] = True
+            await send_tg(session, "✅ Лимитные IOC-ордера ВКЛЮЧЕНЫ — цена фиксируется на "
+                                     "уровне сигнала, проскальзывание больше невозможно.")
+        elif val in ("off", "0", "false", "выкл"):
+            config["use_limit_ioc_orders"] = False
+            await send_tg(session, "⚠️ Лимитные IOC-ордера ВЫКЛЮЧЕНЫ — возврат к рыночным "
+                                     "ордерам (гарантированное исполнение, но с проскальзыванием).")
+        else:
+            await send_tg(session, "❌ Пример: `/setlimitioc on` или `/setlimitioc off`")
+
+
         # НОВОЕ 18.08: БЕЗОПАСНАЯ диагностическая команда — только ЧИТАЕТ
         # баланс trade_hf аккаунта на KuCoin, НИЧЕГО не меняет и не
         # торгует. Нужна, чтобы проверить, что формат ответа биржи
