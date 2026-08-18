@@ -5395,7 +5395,15 @@ async def reserve_watchdog_loop(session):
     while True:
         interval = config.get("reserve_watchdog_interval_sec", 90)
         try:
-            if not config["simulation_mode"] and not config["paused"]:
+            # ИСПРАВЛЕНО 17.08 (найдено сразу после первого реального теста):
+            # раньше здесь стояло "and not config['paused']" — это ОШИБКА,
+            # из-за которой весь смысл watchdog терялся: если бот стоит на
+            # /pause именно затем, чтобы дать резерву подтянуться ПЕРЕД
+            # стартом торговли — watchdog тоже молчал, резерв не подтягивался,
+            # и первая же сделка после /go снова упиралась в синхронную
+            # докупку. Watchdog должен работать НЕЗАВИСИМО от паузы — пауза
+            # блокирует только реальную ТОРГОВЛЮ, не подготовку резерва.
+            if not config["simulation_mode"]:
                 for sym in list(SYMBOLS):
                     for buy_ex, sell_ex in pairs_for_symbol(sym):
                         try:
