@@ -317,6 +317,56 @@ stats = {
     "emergency_closes_succeeded": 0,   # из них — сколько реально закрылось
 }
 trade_history: List[dict] = []
+
+# ═══════════════════════════════════════════════════════════════
+# НОВОЕ 18.08 (по прямому запросу пользователя "сделать так, чтобы не
+# было минуса"): по факту сегодняшних 8+ реальных сделок на ONE выяснили
+# — теоретическая прибыль по формуле (net_pct × объём) почти всегда
+# заметно превышает то, что реально получилось (реальный баланс до/
+# после). Разрыв стабильно составлял ~$0.09-0.12 на лоте ~$3.5-4, то
+# есть ~2.3-3.4% от объёма сделки — почти столько же, сколько сам спред
+# на входе. Это НЕ стоимость докупки резерва (уже учтена отдельно) — это
+# реальное расхождение между зафиксированной на сигнале ценой и тем, что
+# фактически произошло к моменту полного исполнения обеих ног.
+#
+# Гарантировать отсутствие убытка невозможно в принципе (рыночный риск
+# есть всегда) — но можно требовать спред, который заметно перекрывает
+# ИЗМЕРЕННУЮ на практике эрозию, а не просто "честный" порог по комиссиям
+# и ребалансу. execution_erosion_history копит последние измерения разрыва
+# (net_pct на сигнале минус фактически реализованный %), и bar для входа
+# автоматически поднимается, если реальная эрозия продолжает расти.
+# ═══════════════════════════════════════════════════════════════
+execution_erosion_history: List[float] = []
+EXECUTION_EROSION_HISTORY_MAXLEN = 8
+
+config["min_execution_erosion_estimate_pct"] = 2.7  # стартовая оценка — среднее
+    # из сегодняшних измерений ($0.09-0.12 на лоте $3.5-4 ≈ 2.3-3.4%,
+    # взято среднее). Используется, пока не накопится хотя бы 3 реальных
+    # измерения — дальше расчёт идёт по факту, эта константа больше не нужна.
+
+
+def record_execution_erosion(net_pct_at_signal: float, factual_delta: float, vol: float) -> None:
+    """Вызывать после КАЖДОЙ реальной сделки с известным factual_delta.
+    Копит разрыв между обещанным на сигнале % и тем, что реально
+    получилось — та самая эрозия исполнения, найденная 18.08."""
+    if vol <= 0:
+        return
+    factual_realized_pct = factual_delta / vol * 100
+    gap_pct = net_pct_at_signal - factual_realized_pct
+    execution_erosion_history.append(gap_pct)
+    if len(execution_erosion_history) > EXECUTION_EROSION_HISTORY_MAXLEN:
+        execution_erosion_history.pop(0)
+
+
+def get_avg_execution_erosion_pct() -> float:
+    """Скользящее среднее реальной эрозии исполнения. Пока данных мало
+    (<3 сделки) — используем консервативную стартовую оценку 2.7%,
+    откалиброванную по факту 18.08. Дальше — честное среднее по факту."""
+    if len(execution_erosion_history) < 3:
+        return config.get("min_execution_erosion_estimate_pct", 2.7)
+    return round(sum(execution_erosion_history) / len(execution_erosion_history), 4)
+
+
 # НОВОЕ 11.08: история P&L во времени — для скользящего среднего за час в
 # /stats. Каждая проверка P&L (не чаще раз в минуту) добавляет точку
 # (время, значение); старые точки (>1 часа) вычищаются, чтобы список не
@@ -1251,14 +1301,24 @@ def compute_dynamic_min_profit_pct(buy_ex: str, sell_ex: str) -> float:
     Порог теперь считается динамически из реальных комиссий и эмпирически
     измеренной стоимости пересечения спреда, амортизированной на размер
     резервного буфера (sell_reserve_lots) — чем больше буфер, тем реже
-    нужен ребаланс, тем ниже честный порог на одну сделку."""
+    нужен ребаланс, тем ниже честный порог на одну сделку.
+
+    ДОБАВЛЕНО 18.08: плюс отдельный, реально измеренный буфер ЭРОЗИИ
+    ИСПОЛНЕНИЯ (разница между обещанным на сигнале % и тем, что реально
+    получилось к моменту завершения обеих ног) — это НЕ то же самое, что
+    стоимость ребаланса выше, это отдельный, ранее неучтённый источник
+    потерь, найденный по факту 18.08 (~2.3-3.4% от объёма сделки на
+    практике). Без этого добавления бот продолжал бы торговать на
+    спредах, которые в среднем гарантированно съедаются к моменту
+    реального исполнения."""
     buy_fee = FEES.get(buy_ex, 0.1)
     sell_fee = FEES.get(sell_ex, 0.1)
     spread_crossing_pct = config.get("empirical_spread_crossing_pct", 0.34)
     lots = max(config.get("sell_reserve_lots", 3), 1)
     amortized_rebalance = spread_crossing_pct / lots
     safety_margin = config.get("threshold_safety_margin_pct", 0.05)
-    return round(buy_fee + sell_fee + amortized_rebalance + safety_margin, 4)
+    erosion_buffer = get_avg_execution_erosion_pct()
+    return round(buy_fee + sell_fee + amortized_rebalance + safety_margin + erosion_buffer, 4)
 
 
 def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob: Dict,
@@ -3467,6 +3527,12 @@ async def execute_trade(session, opp: dict) -> dict:
                     stats["factual_trades_count"] = stats.get("factual_trades_count", 0) + 1
                     diff_from_estimate = round(factual_delta - honest_cycle_profit, 4)
 
+                    # НОВОЕ 18.08: записываем реальную эрозию исполнения (разница
+                    # между % на сигнале и фактически реализованным %) — питает
+                    # get_avg_execution_erosion_pct(), которая теперь напрямую
+                    # входит в честный порог compute_dynamic_min_profit_pct.
+                    record_execution_erosion(opp["net_pct"], factual_delta, opp["vol"])
+
                     # НОВОЕ 17.08: САМОКАЛИБРОВКА — по прямому запросу пользователя
                     # после вечера, когда даже "спокойный" рынок (движение цены <1%)
                     # дал 2 сделки подряд с реальным минусом при оценке crossingcost=1.5%.
@@ -4581,6 +4647,48 @@ async def handle_command(session, text, chat_id):
                                      "старое поведение, докупка на месте при нехватке резерва.")
         else:
             await send_tg(session, "❌ Пример: `/setskiptopup on` или `/setskiptopup off`")
+
+    elif cmd == "/erosionstats":
+        # НОВОЕ 18.08: показать накопленную историю измеренной эрозии
+        # исполнения (разница между обещанным % на сигнале и фактически
+        # реализованным %) — тот самый буфер, который теперь автоматически
+        # входит в честный порог входа, чтобы снизить частоту убыточных
+        # сделок (полностью исключить их код не может — рыночный риск
+        # есть всегда).
+        avg = get_avg_execution_erosion_pct()
+        hist_str = ", ".join(f"{v:+.2f}%" for v in execution_erosion_history) or "(пусто)"
+        source = "по факту сделок" if len(execution_erosion_history) >= 3 else "стартовая оценка (мало данных)"
+        await send_tg(session,
+            f"📉 *ЭРОЗИЯ ИСПОЛНЕНИЯ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Текущий буфер: *{avg:.2f}%* ({source})\n"
+            f"История последних сделок: {hist_str}\n\n"
+            f"Этот буфер автоматически добавляется к честному порогу входа "
+            f"(`/stats` → «Порог... честный»). Чем выше реально измеренная "
+            f"эрозия — тем строже порог, тем реже (но надёжнее) сделки.\n\n"
+            f"Стартовая оценка (пока данных <3 сделок): "
+            f"{config.get('min_execution_erosion_estimate_pct', 2.7)}%, "
+            f"откалибрована по фактам 18.08. Изменить: "
+            f"`/setminerosion N`"
+        )
+
+    elif cmd == "/setminerosion":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущая стартовая оценка эрозии (пока мало реальных данных): "
+                f"{config.get('min_execution_erosion_estimate_pct', 2.7)}%\n\n"
+                f"Пример: `/setminerosion 2.5`"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0 or val > 20:
+                await send_tg(session, "❌ Разумный диапазон: 0-20%.")
+                return
+            config["min_execution_erosion_estimate_pct"] = val
+            await send_tg(session, f"✅ Стартовая оценка эрозии: {val}% "
+                                     f"(будет использоваться, пока не накопится 3+ реальных сделки)")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setminerosion 2.5`")
 
     elif cmd == "/setpretradevolatility":
         # НОВОЕ 17.08: порог мгновенной волатильности (за 1 минуту),
