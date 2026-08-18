@@ -5460,22 +5460,26 @@ async def reserve_watchdog_loop(session):
     докупка внутри сделки — просто вызывает её ЗАРАНЕЕ, а не по факту
     нехватки в момент попытки. Дневной лимит max_topup_spend_per_day
     общий для обоих механизмов — реактивная докупка внутри сделки
-    сработает реже, но общие траты на докупки не увеличатся бесконтрольно."""
+    сработает реже, но общие траты на докупки не увеличатся бесконтрольно.
+
+    ДОБАВЛЕНО 18.08 (найдено сразу после включения /setskiptopup on):
+    раньше этот цикл проверял ТОЛЬКО резерв монеты на бирже ПРОДАЖИ
+    (sell_ex) — но биржа ПОКУПКИ (buy_ex, напр. KuCoin) тоже структурно
+    накапливает лишнюю монету и теряет USDT (она покупает, но не
+    продаёт в этой схеме). Реактивный механизм top_up_usdt_via_coin_sale
+    чинил это в моменте сделки — но при skip_reactive_topup=on сделки с
+    такой нехваткой теперь просто пропускаются, и БЕЗ этого дополнения
+    остались бы пропущены НАВСЕГДА (watchdog про buy_ex вообще не знал).
+    Теперь цикл заранее продаёт излишек монеты на buy_ex в USDT, тем же
+    способом, каким это раньше делала реактивная докупка — просто заранее."""
     await asyncio.sleep(60)
     while True:
         interval = config.get("reserve_watchdog_interval_sec", 90)
         try:
-            # ИСПРАВЛЕНО 17.08 (найдено сразу после первого реального теста):
-            # раньше здесь стояло "and not config['paused']" — это ОШИБКА,
-            # из-за которой весь смысл watchdog терялся: если бот стоит на
-            # /pause именно затем, чтобы дать резерву подтянуться ПЕРЕД
-            # стартом торговли — watchdog тоже молчал, резерв не подтягивался,
-            # и первая же сделка после /go снова упиралась в синхронную
-            # докупку. Watchdog должен работать НЕЗАВИСИМО от паузы — пауза
-            # блокирует только реальную ТОРГОВЛЮ, не подготовку резерва.
             if not config["simulation_mode"]:
                 for sym in list(SYMBOLS):
                     for buy_ex, sell_ex in pairs_for_symbol(sym):
+                        # --- Резерв МОНЕТЫ на бирже ПРОДАЖИ (как раньше) ---
                         try:
                             balances = await get_real_balances(session, sell_ex)
                             if balances is None:
@@ -5497,6 +5501,28 @@ async def reserve_watchdog_loop(session):
                                     await top_up_coin_reserve(session, sell_ex, sym, shortfall, price)
                         except Exception as e:
                             logger.error(f"Reserve watchdog {sell_ex}/{sym}: {e}")
+
+                        # --- НОВОЕ 18.08: резерв USDT на бирже ПОКУПКИ ---
+                        try:
+                            buy_balances = await get_real_balances(session, buy_ex)
+                            if buy_balances is None:
+                                continue
+                            usdt_have = buy_balances.get("USDT", 0.0)
+                            usdt_target = config["max_real_order_usdt"] * max(config.get("rebalance_target_lots", 1), 1)
+                            trigger_frac = config.get("reserve_watchdog_trigger_frac", 0.6)
+                            if usdt_target > 0 and usdt_have < usdt_target * trigger_frac:
+                                have_coin_on_buy_ex = buy_balances.get(sym, 0.0)
+                                if have_coin_on_buy_ex > 0:
+                                    usdt_shortfall = round(usdt_target - usdt_have, 4)
+                                    price_on_buy_ex = await get_valuation_price(session, buy_ex, sym)
+                                    if price_on_buy_ex and price_on_buy_ex > 0:
+                                        logger.info(f"🛡 Reserve watchdog: {buy_ex} USDT {usdt_have:.2f} "
+                                                     f"ниже {trigger_frac*100:.0f}% от цели {usdt_target:.2f} — "
+                                                     f"продаю излишек {sym} ЗАРАНЕЕ")
+                                        await top_up_usdt_via_coin_sale(
+                                            session, buy_ex, sym, usdt_shortfall, price_on_buy_ex)
+                        except Exception as e:
+                            logger.error(f"Reserve watchdog USDT {buy_ex}/{sym}: {e}")
         except Exception as e:
             logger.error(f"Reserve watchdog loop error: {e}")
         await asyncio.sleep(interval)
