@@ -4965,7 +4965,66 @@ async def handle_command(session, text, chat_id):
         else:
             await send_tg(session, "❌ Пример: `/setlimitioc on` или `/setlimitioc off`")
 
+    elif cmd == "/setprofittarget":
+        # НОВОЕ 18.08: целевой ОБЩИЙ плюс, при достижении которого бот сам
+        # запускает ребаланс и поднимает стартовую точку — фиксируя плюс
+        # как новую базу отсчёта P&L. 0 — выключить полностью.
+        if len(parts) < 2:
+            target = config.get("profit_target_usdt", 0.30)
+            enabled = config.get("profit_target_enabled", True)
+            await send_tg(session,
+                f"Текущая цель фиксации плюса: {'выключено' if not enabled or target <= 0 else f'{target} USDT'}\n\n"
+                f"При достижении ОБЩЕГО P&L этой суммы — бот запускает ребаланс "
+                f"(продажа излишка монеты в USDT на всех биржах) и поднимает "
+                f"стартовую точку до нового баланса — плюс становится новым "
+                f"нулём отсчёта.\n\n"
+                f"Пример: `/setprofittarget 0.3` или `/setprofittarget 0` (выключить)"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0:
+                await send_tg(session, "❌ Не может быть отрицательным.")
+                return
+            config["profit_target_usdt"] = val
+            config["profit_target_enabled"] = val > 0
+            if val > 0:
+                await send_tg(session, f"✅ Цель фиксации плюса: {val} USDT")
+            else:
+                await send_tg(session, "✅ Автофиксация плюса выключена.")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setprofittarget 0.3`")
 
+    elif cmd == "/setidlealert":
+        # НОВОЕ 21.08: порог, при котором бот уведомляет о простаивающем
+        # USDT на биржах-продавцах (которые никогда не покупают в своей
+        # роли) — только уведомление, деньги сам не трогает.
+        if len(parts) < 2:
+            thr = config.get("idle_usdt_alert_threshold_usdt", 2.0)
+            await send_tg(session,
+                f"Текущий порог уведомления о простаивающем USDT: {thr} USDT\n\n"
+                f"Раз в час бот проверяет биржи, которые по своей роли НИКОГДА "
+                f"не покупают (только продают) — если там скопился USDT сверх "
+                f"этого порога, присылает уведомление с рекомендацией, куда "
+                f"его перевести вручную. Бот НЕ переводит деньги сам.\n\n"
+                f"Пример: `/setidlealert 2.0` или `/setidlealert 0` (выключить)"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0:
+                await send_tg(session, "❌ Не может быть отрицательным.")
+                return
+            config["idle_usdt_alert_threshold_usdt"] = val
+            if val > 0:
+                await send_tg(session, f"✅ Порог уведомления о простаивающем USDT: {val} USDT")
+            else:
+                await send_tg(session, "✅ Уведомления о простаивающем USDT выключены "
+                                         "(порог 0 — эффективно никогда не сработает).")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setidlealert 2.0`")
+
+    elif cmd == "/testhfbalance":
         # НОВОЕ 18.08: БЕЗОПАСНАЯ диагностическая команда — только ЧИТАЕТ
         # баланс trade_hf аккаунта на KuCoin, НИЧЕГО не меняет и не
         # торгует. Нужна, чтобы проверить, что формат ответа биржи
@@ -5957,6 +6016,95 @@ async def reserve_watchdog_loop(session):
         await asyncio.sleep(interval)
 
 
+# ═══════════════════════════════════════════════════════════════
+# НОВОЕ 21.08 (по прямому запросу пользователя, после разбора логов
+# /realbalance): найдено, что на бирже-продавце (напр. MEXC в связке
+# KuCoin→MEXC) со временем накапливается простаивающий USDT — выручка от
+# успешных продаж, которая физически не помогает торговле (MEXC никогда
+# не покупает в этой схеме, ей не нужен большой запас USDT). Ни один
+# существующий механизм (profit_lock, periodic_rebalance, reserve_
+# watchdog) не перераспределяет ЭТИ конкретные деньги — они не "излишек
+# монеты" (для profit_lock) и не "нехватка USDT" (для watchdog), они
+# просто лежат.
+#
+# ВАЖНО: этот цикл ТОЛЬКО УВЕДОМЛЯЕТ, никогда не переводит деньги сам —
+# переводы МЕЖДУ биржами всегда оставались ручным решением пользователя
+# (это сознательный, уже сложившийся принцип во всём проекте — бот не
+# трогает межбиржевые переводы автоматически).
+# ═══════════════════════════════════════════════════════════════
+config["idle_usdt_alert_threshold_usdt"] = 2.0   # уведомлять, если простаивает больше этой суммы
+config["idle_usdt_alert_interval_sec"] = 3600    # как часто проверять (по умолчанию раз в час)
+_last_idle_usdt_alert: Dict[str, float] = {}      # ex -> timestamp последнего уведомления
+IDLE_USDT_ALERT_COOLDOWN_SEC = 6 * 3600            # не спамить чаще раза в 6 часов на одну биржу
+
+
+async def idle_usdt_alert_loop(session):
+    """Раз в час (настраивается) проверяет: если на бирже, которая
+    НИКОГДА не покупает по своей роли (только продаёт), скопился USDT
+    сверх небольшого буфера — присылает уведомление с конкретной
+    рекомендацией, куда его вручную перевести (на биржу с дефицитом).
+    Кулдаун 6 часов на одну биржу, чтобы не спамить одним и тем же."""
+    await asyncio.sleep(300)
+    while True:
+        interval = config.get("idle_usdt_alert_interval_sec", 3600)
+        try:
+            if not config["simulation_mode"]:
+                threshold = config.get("idle_usdt_alert_threshold_usdt", 2.0)
+                # Собираем дефициты USDT по покупающим биржам — чтобы
+                # рекомендация была конкретной ("переведи на KuCoin"),
+                # а не абстрактной.
+                deficits = {}
+                for buy_ex in {b for sym in SYMBOLS for b, _ in pairs_for_symbol(sym)}:
+                    buy_balances = await get_real_balances(session, buy_ex)
+                    if buy_balances is None:
+                        continue
+                    usdt_have = buy_balances.get("USDT", 0.0)
+                    usdt_target = config["max_real_order_usdt"] * max(config.get("rebalance_target_lots", 1), 1)
+                    if usdt_have < usdt_target:
+                        deficits[buy_ex] = round(usdt_target - usdt_have, 2)
+
+                for sell_ex in {s for sym in SYMBOLS for _, s in pairs_for_symbol(sym)}:
+                    # Биржа считается "чистым продавцом" (никогда не покупает),
+                    # только если она не встречается как buy_ex ни для одной монеты.
+                    is_also_buyer = any(sell_ex == b for sym in SYMBOLS for b, _ in pairs_for_symbol(sym))
+                    if is_also_buyer:
+                        continue
+                    balances = await get_real_balances(session, sell_ex)
+                    if balances is None:
+                        continue
+                    idle_usdt = balances.get("USDT", 0.0)
+                    if idle_usdt < threshold:
+                        continue
+                    now_ts = time.time()
+                    if now_ts - _last_idle_usdt_alert.get(sell_ex, 0) < IDLE_USDT_ALERT_COOLDOWN_SEC:
+                        continue
+                    _last_idle_usdt_alert[sell_ex] = now_ts
+
+                    if deficits:
+                        target_ex, target_deficit = max(deficits.items(), key=lambda kv: kv[1])
+                        recommendation = (f"Рекомендация: переведи ~${min(idle_usdt, target_deficit):.2f} "
+                                           f"с {sell_ex} на {target_ex} вручную (там сейчас дефицит "
+                                           f"${target_deficit:.2f}).")
+                    else:
+                        recommendation = ("Все биржи-покупатели сейчас с достаточным резервом — "
+                                           "можно просто оставить как есть или перевести в свой кошелёк.")
+
+                    if CHAT_ID:
+                        await send_tg(session,
+                            f"💤 *Простаивающий USDT на {sell_ex}: ${idle_usdt:.2f}*\n\n"
+                            f"{sell_ex} по своей роли никогда не покупает — этот USDT, "
+                            f"скорее всего, выручка от прошлых продаж, физически не "
+                            f"участвующая в торговле.\n\n"
+                            f"{recommendation}\n\n"
+                            f"⚠️ Бот НЕ переводит деньги между биржами сам — это твоё "
+                            f"решение, как и всегда."
+                        )
+        except Exception as e:
+            logger.error(f"Idle USDT alert loop error: {e}")
+        await asyncio.sleep(interval)
+
+
+
 async def lock_in_profit_only(session, ex: str, plan: dict) -> List[dict]:
     """НОВОЕ 12.08: облегчённая версия apply_real_intra_exchange_rebalance —
     ТОЛЬКО продажа излишка (фиксация курсового плюса в USDT), НИКОГДА не
@@ -6110,6 +6258,62 @@ async def drawdown_guard_loop(session):
                                                   # если минус повторится в будущем
         except Exception as e:
             logger.error(f"Drawdown guard loop error: {e}")
+        await asyncio.sleep(300)
+
+
+# НОВОЕ 18.08 (по прямому запросу пользователя, Вариант 1): при достижении
+# заданного ОБЩЕГО плюса ($0.30 по умолчанию) — бот сам запускает полный
+# реальный ребаланс (продажа излишка монеты в USDT на всех биржах, как
+# делает /rebalance), а затем ПОДНИМАЕТ стартовую точку (real_start_capital)
+# до нового, уже зафиксированного баланса — то есть этот плюс становится
+# новым "нулём отсчёта" для дальнейшего P&L, а не просто разовым
+# уведомлением. Работает НЕЗАВИСИМО от lock_in_profit_only (тот проверяет
+# КАЖДУЮ биржу отдельно раз в 5 минут по избытку резерва; этот — ОБЩИЙ
+# P&L всего счёта раз в 5 минут).
+config["profit_target_usdt"] = 0.30      # общий плюс, при котором фиксируем
+config["profit_target_enabled"] = True   # можно выключить /setprofittarget 0
+
+
+async def profit_target_lock_loop(session):
+    """Проверяет общий P&L раз в 5 минут; при достижении config
+    ['profit_target_usdt'] — запускает реальный ребаланс (продажа излишка
+    монеты в USDT) и поднимает real_start_capital до нового баланса,
+    фиксируя плюс как новую базу для дальнейшего счёта P&L."""
+    await asyncio.sleep(220)
+    while True:
+        try:
+            target = config.get("profit_target_usdt", 0)
+            if (target > 0 and config.get("profit_target_enabled", True)
+                    and not config["simulation_mode"] and not config["paused"]
+                    and config.get("real_start_capital")):
+                real = await get_total_real_capital(session)
+                if real:
+                    pnl = real["total"] - config["real_start_capital"]
+                    if pnl >= target:
+                        if CHAT_ID:
+                            await send_tg(session,
+                                f"🎯 *Достигнут целевой плюс {target} USDT* "
+                                f"(факт: {pnl:+.2f}) — запускаю ребаланс, чтобы "
+                                f"зафиксировать его в USDT...")
+                        config["paused"] = True  # на время ребаланса, как и везде в коде
+                        rb_result = await real_auto_rebalance_all(session)
+                        if CHAT_ID:
+                            await send_tg(session, format_real_rebalance_result(rb_result))
+                        # Поднимаем стартовую точку ПОСЛЕ ребаланса, по СВЕЖЕМУ
+                        # балансу — именно это "фиксирует" плюс как новую базу.
+                        fresh = await get_total_real_capital(session)
+                        if fresh:
+                            old_start = config["real_start_capital"]
+                            config["real_start_capital"] = fresh["total"]
+                            if CHAT_ID:
+                                await send_tg(session,
+                                    f"✅ *Плюс зафиксирован.* Новая стартовая точка: "
+                                    f"${fresh['total']} (была ${old_start}). Дальше P&L "
+                                    f"снова считается от этой суммы, с нуля.")
+                        if rb_result.get("safe_to_resume", False):
+                            config["paused"] = False
+        except Exception as e:
+            logger.error(f"Profit target lock loop error: {e}")
         await asyncio.sleep(300)
 
 
@@ -6291,7 +6495,8 @@ async def main():
         await asyncio.gather(polling_loop(session), scan_loop(session),
                               periodic_rebalance_loop(session), profit_lock_loop(session),
                               drawdown_guard_loop(session), volatility_guard_loop(session),
-                              reserve_watchdog_loop(session))
+                              reserve_watchdog_loop(session), profit_target_lock_loop(session),
+                              idle_usdt_alert_loop(session))
 
 
 if __name__ == "__main__":
