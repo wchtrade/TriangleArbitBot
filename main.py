@@ -6276,9 +6276,26 @@ config["profit_target_enabled"] = True   # можно выключить /setpro
 
 async def profit_target_lock_loop(session):
     """Проверяет общий P&L раз в 5 минут; при достижении config
-    ['profit_target_usdt'] — запускает реальный ребаланс (продажа излишка
-    монеты в USDT) и поднимает real_start_capital до нового баланса,
-    фиксируя плюс как новую базу для дальнейшего счёта P&L."""
+    ['profit_target_usdt'] — РЕАЛЬНО продаёт излишек монеты в USDT на
+    каждой бирже-продавце (через lock_in_profit_only, БЕЗОПАСНУЮ версию —
+    она никогда не продаёт больше излишка и никогда не сливает весь
+    резерв целиком, в отличие от полного /rebalance), затем поднимает
+    real_start_capital до нового баланса.
+
+    ИСПРАВЛЕНО 21.08 (Вариант Б, по прямому запросу пользователя после
+    того как он заметил: "я думал продаём монеты в USDT, а тут по-другому"):
+    раньше здесь вызывался real_auto_rebalance_all() — полный ребаланс,
+    который у apply_real_intra_exchange_rebalance имеет ОПАСНЫЙ fallback
+    "если излишек меньше минимума биржи — продать ВЕСЬ резерв целиком"
+    (там это уместно раз в 4 часа для крупной переоценки, но НЕ для
+    частой, мелкой фиксации плюса). Из-за этого на практике реальной
+    продажи не происходило вообще (излишек $0.2 не проходил порог) —
+    "фиксация" была только переносом стартовой точки без изменения
+    состава портфеля, ровно то, что пользователь справедливо не ожидал.
+    Теперь используется lock_in_profit_only — та же функция, что работает
+    в profit_lock_loop, у неё НЕТ опасного fallback, она либо продаёт
+    именно излишек (если он больше реального минимума ордера биржи),
+    либо честно ничего не делает — не трогая резерв целиком."""
     await asyncio.sleep(220)
     while True:
         try:
@@ -6293,25 +6310,55 @@ async def profit_target_lock_loop(session):
                         if CHAT_ID:
                             await send_tg(session,
                                 f"🎯 *Достигнут целевой плюс {target} USDT* "
-                                f"(факт: {pnl:+.2f}) — запускаю ребаланс, чтобы "
-                                f"зафиксировать его в USDT...")
-                        config["paused"] = True  # на время ребаланса, как и везде в коде
-                        rb_result = await real_auto_rebalance_all(session)
+                                f"(факт: {pnl:+.2f}) — продаю реальный излишек монеты "
+                                f"в USDT на биржах-продавцах...")
+                        config["paused"] = True  # на время операции, как и везде в коде
+                        all_actions = []
+                        sold_anything = False
+                        for ex in ALL_EXCHANGES:
+                            try:
+                                plan = await real_exchange_rebalance_plan(session, ex)
+                                if not plan:
+                                    continue
+                                actions = await lock_in_profit_only(session, ex, plan)
+                                if actions:
+                                    all_actions.extend(actions)
+                                    if any(a.get("success") for a in actions):
+                                        sold_anything = True
+                            except Exception as e:
+                                logger.error(f"Profit target lock: ошибка на {ex}: {e}")
+
                         if CHAT_ID:
-                            await send_tg(session, format_real_rebalance_result(rb_result))
-                        # Поднимаем стартовую точку ПОСЛЕ ребаланса, по СВЕЖЕМУ
-                        # балансу — именно это "фиксирует" плюс как новую базу.
+                            if all_actions:
+                                lines = "\n".join(
+                                    f"  {a['ex']}/{a['symbol']}: продано ~${a['usd_estimate']} "
+                                    f"({'✅' if a['success'] else '❌'})"
+                                    for a in all_actions
+                                )
+                                await send_tg(session, f"📋 *Действия по фиксации:*\n{lines}")
+                            else:
+                                await send_tg(session,
+                                    "ℹ️ Реальный излишек монеты на всех биржах сейчас меньше "
+                                    "технического минимума ордера — физически нечего продать "
+                                    "прямо сейчас (это ограничение биржи, не бота). Плюс "
+                                    "останется в монете до следующей проверки, когда излишек "
+                                    "подрастёт достаточно.")
+
+                        # Поднимаем стартовую точку ПОСЛЕ попытки продажи, по
+                        # СВЕЖЕМУ балансу — фиксирует то, что реально удалось
+                        # продать (или просто текущий уровень, если продать
+                        # было физически нечего).
                         fresh = await get_total_real_capital(session)
                         if fresh:
                             old_start = config["real_start_capital"]
                             config["real_start_capital"] = fresh["total"]
                             if CHAT_ID:
+                                sold_note = "" if sold_anything else " (без реальной продажи — см. выше)"
                                 await send_tg(session,
-                                    f"✅ *Плюс зафиксирован.* Новая стартовая точка: "
+                                    f"✅ *Точка отсчёта обновлена{sold_note}.* Новая стартовая точка: "
                                     f"${fresh['total']} (была ${old_start}). Дальше P&L "
                                     f"снова считается от этой суммы, с нуля.")
-                        if rb_result.get("safe_to_resume", False):
-                            config["paused"] = False
+                        config["paused"] = False
         except Exception as e:
             logger.error(f"Profit target lock loop error: {e}")
         await asyncio.sleep(300)
