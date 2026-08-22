@@ -1705,7 +1705,17 @@ async def wait_for_mexc_fill(session, symbol: str, order_id, timeout: float = 3.
     return None
 
 
-async def wait_for_kucoin_fill(session, order_id: str, timeout: float = 3.0) -> Optional[float]:
+async def wait_for_kucoin_fill(session, order_id: str, timeout: float = 6.0) -> Optional[float]:
+    # ИЗМЕНЕНО 22.08 (по факту логов реальных сделок): было 3.0 сек — этого
+    # оказалось недостаточно для надёжного подтверждения статуса лимитных
+    # IOC-ордеров (введённых 18.08), из-за чего несколько раз подряд
+    # confirm_fill_and_get_qty сдавался раньше, чем KuCoin API успевал
+    # вернуть финальный статус ('buy_leg_not_confirmed_filled_on_KuCoin' в
+    # логах 22.08, хотя сам ордер, скорее всего, уже давно закрылся —
+    # просто не успели это увидеть за 10 попыток по 0.3 сек). Деньги в
+    # этих случаях не терялись (вторая нога просто не открывалась), но
+    # сделки терялись зря. Увеличено до 6 сек — тот же шаг 0.3 сек, просто
+    # больше попыток (20 вместо 10) на случай кратковременной задержки API.
     deadline = time.time() + timeout
     endpoint = f"/api/v1/orders/{order_id}"
     while time.time() < deadline:
