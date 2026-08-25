@@ -475,6 +475,15 @@ _last_exchange_error: Dict[str, str] = {"Binance": "", "KuCoin": "", "HTX": "", 
 # докупке резерва (не просто оценку по комиссии, как было раньше).
 _last_real_sell_price: Dict[Tuple[str, str], float] = {}
 
+# НОВОЕ 25.08 (по прямому запросу пользователя — "почему оценка не
+# пересчитывается под конкретную докупку"): зеркальный трекер для
+# top_up_usdt_via_coin_sale — раньше эта функция вообще НЕ считала свою
+# реальную стоимость (в отличие от top_up_coin_reserve). Цена последней
+# реальной ПОКУПКИ по (биржа, монета) — если реактивная продажа излишка
+# монеты идёт по цене ХУЖЕ, чем мы только что за неё заплатили, это
+# реальный, измеримый убыток сверх комиссии.
+_last_real_buy_price: Dict[Tuple[str, str], float] = {}
+
 
 def _remember_error(ex: str, detail) -> None:
     text = str(detail)
@@ -2273,7 +2282,7 @@ MIN_ORDER_VALUE_USD = {"Binance": 5.0, "KuCoin": 1.0, "HTX": 10.0, "MEXC": 1.0} 
 
 
 async def top_up_usdt_via_coin_sale(session, ex: str, symbol: str, usdt_needed: float,
-                                     price_hint: float) -> bool:
+                                     price_hint: float, cost_accumulator: Optional[list] = None) -> bool:
     """НОВОЕ 10.08: зеркальная функция к top_up_coin_reserve — но для
     ПРОТИВОПОЛОЖНОЙ проблемы. Найдено по логам и выгрузке Binance: биржа,
     которая только ПОКУПАЕТ монету (например, KuCoin в связке
@@ -2368,13 +2377,34 @@ async def top_up_usdt_via_coin_sale(session, ex: str, symbol: str, usdt_needed: 
         stats["topup_success"] = stats.get("topup_success", 0) + 1
         usd_gained = coin_to_sell * price_hint
         stats["topup_cost_usdt"] = stats.get("topup_cost_usdt", 0.0) + usd_gained
+        # НОВОЕ 25.08 (по прямому запросу пользователя, критическая находка):
+        # раньше эта функция вообще НЕ считала реальную стоимость сдвига
+        # курса — в отличие от зеркальной top_up_coin_reserve. Если продаём
+        # монету сейчас ДЕШЕВЛЕ, чем недавно за неё заплатили на этой же
+        # бирже (_last_real_buy_price) — это реальный, измеримый убыток
+        # сверх комиссии, и он должен учитываться так же честно.
+        drift_cost = 0.0
+        last_buy = _last_real_buy_price.get((ex, symbol))
+        if last_buy and last_buy > 0:
+            drift_cost = round((last_buy - price_hint) * coin_to_sell, 4)
+            stats["price_drift_cost_usdt"] = round(stats.get("price_drift_cost_usdt", 0.0) + drift_cost, 4)
+            stats["realized_trading_pnl"] = round(stats.get("realized_trading_pnl", 0.0) - drift_cost, 4)
+            if cost_accumulator is not None:
+                cost_accumulator[0] += drift_cost
+            logger.info(f"💧 Реальная стоимость сдвига курса при продаже {symbol}/{ex}: "
+                         f"{'+' if drift_cost < 0 else '-'}{abs(drift_cost):.4f} USDT "
+                         f"(продажа по {price_hint:.8f} против последней покупки по {last_buy:.8f})")
         logger.info(f"✅ Докупка USDT на {ex} через продажу {coin_to_sell} {symbol} "
                      f"(~${usd_gained:.2f})")
         if CHAT_ID:
+            drift_line = ""
+            if last_buy and last_buy > 0:
+                drift_line = (f"💧 Реальная стоимость сдвига курса: "
+                               f"{'+' if drift_cost < 0 else '-'}{abs(drift_cost):.4f} USDT\n")
             await send_tg(session,
                 f"🔧 *Автодокупка USDT*: не хватало ${usdt_needed:.2f} на {ex} "
                 f"перед сделкой — продал {coin_to_sell} {symbol} (~${usd_gained:.2f}) "
-                f"из накопленного избытка и продолжаю.")
+                f"из накопленного избытка и продолжаю.\n{drift_line}")
         return True
     stats["topup_attempts"] = stats.get("topup_attempts", 0) + 1
     logger.error(f"❌ Автодокупка USDT на {ex}/{symbol} не удалась: ордер на продажу "
@@ -2390,7 +2420,7 @@ async def top_up_usdt_via_coin_sale(session, ex: str, symbol: str, usdt_needed: 
 
 
 async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: float,
-                               price_hint: float) -> bool:
+                               price_hint: float, cost_accumulator: Optional[list] = None) -> bool:
     """ИСПРАВЛЕНИЕ 04.08: точечная мгновенная докупка нехватающей монеты.
 
     Раньше, если preflight-проверка перед сделкой обнаруживала нехватку
@@ -2483,6 +2513,8 @@ async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: floa
             drift_cost = round((price_hint - last_sell) * bought_qty, 4)
             stats["price_drift_cost_usdt"] = round(stats.get("price_drift_cost_usdt", 0.0) + drift_cost, 4)
             stats["realized_trading_pnl"] = round(stats.get("realized_trading_pnl", 0.0) - drift_cost, 4)
+            if cost_accumulator is not None:
+                cost_accumulator[0] += drift_cost
             logger.info(f"💧 Реальная стоимость сдвига курса при докупке {symbol}/{ex}: "
                          f"{'+' if drift_cost < 0 else '-'}{abs(drift_cost):.4f} USDT "
                          f"(докупка по {price_hint:.8f} против последней продажи по {last_sell:.8f})")
@@ -2518,6 +2550,13 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
 
     vol = min(opp["vol"], config["max_real_order_usdt"])  # ЖЁСТКИЙ потолок, /setlot его не обходит
     symbol, buy_ex, sell_ex = opp["symbol"], opp["buy_ex"], opp["sell_ex"]
+
+    # НОВОЕ 25.08 (по прямому запросу пользователя): накопитель РЕАЛЬНОЙ
+    # стоимости всех докупок, произошедших ИМЕННО в этом цикле сделки (не
+    # фоновых, из reserve_watchdog_loop — те используют вызовы БЕЗ этого
+    # параметра, поэтому не попадают сюда). Список из одного элемента —
+    # простой изменяемый "ящик" для накопления через несколько функций.
+    cycle_topup_cost = [0.0]
 
     # НАХОДКА 03.08: та же проблема с минимумом биржи, что чинили в ребалансе,
     # оказывается актуальна и для самой сделки — HTX отклоняет ЛЮБОЙ ордер
@@ -2587,7 +2626,8 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
             # получить нужный USDT, с проверкой курса перед продажей.
             usdt_shortfall = vol * usdt_buffer_mult - available_usdt_on_buy_ex
             topped_up = await top_up_usdt_via_coin_sale(
-                session, buy_ex, symbol, usdt_shortfall, opp.get("buy_price", 0))
+                session, buy_ex, symbol, usdt_shortfall, opp.get("buy_price", 0),
+                cost_accumulator=cycle_topup_cost)
             if topped_up:
                 buy_balances = await get_real_balances(session, buy_ex)
                 available_usdt_on_buy_ex = (buy_balances or {}).get("USDT", 0.0)
@@ -2650,7 +2690,7 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
         full_target_qty = (config["max_real_order_usdt"] * config["sell_reserve_lots"]
                             / opp["sell_price"] * headroom_mult)
         shortfall = round(max(required_with_buffer, full_target_qty) - available_on_sell_ex, 4)
-        topped = await top_up_coin_reserve(session, sell_ex, symbol, shortfall, opp["sell_price"])
+        topped = await top_up_coin_reserve(session, sell_ex, symbol, shortfall, opp["sell_price"], cost_accumulator=cycle_topup_cost)
         if topped:
             await asyncio.sleep(1.5)  # даём бирже время зачислить монету на баланс
             refreshed = await get_real_balances(session, sell_ex)
@@ -2756,7 +2796,7 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
         full_target_qty = (config["max_real_order_usdt"] * config["sell_reserve_lots"]
                             / opp["sell_price"] * headroom_mult)
         shortfall = round(max(sell_qty, full_target_qty) - fresh_available, 4)
-        topped = await top_up_coin_reserve(session, sell_ex, symbol, shortfall, opp["sell_price"])
+        topped = await top_up_coin_reserve(session, sell_ex, symbol, shortfall, opp["sell_price"], cost_accumulator=cycle_topup_cost)
         if topped:
             await asyncio.sleep(1.5)
             refreshed = await get_real_balances(session, sell_ex)
@@ -2827,9 +2867,12 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     # реальная, а не бумажная потеря — за 2 дня набежало -$1.98 только на
     # этом эффекте, и бот её никогда не видел и не показывал.
     _last_real_sell_price[(sell_ex, symbol)] = opp["sell_price"]
+    # НОВОЕ 25.08: зеркальный трекер цены покупки — для честной стоимости
+    # реактивной продажи излишка (top_up_usdt_via_coin_sale).
+    _last_real_buy_price[(buy_ex, symbol)] = opp["buy_price"]
 
     return {"success": True, "buy_result": buy_result, "sell_result": sell_result, "vol": vol,
-             "confirmed_qty": confirmed_qty}
+             "confirmed_qty": confirmed_qty, "real_topup_cost_usdt": round(cycle_topup_cost[0], 4)}
 
 
 # =====================================================================
@@ -3817,9 +3860,36 @@ async def execute_trade(session, opp: dict) -> dict:
             # рынке). Теперь явно добавляем настраиваемую оценку пересечения
             # спреда (/setcrossingcost) поверх комиссий.
             spread_crossing_est = opp["vol"] * config.get("empirical_spread_crossing_pct", 0.34) / 100
-            rebalance_cost_est = round(opp["vol"] * (FEES.get(opp["buy_ex"], 0.1) +
-                                                       FEES.get(opp["sell_ex"], 0.1)) / 100
-                                        + spread_crossing_est, 4)
+            fees_only = opp["vol"] * (FEES.get(opp["buy_ex"], 0.1) + FEES.get(opp["sell_ex"], 0.1)) / 100
+
+            # НОВОЕ 25.08 (по прямому запросу пользователя — "почему оценка
+            # не пересчитывается под конкретную докупку"): если в ЭТОМ
+            # конкретном цикле реально произошла докупка — её реальная
+            # стоимость (drift_cost) уже была вычтена из stats["realized_
+            # trading_pnl"] ПРЯМО ВНУТРИ top_up_coin_reserve/top_up_usdt_
+            # via_coin_sale, в момент докупки. Если добавить сюда ЕЩЁ и
+            # общую оценку (spread_crossing_est) — получится двойной счёт
+            # одной и той же стоимости. Поэтому: есть реальные данные —
+            # используем ТОЛЬКО комиссии здесь (стоимость уже учтена
+            # отдельно), нет — как раньше, используем оценку.
+            #
+            # ВАЖНО: pretrade_card_estimate — это ТА ЖЕ формула (оценка),
+            # что уже была отправлена пользователю в карточке ДО сделки —
+            # она НЕ меняется задним числом, иначе строка "оценка в
+            # карточке была: X" станет враньём (покажет не то число, что
+            # реально видел пользователь в предыдущем сообщении).
+            # honest_cycle_profit — ОТДЕЛЬНОЕ, более точное число для
+            # внутренней бухгалтерии (stats["realized_trading_pnl"]),
+            # использующее реальные данные о докупке, когда они есть.
+            pretrade_card_estimate = round(opp["profit_usdt"] - round(fees_only + spread_crossing_est, 4), 4)
+
+            real_topup_cost_this_cycle = real_result.get("real_topup_cost_usdt", 0.0)
+            if real_topup_cost_this_cycle != 0.0:
+                rebalance_cost_est = round(fees_only, 4)
+                cost_source_note = f" (скорректировано по реальной докупке: {real_topup_cost_this_cycle:+.4f} USDT)"
+            else:
+                rebalance_cost_est = round(fees_only + spread_crossing_est, 4)
+                cost_source_note = ""
             honest_cycle_profit = round(opp["profit_usdt"] - rebalance_cost_est, 4)
             stats["realized_trading_pnl"] = round(stats.get("realized_trading_pnl", 0.0) + honest_cycle_profit, 4)
             stats["realized_trades_count"] = stats.get("realized_trades_count", 0) + 1
@@ -3892,8 +3962,9 @@ async def execute_trade(session, opp: dict) -> dict:
                             f"не оценка):\n"
                             f"   До: ${capital_before['total']} → После: ${capital_after['total']}\n"
                             f"   Фактически: `{factual_delta:+.4f} USDT`\n"
-                            f"   (оценка в карточке была: `{honest_cycle_profit:+.4f}` — "
-                            f"разница `{diff_from_estimate:+.4f}`)")
+                            f"   (оценка в карточке была: `{pretrade_card_estimate:+.4f}` — "
+                            f"разница `{round(factual_delta - pretrade_card_estimate, 4):+.4f}`)"
+                            f"{cost_source_note}")
         if not real_result.get("success"):
             logger.error(f"РЕАЛЬНАЯ сделка не удалась: {real_result}")
             error = real_result.get("error", "")
