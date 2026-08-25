@@ -4371,7 +4371,8 @@ async def handle_command(session, text, chat_id):
                 f"😔 Нет валидных сигналов (порог {config['min_profit_pct']}%).\n"
                 f"Бирж онлайн: {', '.join(active) if active else 'ни одной!'}\n"
                 f"Отказов стакана: Binance={stats['depth_fail']['Binance']} "
-                f"KuCoin={stats['depth_fail']['KuCoin']} HTX={stats['depth_fail']['HTX']}\n"
+                f"KuCoin={stats['depth_fail']['KuCoin']} HTX={stats['depth_fail']['HTX']} "
+                f"MEXC={stats['depth_fail'].get('MEXC', 0)}\n"
                 f"Недостаточно ликвидности (за всё время): {stats['insufficient_liquidity']}\n"
                 f"Сбоев получения 24h-объёма: {stats.get('volume_fetch_fail', 0)}"
             )
@@ -4475,6 +4476,7 @@ async def handle_command(session, text, chat_id):
                 f"   Binance: {stats['depth_fail']['Binance']}\n"
                 f"   KuCoin: {stats['depth_fail']['KuCoin']}\n"
                 f"   HTX: {stats['depth_fail']['HTX']}\n"
+                f"   MEXC: {stats['depth_fail'].get('MEXC', 0)}\n"
                 f"   Сбоев 24h-объёма: {stats.get('volume_fetch_fail', 0)}\n\n"
                 f"🔧 Автодокупок при нехватке баланса: {stats['topup_success']}/{stats['topup_attempts']} "
                 f"(потрачено сегодня: ~${stats.get('topup_cost_usdt', 0.0):.2f} из "
@@ -6568,7 +6570,20 @@ async def scan_loop(session):
                 logger.info(
                     f"Скан #{stats['scans']}: бирж={len(active)} сигналов={len(signals)} "
                     f"отказов_стакана=B:{stats['depth_fail']['Binance']}/"
-                    f"K:{stats['depth_fail']['KuCoin']}/H:{stats['depth_fail']['HTX']}"
+                    f"K:{stats['depth_fail']['KuCoin']}/H:{stats['depth_fail']['HTX']}/"
+                    f"M:{stats['depth_fail'].get('MEXC', 0)}"
+                    # ИСПРАВЛЕНО 25.08 (по факту находки): счётчик MEXC уже
+                    # существовал в коде (stats["depth_fail"]["MEXC"]), но
+                    # НИКОГДА не выводился — ни здесь, ни в /stats, ни в
+                    # /wsstatus. Найдено после смены региона Railway на
+                    # Singapore: 5733 скана, 0 сигналов, при этом /depthcheck
+                    # вручную честно показал реальный спред 3.75% (выше
+                    # порога). MEXC не участвует в WS (только Binance/KuCoin/
+                    # HTX её используют), значит сканирование берёт MEXC
+                    # через отдельный путь — если ОН тихо отказывает при
+                    # реальном скане (не при разовой ручной /depthcheck), это
+                    # объясняет полное отсутствие сигналов без единой видимой
+                    # ошибки где-либо в интерфейсе.
                 )
                 for opp in signals[:3]:
                     key = f"{opp['symbol']}-{opp['buy_ex']}-{opp['sell_ex']}"
