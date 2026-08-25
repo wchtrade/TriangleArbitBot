@@ -6184,6 +6184,11 @@ async def periodic_rebalance_loop(session):
             continue
         try:
             if not config["simulation_mode"] and not config["paused"]:
+                # НОВОЕ 25.08: та же защита, что и у watchdog/profit_lock —
+                # этот цикл тоже реально двигает баланс, пусть и редко (раз
+                # в несколько часов).
+                async with _capital_measurement_lock:
+                    pass
                 logger.info(f"Периодический ребаланс (раз в {hours}ч): запускаю...")
                 rb_result = await real_auto_rebalance_all(session)
                 if CHAT_ID and (rb_result.get("applied") or rb_result.get("cross_exchange_needed")):
@@ -6474,6 +6479,16 @@ async def profit_lock_loop(session):
     while True:
         try:
             if not config["simulation_mode"] and not config["paused"]:
+                # НОВОЕ 25.08 (по прямому запросу пользователя, продолжение
+                # находки про reserve_watchdog_loop): profit_lock_loop —
+                # ТОЖЕ фоновый цикл, реально двигающий баланс (продажа
+                # излишка монеты) каждые 5 минут — тот же риск искажения
+                # факт-результата параллельной сделки, что и у watchdog.
+                # Разрыв $0.0468 остался ПОСЛЕ защиты watchdog — значит,
+                # либо сработал именно этот цикл, либо оба. Применяем ту
+                # же защиту.
+                async with _capital_measurement_lock:
+                    pass
                 all_actions = []
                 for ex in ["Binance", "KuCoin", "HTX", "MEXC"]:
                     if ex == "MEXC" and not MEXC_KEY:
@@ -6589,6 +6604,11 @@ async def profit_target_lock_loop(session):
                 if real:
                     pnl = real["total"] - config["real_start_capital"]
                     if pnl >= target:
+                        # НОВОЕ 25.08: та же защита — этот цикл тоже реально
+                        # продаёт монету при срабатывании, ждём, если сейчас
+                        # идёт замер факта другой сделки.
+                        async with _capital_measurement_lock:
+                            pass
                         if CHAT_ID:
                             await send_tg(session,
                                 f"🎯 *Достигнут целевой плюс {target} USDT* "
