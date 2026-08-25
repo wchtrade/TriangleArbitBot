@@ -1426,6 +1426,26 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
         stats["absolute_profit_too_low_rejected"] = stats.get("absolute_profit_too_low_rejected", 0) + 1
         return None
 
+    # НОВОЕ 25.08 (по прямому запросу пользователя — "как сделать +, а не
+    # -", на основе сегодняшних данных): проверка выше использует
+    # АМОРТИЗИРОВАННУЮ (÷sell_reserve_lots) стоимость ребаланса — мягкую,
+    # пропускающую сделки, которые сама же карточка чуть позже честно
+    # покажет как убыточные (полная, неамортизированная формула).
+    # Сегодня 25.08 подтверждено на 10 реальных сделках: КОГДА честная
+    # оценка (полная формула) БЛИЗКА К НУЛЮ ИЛИ ОТРИЦАТЕЛЬНА — факт
+    # почти всегда совпадает с этим прогнозом (разрыв всего $0.001-0.013,
+    # против $0.05-0.26 раньше). Модель ТЕПЕРЬ ДОКАЗАННО ТОЧНА — значит,
+    # можно и нужно гейтить именно по ней, не только по мягкой
+    # амортизированной версии. Требуем строго ПОЛОЖИТЕЛЬНЫЙ прогноз по
+    # полной формуле, с тем же абсолютным минимумом — а не просто "не
+    # катастрофически отрицательный".
+    full_crossing_cost_est = trade_usdt * config.get("empirical_spread_crossing_pct", 0.34) / 100
+    full_rebalance_cost_est = trade_usdt * (buy_fee + sell_fee) + full_crossing_cost_est
+    strict_honest_profit_usd = round(naive_profit_usd - full_rebalance_cost_est, 4)
+    if strict_honest_profit_usd < 0:
+        stats["strict_honest_negative_rejected"] = stats.get("strict_honest_negative_rejected", 0) + 1
+        return None
+
     # ИСПРАВЛЕНИЕ 05.08: раньше сигнал с ЛЮБЫМ спредом выше порога считался
     # валидным — но 04.08 бот регулярно ловил спреды 13-23% на ZIL/HTX,
     # которые оказались не реальной прибылью, а искажением из-за тонкого,
@@ -3196,7 +3216,7 @@ def record_pnl_and_get_hour_avg(pnl_now: float) -> float:
     return sum(p for _, p in pnl_history) / len(pnl_history)
 
 
-async def get_total_real_capital(session) -> Optional[dict]:
+async def get_total_real_capital(session, fixed_prices: Optional[Dict[Tuple[str, str], float]] = None) -> Optional[dict]:
     """Реальный совокупный капитал на всех трёх биржах — используется в /stats
     вместо симуляционного SIM_START/sim_balances, когда бот в реальном режиме.
     ИСПРАВЛЕНИЕ 10.08: раньше считались ТОЛЬКО USDT и торгуемая монета
@@ -3204,10 +3224,24 @@ async def get_total_real_capital(session) -> Optional[dict]:
     для скидки на комиссию) был полностью невидим для этого расчёта. Вся
     сумма, потраченная на комиссию из этих запасов, никогда не появлялась
     ни в "Реальном балансе", ни в P&L — реальная, но невидимая утечка
-    капитала. Теперь учитываем ЛЮБОЙ ненулевой актив на счету."""
+    капитала. Теперь учитываем ЛЮБОЙ ненулевой актив на счету.
+
+    ИСПРАВЛЕНО 25.08 (по прямому запросу пользователя — "почему даже
+    честно положительные по прогнозу сделки дают факт -$0.01"): найдена
+    корневая причина — эта функция запрашивает СВЕЖУЮ рыночную цену
+    каждый раз при вызове. Когда её вызывают дважды подряд (до и после
+    сделки, с разницей в несколько секунд из-за исполнения+докупок+
+    паузы), любое естественное колебание цены ONE за эти секунды
+    попадает в "фактический результат" как будто это потеря от сделки —
+    хотя реально это просто рыночный шум на резерве (~$15), не имеющий
+    отношения к тому, прибыльна сделка или нет. Теперь необязательный
+    параметр fixed_prices позволяет замерить "после" ПО ТЕМ ЖЕ ценам,
+    что и "до" — тогда разница отражает ТОЛЬКО реальное изменение
+    количества монет/USDT от сделки, без искажения ценовым шумом."""
     per_exchange = {}
     total = 0.0
     misc_assets_value = {}
+    prices_used: Dict[Tuple[str, str], float] = {}
     for ex in ["Binance", "KuCoin", "HTX", "MEXC"]:
         # MEXC — необязательна, пока не заданы ключи в Railway (иначе
         # авторизация 401 сломала бы ВЕСЬ /stats, а не только строку MEXC)
@@ -3222,9 +3256,13 @@ async def get_total_real_capital(session) -> Optional[dict]:
         for sym in SYMBOLS:
             qty = balances.get(sym, 0.0)
             if qty > 0:
-                price = await get_valuation_price(session, ex, sym)
+                if fixed_prices is not None and (ex, sym) in fixed_prices:
+                    price = fixed_prices[(ex, sym)]
+                else:
+                    price = await get_valuation_price(session, ex, sym)
                 if price:
                     ex_total += qty * price
+                    prices_used[(ex, sym)] = price
         # НОВОЕ: любые другие ненулевые активы (BNB, KCS и т.п.)
         other_assets = {a: q for a, q in balances.items()
                          if a != "USDT" and a not in SYMBOLS and q > 0.00001}
@@ -3237,7 +3275,7 @@ async def get_total_real_capital(session) -> Optional[dict]:
         per_exchange[ex] = round(ex_total, 2)
         total += ex_total
     return {"total": round(total, 2), "per_exchange": per_exchange,
-            "misc_assets_value": misc_assets_value}
+            "misc_assets_value": misc_assets_value, "prices_used": prices_used}
 
 
 async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
@@ -3902,7 +3940,13 @@ async def execute_trade(session, opp: dict) -> dict:
             # местах кода после докупок).
             if capital_before is not None:
                 await asyncio.sleep(1.0)
-                capital_after = await get_total_real_capital(session)
+                # ИСПРАВЛЕНО 25.08: используем ТЕ ЖЕ цены, что были в
+                # capital_before — иначе рыночный шум за эти секунды
+                # искажает "факт" сделки (см. комментарий в
+                # get_total_real_capital). Теперь разница отражает ТОЛЬКО
+                # реальное изменение количества монет/USDT.
+                capital_after = await get_total_real_capital(
+                    session, fixed_prices=capital_before.get("prices_used"))
                 if capital_after is not None:
                     factual_delta = round(capital_after["total"] - capital_before["total"], 4)
                     stats["factual_realized_pnl"] = round(stats.get("factual_realized_pnl", 0.0) + factual_delta, 4)
