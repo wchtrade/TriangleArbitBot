@@ -484,6 +484,18 @@ _last_real_sell_price: Dict[Tuple[str, str], float] = {}
 # реальный, измеримый убыток сверх комиссии.
 _last_real_buy_price: Dict[Tuple[str, str], float] = {}
 
+# НОВОЕ 25.08 (по прямому запросу пользователя, найдено по логам Railway
+# с точными временными метками): reserve_watchdog_loop — ФОНОВЫЙ цикл,
+# который может сработать В ЛЮБОЙ момент, независимо от того, идёт ли
+# прямо сейчас замер факта конкретной сделки (capital_before → sleep(1) →
+# capital_after). Если watchdog купит/продаст монету ИМЕННО в эти
+# секунды — эта реальная, но НЕ относящаяся к сделке операция попадает в
+# "факт" этой сделки, искажая его (подтверждено логами: watchdog сделал
+# докупку+продажу на $10 суммарно за 1 секунду, между двумя обычными
+# сканами). Lock гарантирует: пока идёт замер факта сделки, watchdog
+# ждёт своей очереди, а не работает параллельно.
+_capital_measurement_lock = asyncio.Lock()
+
 
 def _remember_error(ex: str, detail) -> None:
     text = str(detail)
@@ -3859,6 +3871,15 @@ async def execute_trade(session, opp: dict) -> dict:
         # мгновенно, до знания об исполнении) — дополняет её вторым,
         # безусловно точным числом чуть позже.
         capital_before = await get_total_real_capital(session)
+        # НОВОЕ 25.08 (по прямому запросу пользователя, найдено по логам
+        # Railway с точными метками времени): захватываем lock СРАЗУ после
+        # capital_before — до самого исполнения и до snapshot "после".
+        # Это гарантирует, что reserve_watchdog_loop (см. его код) не
+        # сможет выполнить параллельную докупку/продажу именно в эти
+        # секунды, искажая факт-результат ЭТОЙ сделки чужой операцией.
+        # Освобождается ниже — либо после снимка "после" (успех), либо
+        # сразу же (неудача, снимок "после" не нужен).
+        await _capital_measurement_lock.acquire()
         real_result = await execute_real_arbitrage(session, opp)
         # НОВОЕ 10.08 (раунд 2): раньше диагностика шла только в Railway-логи
         # (logger.info) — тишина в Telegram при этом сохранялась, а до
@@ -3938,16 +3959,24 @@ async def execute_trade(session, opp: dict) -> dict:
             # Небольшая задержка перед снимком "после" — даём биржам полностью
             # отразить исполнение на балансе (та же логика, что и в других
             # местах кода после докупок).
-            if capital_before is not None:
-                await asyncio.sleep(1.0)
-                # ИСПРАВЛЕНО 25.08: используем ТЕ ЖЕ цены, что были в
-                # capital_before — иначе рыночный шум за эти секунды
-                # искажает "факт" сделки (см. комментарий в
-                # get_total_real_capital). Теперь разница отражает ТОЛЬКО
-                # реальное изменение количества монет/USDT.
-                capital_after = await get_total_real_capital(
-                    session, fixed_prices=capital_before.get("prices_used"))
-                if capital_after is not None:
+            try:
+                capital_after = None
+                if capital_before is not None:
+                    await asyncio.sleep(1.0)
+                    # ИСПРАВЛЕНО 25.08: используем ТЕ ЖЕ цены, что были в
+                    # capital_before — иначе рыночный шум за эти секунды
+                    # искажает "факт" сделки (см. комментарий в
+                    # get_total_real_capital). Теперь разница отражает ТОЛЬКО
+                    # реальное изменение количества монет/USDT.
+                    capital_after = await get_total_real_capital(
+                        session, fixed_prices=capital_before.get("prices_used"))
+            finally:
+                # НОВОЕ 25.08: освобождаем lock ЗДЕСЬ — после снимка "после",
+                # что бы ни случилось внутри (даже исключение) — иначе
+                # watchdog навсегда останется заблокирован при ошибке.
+                if _capital_measurement_lock.locked():
+                    _capital_measurement_lock.release()
+            if capital_after is not None:
                     factual_delta = round(capital_after["total"] - capital_before["total"], 4)
                     stats["factual_realized_pnl"] = round(stats.get("factual_realized_pnl", 0.0) + factual_delta, 4)
                     stats["factual_trades_count"] = stats.get("factual_trades_count", 0) + 1
@@ -4010,6 +4039,12 @@ async def execute_trade(session, opp: dict) -> dict:
                             f"разница `{round(factual_delta - pretrade_card_estimate, 4):+.4f}`)"
                             f"{cost_source_note}")
         if not real_result.get("success"):
+            # НОВОЕ 25.08: если сделка не удалась — снимок "после" не нужен,
+            # но lock ВСЁ РАВНО был захвачен выше и должен быть освобождён
+            # здесь, иначе watchdog навсегда останется заблокирован после
+            # любой неудачной попытки сделки.
+            if _capital_measurement_lock.locked():
+                _capital_measurement_lock.release()
             logger.error(f"РЕАЛЬНАЯ сделка не удалась: {real_result}")
             error = real_result.get("error", "")
             # ИСПРАВЛЕНИЕ 04.08 (раунд 5): добавлена проверка "insufficient_usdt_on_"
@@ -6200,6 +6235,18 @@ async def reserve_watchdog_loop(session):
         interval = config.get("reserve_watchdog_interval_sec", 90)
         try:
             if not config["simulation_mode"]:
+                # НОВОЕ 25.08 (по прямому запросу пользователя, найдено по
+                # логам с точными метками времени): раньше watchdog мог
+                # сработать В ЛЮБОЙ момент, включая ровно те секунды, пока
+                # идёт замер факта конкретной сделки (capital_before →
+                # capital_after) — подтверждено логами: watchdog выполнил
+                # реальную докупку+продажу на $10 за 1 секунду, попав прямо
+                # в окно замера чужой сделки и исказив её факт-результат.
+                # Теперь watchdog СНАЧАЛА получает и сразу отпускает lock —
+                # если сделка сейчас в процессе замера, watchdog подождёт её
+                # завершения, а не будет работать параллельно.
+                async with _capital_measurement_lock:
+                    pass
                 for sym in list(SYMBOLS):
                     for buy_ex, sell_ex in pairs_for_symbol(sym):
                         # --- Резерв МОНЕТЫ на бирже ПРОДАЖИ (как раньше) ---
