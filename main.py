@@ -3918,8 +3918,25 @@ async def execute_trade(session, opp: dict) -> dict:
             # карточка попросту не учитывала расширение спреда при волатильном
             # рынке). Теперь явно добавляем настраиваемую оценку пересечения
             # спреда (/setcrossingcost) поверх комиссий.
-            spread_crossing_est = opp["vol"] * config.get("empirical_spread_crossing_pct", 0.34) / 100
-            fees_only = opp["vol"] * (FEES.get(opp["buy_ex"], 0.1) + FEES.get(opp["sell_ex"], 0.1)) / 100
+            # НОВОЕ 26.08 (по прямому запросу пользователя, найдено во время
+            # теста с лотом $10): раньше spread_crossing_est/fees_only и
+            # opp["profit_usdt"] использовались как есть — рассчитанные под
+            # ИСХОДНО ЗАПРОШЕННЫЙ лот (opp["vol"]). Но если сделка реально
+            # исполнилась на МЕНЬШЕМ объёме (например, из-за нехватки USDT
+            # на бирже — "Уменьшаю объём сделки" в логах), реальный объём
+            # (real_result["vol"]) может ОТЛИЧАТЬСЯ от исходного в разы.
+            # Найдено: лот $10 запрошен, реально исполнилось только $2.83 —
+            # карточка показала оценку прибыли ДЛЯ $10 ($0.4547), хотя
+            # реально торговалось $2.83, отсюда рекордный разрыв $0.1007,
+            # не имеющий отношения к рынку/докупкам/задержкам — чистая
+            # ошибка расчёта объёма. Теперь масштабируем оценку под
+            # РЕАЛЬНО исполненный объём.
+            actual_vol = real_result.get("vol") or opp["vol"]
+            vol_ratio = actual_vol / opp["vol"] if opp["vol"] else 1.0
+            actual_profit_usdt = round(opp["profit_usdt"] * vol_ratio, 4)
+
+            spread_crossing_est = actual_vol * config.get("empirical_spread_crossing_pct", 0.34) / 100
+            fees_only = actual_vol * (FEES.get(opp["buy_ex"], 0.1) + FEES.get(opp["sell_ex"], 0.1)) / 100
 
             # НОВОЕ 25.08 (по прямому запросу пользователя — "почему оценка
             # не пересчитывается под конкретную докупку"): если в ЭТОМ
@@ -3936,11 +3953,15 @@ async def execute_trade(session, opp: dict) -> dict:
             # что уже была отправлена пользователю в карточке ДО сделки —
             # она НЕ меняется задним числом, иначе строка "оценка в
             # карточке была: X" станет враньём (покажет не то число, что
-            # реально видел пользователь в предыдущем сообщении).
-            # honest_cycle_profit — ОТДЕЛЬНОЕ, более точное число для
-            # внутренней бухгалтерии (stats["realized_trading_pnl"]),
-            # использующее реальные данные о докупке, когда они есть.
-            pretrade_card_estimate = round(opp["profit_usdt"] - round(fees_only + spread_crossing_est, 4), 4)
+            # реально видел пользователь в предыдущем сообщении). Однако
+            # если объём реально изменился (vol_ratio != 1.0) — честно
+            # показываем ЭТОТ факт отдельной пометкой, а не молчим о нём.
+            pretrade_card_estimate = round(actual_profit_usdt - round(fees_only + spread_crossing_est, 4), 4)
+            vol_shrink_note = ""
+            if abs(vol_ratio - 1.0) > 0.01:
+                vol_shrink_note = (f"\n⚠️ Объём сделки изменился при исполнении: запрошено "
+                                     f"${opp['vol']:.2f} → реально ${actual_vol:.2f} "
+                                     f"(нехватка баланса) — оценка пересчитана под реальный объём.")
 
             real_topup_cost_this_cycle = real_result.get("real_topup_cost_usdt", 0.0)
             if real_topup_cost_this_cycle != 0.0:
@@ -3949,7 +3970,7 @@ async def execute_trade(session, opp: dict) -> dict:
             else:
                 rebalance_cost_est = round(fees_only + spread_crossing_est, 4)
                 cost_source_note = ""
-            honest_cycle_profit = round(opp["profit_usdt"] - rebalance_cost_est, 4)
+            honest_cycle_profit = round(actual_profit_usdt - rebalance_cost_est, 4)
             stats["realized_trading_pnl"] = round(stats.get("realized_trading_pnl", 0.0) + honest_cycle_profit, 4)
             stats["realized_trades_count"] = stats.get("realized_trades_count", 0) + 1
 
@@ -4045,7 +4066,7 @@ async def execute_trade(session, opp: dict) -> dict:
                             f"   Фактически: `{factual_delta:+.4f} USDT`\n"
                             f"   (оценка в карточке была: `{pretrade_card_estimate:+.4f}` — "
                             f"разница `{round(factual_delta - pretrade_card_estimate, 4):+.4f}`)"
-                            f"{cost_source_note}")
+                            f"{cost_source_note}{vol_shrink_note}")
         if not real_result.get("success"):
             # НОВОЕ 25.08: если сделка не удалась — снимок "после" не нужен,
             # но lock ВСЁ РАВНО был захвачен выше и должен быть освобождён
