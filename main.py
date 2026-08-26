@@ -484,6 +484,10 @@ _last_real_sell_price: Dict[Tuple[str, str], float] = {}
 # реальный, измеримый убыток сверх комиссии.
 _last_real_buy_price: Dict[Tuple[str, str], float] = {}
 
+# НОВОЕ 26.08 (СРОЧНО): cooldown для уведомлений о неудачной докупке USDT —
+# не спамить одной и той же ошибкой в Telegram каждые несколько секунд.
+_last_topup_failure_notification: Dict[Tuple[str, str], float] = {}
+
 # НОВОЕ 25.08 (по прямому запросу пользователя, найдено по логам Railway
 # с точными временными метками): reserve_watchdog_loop — ФОНОВЫЙ цикл,
 # который может сработать В ЛЮБОЙ момент, независимо от того, идёт ли
@@ -2367,6 +2371,26 @@ async def top_up_usdt_via_coin_sale(session, ex: str, symbol: str, usdt_needed: 
                          f"под правила биржи количество получилось нулевым")
         return False
 
+    # НОВОЕ 26.08 (СРОЧНО, по прямому запросу пользователя — бот "крутил"
+    # одну и ту же ошибку по кругу): раньше здесь не было проверки
+    # МИНИМАЛЬНОГО объёма ордера биржи ДО попытки — функция каждый раз
+    # заново пыталась продать один и тот же слишком маленький остаток
+    # (например, 75 ONE ≈ $0.05, при минимуме KuCoin $0.1), получала
+    # гарантированный отказ, и пыталась снова на следующем цикле — без
+    # каких-либо шансов на успех, просто зря тратя время и засоряя логи.
+    # Теперь проверяем МИНИМУМ биржи заранее и, если сумма заведомо мала,
+    # сразу отказываемся — БЕЗ повторных бесполезных попыток и БЕЗ спама
+    # одинаковых ошибок.
+    estimated_value = coin_to_sell * price_hint
+    exchange_min = MIN_ORDER_VALUE_USD.get(ex, 1.0)
+    if estimated_value < exchange_min:
+        logger.warning(f"⛔ Автодокупка USDT на {ex}/{symbol} пропущена: остаток монеты "
+                         f"({coin_to_sell} {symbol} ≈ ${estimated_value:.4f}) меньше "
+                         f"минимума ордера биржи (${exchange_min}) — продать физически "
+                         f"невозможно. Нужна ручная докупка монеты на {ex} (даже $1-2), "
+                         f"чтобы поднять остаток выше минимума.")
+        return False
+
     # ПРОВЕРКА КУРСА (пункт 4): берём самую свежую цену прямо перед продажей,
     # не полагаемся на price_hint, который мог устареть за секунды ожидания
     fresh_ob = None
@@ -2442,12 +2466,22 @@ async def top_up_usdt_via_coin_sale(session, ex: str, symbol: str, usdt_needed: 
     logger.error(f"❌ Автодокупка USDT на {ex}/{symbol} не удалась: ордер на продажу "
                   f"{coin_to_sell} {symbol} отклонён биржей "
                   f"({_last_exchange_error.get(ex) or 'нет деталей'})")
-    if CHAT_ID:
+    # НОВОЕ 26.08 (СРОЧНО, по прямому запросу пользователя — бот "крутил"
+    # одну и ту же ошибку в Telegram каждые несколько секунд): даже для
+    # причин отказа ДРУГИХ, чем минимальный объём (которые теперь
+    # отсекаются раньше и вообще не доходят сюда), добавляем cooldown —
+    # не чаще одного уведомления в 5 минут на одну и ту же биржу+монету.
+    cooldown_key = (ex, symbol)
+    now_ts = time.time()
+    last_notified = _last_topup_failure_notification.get(cooldown_key, 0)
+    if CHAT_ID and (now_ts - last_notified > 300):
+        _last_topup_failure_notification[cooldown_key] = now_ts
         await send_tg(session,
             f"❌ *Автодокупка USDT не удалась*: пытался продать {coin_to_sell} {symbol} "
             f"на {ex}, биржа отклонила ордер "
             f"({_last_exchange_error.get(ex) or 'нет деталей'}). "
-            f"Нужен ручной /rebalance или перевод на {ex}.")
+            f"Нужен ручной /rebalance или перевод на {ex}. "
+            f"(дальнейшие повторы этой же ошибки не чаще раза в 5 мин)")
     return False
 
 
