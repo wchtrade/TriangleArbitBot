@@ -5350,6 +5350,38 @@ async def handle_command(session, text, chat_id):
         except ValueError:
             await send_tg(session, "❌ Пример: `/setfactualdelay 2.5`")
 
+    elif cmd == "/haltwatchdog":
+        # НОВОЕ 26.08 (СРОЧНО, по прямому запросу пользователя): полная,
+        # независимая от /pause остановка reserve_watchdog_loop — нужна,
+        # когда пользователь вручную докупает/переводит монету на бирже,
+        # а watchdog (специально работающий даже во время /pause) тут же
+        # продаёт эту докупку обратно, не давая ручному вмешательству
+        # закрепиться. /pause останавливает ТОРГОВЛЮ, эта команда
+        # останавливает ПОДГОТОВКУ РЕЗЕРВА — разные вещи, разные команды.
+        if len(parts) < 2:
+            cur = config.get("watchdog_fully_halted", False)
+            await send_tg(session,
+                f"Текущий статус watchdog: {'🛑 ПОЛНОСТЬЮ ОСТАНОВЛЕН' if cur else '✅ работает как обычно'}\n\n"
+                f"Используй `/haltwatchdog on`, когда вручную докупаешь/переводишь "
+                f"монету на бирже и не хочешь, чтобы watchdog тут же её продал "
+                f"обратно. Не забудь `/haltwatchdog off`, когда закончишь — "
+                f"иначе резерв перестанет пополняться перед сделками.\n\n"
+                f"Пример: `/haltwatchdog on` или `/haltwatchdog off`"
+            )
+            return
+        val = parts[1].lower()
+        if val in ("on", "1", "true", "вкл"):
+            config["watchdog_fully_halted"] = True
+            await send_tg(session, "🛑 Watchdog ПОЛНОСТЬЮ остановлен — можно спокойно "
+                                     "докупать/переводить монету вручную, ничего не "
+                                     "будет продано автоматически. Не забудь "
+                                     "`/haltwatchdog off`, когда закончишь.")
+        elif val in ("off", "0", "false", "выкл"):
+            config["watchdog_fully_halted"] = False
+            await send_tg(session, "✅ Watchdog снова работает в обычном режиме.")
+        else:
+            await send_tg(session, "❌ Пример: `/haltwatchdog on` или `/haltwatchdog off`")
+
     elif cmd == "/testhfbalance":
         # НОВОЕ 18.08: БЕЗОПАСНАЯ диагностическая команда — только ЧИТАЕТ
         # баланс trade_hf аккаунта на KuCoin, НИЧЕГО не меняет и не
@@ -6295,7 +6327,18 @@ async def reserve_watchdog_loop(session):
     while True:
         interval = config.get("reserve_watchdog_interval_sec", 90)
         try:
-            if not config["simulation_mode"]:
+            # ИСПРАВЛЕНО 26.08 (СРОЧНО, по прямому запросу пользователя):
+            # найдена прямая причина конфликта — watchdog специально
+            # работает НЕЗАВИСИМО от /pause (это было сознательное решение
+            # 18.08 — чтобы готовить резерв ДО старта торговли). Но это же
+            # означает: пока пользователь вручную докупает монету на бирже
+            # во время паузы, watchdog может почти сразу продать её
+            # обратно, если видит нехватку USDT — ручное вмешательство
+            # никогда не успевает закрепиться. Теперь есть ОТДЕЛЬНЫЙ флаг
+            # config["watchdog_fully_halted"] — включается командой
+            # /haltwatchdog, полностью останавливает ЭТОТ цикл (не только
+            # торговлю), пока пользователь не закончит ручные операции.
+            if not config["simulation_mode"] and not config.get("watchdog_fully_halted", False):
                 # НОВОЕ 25.08 (по прямому запросу пользователя, найдено по
                 # логам с точными метками времени): раньше watchdog мог
                 # сработать В ЛЮБОЙ момент, включая ровно те секунды, пока
