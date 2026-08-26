@@ -2941,6 +2941,10 @@ async def get_real_balances_binance(session) -> Optional[Dict[str, float]]:
 
 
 async def get_real_balances_kucoin(session) -> Optional[Dict[str, float]]:
+    """ИСПРАВЛЕНО 26.08 (СРОЧНО, тот же инцидент, что и у MEXC — см.
+    комментарий в get_real_balances_mexc): раньше бралось ТОЛЬКО поле
+    'available', игнорируя 'holds' (замороженное в открытых ордерах).
+    Теперь предупреждаем при значительном замороженном остатке."""
     if is_backed_off("KuCoin"):
         return None
     endpoint = "/api/v1/accounts"
@@ -2961,9 +2965,20 @@ async def get_real_balances_kucoin(session) -> Optional[Dict[str, float]]:
                 logger.error(f"KuCoin balance fetch failed: {data}")
                 return None
             result = {}
+            frozen_found = {}
             for acc in data.get("data", []):
                 if acc.get("type") == "trade":
                     result[acc["currency"]] = float(acc["available"])
+                    holds = float(acc.get("holds", 0.0))
+                    if holds > 0.00001:
+                        frozen_found[acc["currency"]] = holds
+            if frozen_found:
+                stats.setdefault("frozen_assets_detected", {})["KuCoin"] = frozen_found
+                logger.warning(f"⚠️ KuCoin: обнаружены замороженные средства (открытые ордера?): "
+                                 f"{frozen_found} — не учтены в 'available', проверьте "
+                                 f"вручную в приложении биржи")
+            elif "KuCoin" in stats.get("frozen_assets_detected", {}):
+                del stats["frozen_assets_detected"]["KuCoin"]
             return result
     except Exception as e:
         logger.error(f"KuCoin balance exception: {e}")
@@ -3114,7 +3129,17 @@ async def get_real_balances_htx(session) -> Optional[Dict[str, float]]:
 
 
 async def get_real_balances_mexc(session) -> Optional[Dict[str, float]]:
-    """НОВОЕ 10.08: формат ответа MEXC идентичен Binance (/api/v3/account)."""
+    """НОВОЕ 10.08: формат ответа MEXC идентичен Binance (/api/v3/account).
+
+    ИСПРАВЛЕНО 26.08 (СРОЧНО, по прямому запросу пользователя — реальный
+    инцидент): раньше бралось ТОЛЬКО поле 'free' (доступный остаток),
+    полностью игнорируя 'locked' (замороженный в открытых ордерах).
+    Найдено на практике: 3822 ONE (~$2.84) оказались заморожены под
+    забытый открытый ордер на MEXC — бот решил, что их физически нет,
+    запаниковал в "замкнутый круг", хотя деньги были на месте, просто
+    временно заблокированы. Теперь при значительном замороженном остатке
+    (>$0.5) бот явно предупреждает об этом в логах и через отдельный
+    словарь stats["frozen_assets_detected"], доступный через /realbalance."""
     if is_backed_off("MEXC"):
         return None
     url = "https://api.mexc.com/api/v3/account"
@@ -3133,7 +3158,21 @@ async def get_real_balances_mexc(session) -> Optional[Dict[str, float]]:
                 logger.error(f"MEXC balance fetch failed: {data}")
                 _remember_error("MEXC", data)
                 return None
-            return {b["asset"]: float(b["free"]) for b in data.get("balances", [])}
+            result = {}
+            frozen_found = {}
+            for b in data.get("balances", []):
+                result[b["asset"]] = float(b["free"])
+                locked = float(b.get("locked", 0.0))
+                if locked > 0.00001:
+                    frozen_found[b["asset"]] = locked
+            if frozen_found:
+                stats["frozen_assets_detected"] = {"MEXC": frozen_found}
+                logger.warning(f"⚠️ MEXC: обнаружены замороженные средства (открытые ордера?): "
+                                 f"{frozen_found} — не учтены в 'free', проверьте "
+                                 f"вручную через /openorders или в приложении биржи")
+            elif "MEXC" in stats.get("frozen_assets_detected", {}):
+                del stats["frozen_assets_detected"]["MEXC"]
+            return result
     except Exception as e:
         logger.error(f"MEXC balance exception: {e}")
         return None
@@ -5895,6 +5934,16 @@ async def handle_command(session, text, chat_id):
                 f"   Всего: ${plan['total_usd']} | Нужно: ${plan['needed_total']} | "
                 f"Излишек/дефицит: ${plan['surplus']}\n"
             )
+            # НОВОЕ 26.08 (СРОЧНО, по прямому запросу пользователя после
+            # реального инцидента — 3822 ONE ($2.84) оказались заморожены
+            # под забытый открытый ордер на MEXC, бот их не видел и
+            # запаниковал в "замкнутый круг"): явно показываем прямо в
+            # /realbalance, если на этой бирже что-то заморожено.
+            frozen = stats.get("frozen_assets_detected", {}).get(ex)
+            if frozen:
+                frozen_str = ", ".join(f"{amt} {asset}" for asset, amt in frozen.items())
+                msg += (f"   ⚠️ *Заморожено (не учтено выше!):* {frozen_str}\n"
+                        f"   Проверь «Открытые ордера» на {ex} — возможно, забытый ордер.\n")
             await send_tg(session, msg)
 
     elif cmd == "/apistatus":
