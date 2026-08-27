@@ -1852,6 +1852,40 @@ async def wait_for_mexc_fill(session, symbol: str, order_id, timeout: float = 3.
     return None
 
 
+async def confirm_mexc_ioc_executed_qty(session, symbol: str, order_id) -> float:
+    """НОВОЕ 27.08 (СРОЧНО, по прямому запросу пользователя — найдено по
+    сырому ответу биржи: MEXC НЕ включает поле 'executedQty' в ответ на
+    само РАЗМЕЩЕНИЕ ордера — только orderId/price/origQty. Код 2 дня
+    проверял 'executedQty' из ЭТОГО ответа, где его физически нет —
+    получал 0 по умолчанию ВСЕГДА, независимо от реального исполнения.
+    Это могло означать, что часть/все "неудачные" IOC-продажи на самом
+    деле УСПЕШНО исполнялись, а бот ошибочно считал их провалом и запускал
+    ненужное аварийное закрытие, удваивая издержки.
+
+    Эта функция делает ОТДЕЛЬНЫЙ запрос статуса ордера (как уже сделано
+    для покупки) — и, В ОТЛИЧИЕ от wait_for_mexc_fill (которая возвращает
+    None при статусе CANCELED, даже если было частичное исполнение),
+    здесь возвращаем executedQty ВСЕГДА, включая случай, когда IOC
+    частично исполнился и остаток был отменён (статус CANCELED, но
+    executedQty > 0) — именно так обычно и работают IOC-ордера."""
+    ts = int(time.time() * 1000)
+    params = {"symbol": f"{symbol}{QUOTE}", "orderId": order_id, "timestamp": ts, "recvWindow": 5000}
+    params["signature"] = sign_binance(params, MEXC_SECRET)
+    headers = {"X-MEXC-APIKEY": MEXC_KEY, "Content-Type": "application/json"}
+    try:
+        async with session.get("https://api.mexc.com/api/v3/order", params=params,
+                                headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as r:
+            data = await r.json()
+            logger.info(f"🔍 MEXC order status check: {data}")
+            try:
+                return float(data.get("executedQty", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    except Exception as e:
+        logger.error(f"MEXC order status check exception: {e}")
+        return 0.0
+
+
 async def wait_for_kucoin_fill(session, order_id: str, timeout: float = 6.0) -> Optional[float]:
     # ИЗМЕНЕНО 22.08 (по факту логов реальных сделок): было 3.0 сек — этого
     # оказалось недостаточно для надёжного подтверждения статуса лимитных
@@ -3018,9 +3052,21 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
             # ложно-оптимистичную оценку. Это и есть точная причина
             # двухдневного разрыва между "оценка +$0.02-0.04" и "факт ~$0".
             if sell_result:
-                try:
-                    executed_qty = float(sell_result.get("executedQty", 0) or 0)
-                except (TypeError, ValueError):
+                # ИСПРАВЛЕНО 27.08 (СРОЧНО, критичная находка): раньше
+                # здесь читалось поле "executedQty" из ОТВЕТА НА РАЗМЕЩЕНИЕ
+                # ордера — но MEXC его туда НЕ включает (подтверждено
+                # сырым ответом: {'symbol':..., 'orderId':..., 'price':...,
+                # 'origQty':..., БЕЗ 'executedQty' и 'status'}). Значит,
+                # переменная всегда была 0 по умолчанию, а НЕ реальным
+                # результатом — часть/все "провалившиеся" продажи МОГЛИ
+                # реально исполниться, просто мы это неправильно проверяли
+                # и запускали ненужное аварийное закрытие. Теперь делаем
+                # ОТДЕЛЬНЫЙ запрос статуса ордера — единственный способ
+                # узнать правду.
+                order_id = sell_result.get("orderId")
+                if order_id:
+                    executed_qty = await confirm_mexc_ioc_executed_qty(session, symbol, order_id)
+                else:
                     executed_qty = 0.0
                 fill_ratio = (executed_qty / sell_qty) if sell_qty > 0 else 0.0
                 if fill_ratio < 0.95:
