@@ -2890,8 +2890,24 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
         sell_result = await place_order_binance(session, symbol, "SELL", sell_qty)
     elif sell_ex == "MEXC":
         if use_limit_ioc and opp.get("sell_price"):
+            # НОВОЕ 27.08 (по прямому запросу пользователя — "нужны
+            # прибыльные сделки", найдено по факту: 17 из 17 IOC-продаж
+            # сегодня исполнились <95% или вообще не исполнились): раньше
+            # лимитная цена продажи была ТОЧНО равна opp["sell_price"]
+            # (цена на момент сигнала) — без малейшего запаса. За время
+            # между сигналом и фактическим размещением ордера на продажу
+            # (после завершения покупки, подтверждения и т.д.) цена на
+            # MEXC успевает немного сдвинуться, и точный лимит почти
+            # никогда не встречает встречной заявки — IOC отменяется.
+            # Теперь допускаем небольшой запас (sell_limit_slippage_pct,
+            # по умолчанию 0.05%) — продаём чуть ХУЖЕ идеальной цены
+            # сигнала, но РЕАЛЬНО исполняем сделку, а не отменяем её
+            # почти всегда. Небольшая потеря маржи на каждой успешной
+            # сделке — цена за то, чтобы сделки вообще случались.
+            slippage_pct = config.get("sell_limit_slippage_pct", 0.05)
+            sell_limit_price = opp["sell_price"] * (1 - slippage_pct / 100)
             sell_result = await place_order_mexc_limit_ioc(
-                session, symbol, "SELL", opp["sell_price"], sell_qty)
+                session, symbol, "SELL", sell_limit_price, sell_qty)
             # ═══════════════════════════════════════════════════════════
             # ИСПРАВЛЕНО 26.08 (КРИТИЧНО, найдено после подробного разбора
             # всех сделок за 2 дня, по прямому запросу пользователя "какая
@@ -5363,6 +5379,34 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Вес строгого гейта: {val}")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setstrictgateweight 0.5`")
+
+    elif cmd == "/setsellslippage":
+        # НОВОЕ 27.08 (по прямому запросу пользователя — "нужны прибыльные
+        # сделки", найдено по факту: 17 из 17 IOC-продаж не исполнились
+        # сегодня): допустимый запас на лимитной цене продажи на MEXC —
+        # чем больше, тем выше шанс реального исполнения, но тем меньше
+        # маржа на успешных сделках.
+        if len(parts) < 2:
+            val = config.get("sell_limit_slippage_pct", 0.05)
+            await send_tg(session,
+                f"Текущий допустимый запас на цене продажи: {val}%\n\n"
+                f"Продаём чуть хуже идеальной цены сигнала, чтобы реально "
+                f"исполнить сделку, а не почти всегда отменять IOC-ордер.\n\n"
+                f"0.05% (по умолчанию) — минимальный запас\n"
+                f"0.1-0.2% — заметно выше шанс исполнения, но и больше "
+                f"потеря маржи на каждой успешной сделке\n\n"
+                f"Пример: `/setsellslippage 0.1`"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0 or val > 2:
+                await send_tg(session, "❌ Разумный диапазон: 0-2%.")
+                return
+            config["sell_limit_slippage_pct"] = val
+            await send_tg(session, f"✅ Допустимый запас на продаже: {val}%")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setsellslippage 0.1`")
 
     elif cmd == "/seterosionweight":
         # НОВОЕ 23.08: доля процентного эрозийного буфера, остающаяся в
