@@ -2992,6 +2992,8 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
             sell_limit_price = opp["sell_price"] * (1 - slippage_pct / 100)
             sell_result = await place_order_mexc_limit_ioc(
                 session, symbol, "SELL", sell_limit_price, sell_qty)
+            logger.info(f"📤 MEXC sell IOC отправлен: цена={sell_limit_price}, "
+                         f"объём={sell_qty}, ответ биржи={sell_result}")
             # ═══════════════════════════════════════════════════════════
             # ИСПРАВЛЕНО 26.08 (КРИТИЧНО, найдено после подробного разбора
             # всех сделок за 2 дня, по прямому запросу пользователя "какая
@@ -3022,9 +3024,19 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
                     executed_qty = 0.0
                 fill_ratio = (executed_qty / sell_qty) if sell_qty > 0 else 0.0
                 if fill_ratio < 0.95:
+                    # ИСПРАВЛЕНО 27.08 (СРОЧНО, по прямому запросу
+                    # пользователя "давай работать", после 3 неудачных
+                    # попыток исправить вслепую): хватит гадать — теперь
+                    # показываем ПОЛНЫЙ сырой ответ биржи прямо в тексте
+                    # ошибки, видимом в Telegram. Раньше видели только
+                    # "executedQty" — не видели status, price, origQty и
+                    # другие поля, которые могли бы сразу объяснить
+                    # причину (REJECTED vs CANCELED, несовпадение цены,
+                    # неверный формат символа и т.п.).
+                    raw_response_str = str(sell_result)[:500]
                     error_detail = (f"IOC исполнился только на {fill_ratio*100:.1f}% "
                                       f"(запрошено {sell_qty}, реально продано {executed_qty} "
-                                      f"{symbol}) — цена ушла до размещения ордера на продажу")
+                                      f"{symbol}). Сырой ответ биржи: {raw_response_str}")
                     logger.error(
                         f"⚠️ КРИТИЧНО: лимитный IOC на продажу {symbol}/MEXC исполнился "
                         f"лишь частично/не исполнился: запрошено {sell_qty}, реально "
