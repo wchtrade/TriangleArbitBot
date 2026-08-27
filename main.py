@@ -1437,11 +1437,6 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
                                      / 100 / lots_for_cost)
     honest_pretrade_profit_usd = round(naive_profit_usd - amortized_rebalance_cost_est, 4)
 
-    min_abs = config.get("min_absolute_profit_usd", 0.15)
-    if honest_pretrade_profit_usd < min_abs:
-        stats["absolute_profit_too_low_rejected"] = stats.get("absolute_profit_too_low_rejected", 0) + 1
-        return None
-
     # НОВОЕ 25.08 (по прямому запросу пользователя — "как сделать +, а не
     # -", на основе сегодняшних данных): проверка выше использует
     # АМОРТИЗИРОВАННУЮ (÷sell_reserve_lots) стоимость ребаланса — мягкую,
@@ -1452,14 +1447,28 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
     # почти всегда совпадает с этим прогнозом (разрыв всего $0.001-0.013,
     # против $0.05-0.26 раньше). Модель ТЕПЕРЬ ДОКАЗАННО ТОЧНА — значит,
     # можно и нужно гейтить именно по ней, не только по мягкой
-    # амортизированной версии. Требуем строго ПОЛОЖИТЕЛЬНЫЙ прогноз по
-    # полной формуле, с тем же абсолютным минимумом — а не просто "не
-    # катастрофически отрицательный".
+    # амортизированной версии.
+    #
+    # ИСПРАВЛЕНО 27.08 (по прямому запросу пользователя — "хочу больше
+    # сделок"): раньше требование было ЖЁСТКО зашито как ">= 0" (полная,
+    # неамортизированная стоимость целиком) — это давало эффективный
+    # порог ~3.5%+ независимо от других настроек (min_absolute_profit_usd
+    # и т.п.), и пользователь не мог его смягчить без правки кода. Теперь
+    # это настраиваемая ДОЛЯ полной стоимости (strict_gate_cost_weight,
+    # по умолчанию 1.0 = как было). Например, 0.5 — требовать покрыть
+    # только половину полной стоимости, отдав вторую половину на волю
+    # абсолютного/процентного порога выше.
+    strict_gate_cost_weight = config.get("strict_gate_cost_weight", 1.0)
     full_crossing_cost_est = trade_usdt * config.get("empirical_spread_crossing_pct", 0.34) / 100
     full_rebalance_cost_est = trade_usdt * (buy_fee + sell_fee) + full_crossing_cost_est
-    strict_honest_profit_usd = round(naive_profit_usd - full_rebalance_cost_est, 4)
+    strict_honest_profit_usd = round(naive_profit_usd - full_rebalance_cost_est * strict_gate_cost_weight, 4)
     if strict_honest_profit_usd < 0:
         stats["strict_honest_negative_rejected"] = stats.get("strict_honest_negative_rejected", 0) + 1
+        return None
+
+    min_abs = config.get("min_absolute_profit_usd", 0.15)
+    if honest_pretrade_profit_usd < min_abs:
+        stats["absolute_profit_too_low_rejected"] = stats.get("absolute_profit_too_low_rejected", 0) + 1
         return None
 
     # ИСПРАВЛЕНИЕ 05.08: раньше сигнал с ЛЮБЫМ спредом выше порога считался
@@ -5321,6 +5330,39 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Абсолютный минимум прибыли: ${val}")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setminabsprofit 0.15`")
+
+    elif cmd == "/setstrictgateweight":
+        # НОВОЕ 27.08 (по прямому запросу пользователя — "хочу больше
+        # сделок"): доля ПОЛНОЙ (неамортизированной) стоимости ребаланса,
+        # которую требует строгий гейт (24.08). 1.0 = как было изначально
+        # (эффективный порог ~3.5%+ при текущем crossing_pct). Меньше —
+        # мягче, больше сделок, но и больше риск повторить прежние частые
+        # мелкие минусы, от которых этот гейт защищал.
+        if len(parts) < 2:
+            val = config.get("strict_gate_cost_weight", 1.0)
+            lot = config.get("max_real_order_usdt", 4.0)
+            crossing = config.get("empirical_spread_crossing_pct", 3.34)
+            full_cost = lot*0.002 + lot*crossing/100
+            required_pct = round(full_cost*val/lot*100, 2)
+            await send_tg(session,
+                f"Текущий вес строгого гейта: {val} (0.0-1.0)\n"
+                f"При текущих настройках это требует спред минимум ~{required_pct}%\n\n"
+                f"1.0 = полная защита (как было 24.08, ~3.5%+)\n"
+                f"0.5 = требовать покрыть половину полной стоимости\n"
+                f"0.0 = гейт выключен полностью (остаются только процентный "
+                f"и абсолютный доллар-фильтры)\n\n"
+                f"Пример: `/setstrictgateweight 0.5`"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0 or val > 1:
+                await send_tg(session, "❌ Диапазон: 0.0-1.0.")
+                return
+            config["strict_gate_cost_weight"] = val
+            await send_tg(session, f"✅ Вес строгого гейта: {val}")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setstrictgateweight 0.5`")
 
     elif cmd == "/seterosionweight":
         # НОВОЕ 23.08: доля процентного эрозийного буфера, остающаяся в
