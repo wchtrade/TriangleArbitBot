@@ -2938,6 +2938,9 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
                     executed_qty = 0.0
                 fill_ratio = (executed_qty / sell_qty) if sell_qty > 0 else 0.0
                 if fill_ratio < 0.95:
+                    error_detail = (f"IOC исполнился только на {fill_ratio*100:.1f}% "
+                                      f"(запрошено {sell_qty}, реально продано {executed_qty} "
+                                      f"{symbol}) — цена ушла до размещения ордера на продажу")
                     logger.error(
                         f"⚠️ КРИТИЧНО: лимитный IOC на продажу {symbol}/MEXC исполнился "
                         f"лишь частично/не исполнился: запрошено {sell_qty}, реально "
@@ -2945,6 +2948,16 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
                         f"ответила success, но монета осталась НЕПРОДАННОЙ (или продана "
                         f"частично) — раньше это ложно засчитывалось как полный успех."
                     )
+                    # ИСПРАВЛЕНО 27.08 (по прямому запросу пользователя,
+                    # найдено при разборе логов — сообщение об ошибке
+                    # показывало "нет деталей от биржи", хотя причина была
+                    # ИЗВЕСТНА самому коду): раньше здесь НЕ вызывался
+                    # _remember_error, из-за чего финальное сообщение об
+                    # ошибке ("sell_leg_failed_on_MEXC") не могло найти
+                    # причину и показывало пустое "нет деталей". Теперь
+                    # причина явно записывается и видна сразу в Telegram,
+                    # без необходимости искать логи Railway.
+                    _remember_error("MEXC", error_detail)
                     stats["sell_leg_partial_or_zero_fill"] = stats.get("sell_leg_partial_or_zero_fill", 0) + 1
                     # Считаем это НЕ прошедшей продажей — сработает штатное
                     # аварийное закрытие ниже (продаст купленное обратно на
