@@ -1677,6 +1677,58 @@ async def get_mexc_lot_step(session, symbol: str) -> float:
     return 1.0
 
 
+# НОВОЕ 27.08 (СРОЧНО, по прямому запросу пользователя — "давай работать",
+# после серии сделок с 0.0% исполнения IOC-продажи НЕЗАВИСИМО от размера
+# запаса на цене): найдена вероятная причина — цена для лимитного ордера
+# отправлялась БЕЗ округления под требования биржи (PRICE_FILTER/tickSize).
+# После умножения на коэффициент запаса (1±slippage%) плавающая точка
+# Python может дать цену с 10+ значащими цифрами — многие биржи ТИХО
+# отклоняют/обрезают такую цену, что может объяснять систематический
+# 0% fill независимо от размера самого запаса (проблема не в размере
+# запаса, а в формате самого числа).
+_mexc_tick_size_cache: Dict[str, float] = {}
+
+
+async def get_mexc_tick_size(session, symbol: str) -> float:
+    """Шаг цены (tickSize) для MEXC — сколько знаков после запятой реально
+    допустимо в цене ордера. Без этого биржа может тихо отклонять ордер
+    с "некрасивой" ценой (например, 0.00073731154...)."""
+    if symbol in _mexc_tick_size_cache:
+        return _mexc_tick_size_cache[symbol]
+    try:
+        async with session.get("https://api.mexc.com/api/v3/exchangeInfo",
+                                params={"symbol": f"{symbol}{QUOTE}"},
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            for s in data.get("symbols", []):
+                # MEXC может отдавать точность как quotePrecision (число
+                # знаков) ИЛИ как PRICE_FILTER.tickSize — проверяем оба.
+                for f in s.get("filters", []):
+                    if f.get("filterType") == "PRICE_FILTER" and "tickSize" in f:
+                        tick = float(f["tickSize"])
+                        _mexc_tick_size_cache[symbol] = tick
+                        return tick
+                if "quotePrecision" in s:
+                    tick = 10 ** (-int(s["quotePrecision"]))
+                    _mexc_tick_size_cache[symbol] = tick
+                    return tick
+    except Exception as e:
+        logger.error(f"MEXC tick size fetch {symbol}: {e}")
+    # Безопасный дефолт — 6 знаков после запятой, типично для мелких
+    # альткоинов вроде ONE (0.000001)
+    return 0.000001
+
+
+def _round_price_to_tick(price: float, tick: float) -> float:
+    """Округляет цену ВНИЗ (для продажи — безопаснее занизить лимит,
+    чем случайно завысить и получить ещё меньше шансов на исполнение)
+    до ближайшего допустимого шага цены биржи."""
+    if tick <= 0:
+        return price
+    steps = int(price / tick)
+    return round(steps * tick, 10)
+
+
 async def get_kucoin_base_increment(session, symbol: str) -> float:
     if symbol in _kucoin_increment_cache:
         return _kucoin_increment_cache[symbol]
@@ -2098,10 +2150,19 @@ async def place_order_kucoin_limit_ioc(session, symbol: str, side: str,
 async def place_order_mexc_limit_ioc(session, symbol: str, side: str,
                                        price: float, quantity: float) -> Optional[dict]:
     """Лимитный IOC-ордер на MEXC. Формат идентичен Binance (type=LIMIT,
-    timeInForce=IOC, price+quantity обязательны)."""
+    timeInForce=IOC, price+quantity обязательны).
+
+    ИСПРАВЛЕНО 27.08 (СРОЧНО): цена и количество теперь округляются под
+    реальные правила биржи (tickSize/stepSize) ПЕРЕД отправкой — раньше
+    отправлялись "сырые" числа с плавающей точкой (10+ значащих цифр),
+    что могло приводить к тихому отклонению/некорректному округлению
+    самой биржей и объяснять систематический 0% fill."""
     if is_backed_off("MEXC"):
         logger.error("MEXC в бэкоффе — лимитный ордер НЕ отправлен")
         return None
+    tick = await get_mexc_tick_size(session, symbol)
+    price = _round_price_to_tick(price, tick)
+    quantity = await round_quantity_for_exchange(session, "MEXC", symbol, quantity)
     url = "https://api.mexc.com/api/v3/order"
     ts = int(time.time() * 1000)
     params = {
