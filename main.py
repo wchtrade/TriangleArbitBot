@@ -1346,6 +1346,34 @@ async def scan_triangles(session) -> List[dict]:
 # АРБИТРАЖ — расчёт на основе реальной глубины
 # =====================================================================
 
+def _format_effective_threshold_line() -> str:
+    """НОВОЕ 28.08 (СРОЧНО, по прямому запросу пользователя — найдено:
+    реальный требуемый спред для прохождения min_absolute_profit_usd
+    может быть ВЫШЕ отображаемого 'честного' процентного порога, если
+    sell_reserve_lots маленький (амортизация слабая/отсутствует). Раньше
+    это было полностью невидимо в /stats — сигналы молча отклонялись,
+    хотя внешне казалось, что порог низкий. Теперь считаем и явно
+    показываем РЕАЛЬНЫЙ эффективный требуемый спред — максимум из
+    процентного порога и того, что реально нужно для абсолютного
+    доллар-фильтра при текущем лоте."""
+    lot = config.get("max_real_order_usdt", 4.0)
+    crossing_pct = config.get("empirical_spread_crossing_pct", 0.34)
+    lots = max(config.get("sell_reserve_lots", 3), 1)
+    buy_fee = FEES.get("KuCoin", 0.1) / 100
+    sell_fee = FEES.get("MEXC", 0.1) / 100
+    min_abs = config.get("min_absolute_profit_usd", 0.15)
+    amortized_cost = lot * (buy_fee + sell_fee) + lot * crossing_pct / 100 / lots
+    required_net_for_abs = (min_abs + amortized_cost) / lot * 100 if lot else 0
+    dynamic_min = compute_dynamic_min_profit_pct("KuCoin", "MEXC")
+    effective = max(dynamic_min, required_net_for_abs)
+    note = ""
+    if required_net_for_abs > dynamic_min:
+        note = (f" ⚠️ РЕАЛЬНО нужен спред от {effective:.2f}% — доллар-фильтр "
+                 f"(${min_abs}) требует больше, чем показывает 'честный' порог "
+                 f"выше, из-за маленького sell_reserve_lots={lots}!")
+    return f"📐 Реальный эффективный требуемый спред: {effective:.2f}%{note}"
+
+
 def compute_dynamic_min_profit_pct(buy_ex: str, sell_ex: str) -> float:
     """НОВОЕ 10.08: раньше min_profit_pct был фиксированным числом (0.18-0.3%),
     учитывающим только комиссии buy+sell ОДНОЙ ноги арбитража — но не
@@ -4997,7 +5025,15 @@ async def handle_command(session, text, chat_id):
                 f"Порог: {config['min_profit_pct']}% (ручной) / "
                 f"{compute_dynamic_min_profit_pct('KuCoin', 'Binance')}% (честный, с учётом ребаланса) | "
                 f"Буфер баланса: {config['balance_safety_buffer_pct']}% | "
-                f"Запас ребаланса: {config['rebalance_headroom_pct']}%"
+                f"Запас ребаланса: {config['rebalance_headroom_pct']}%\n"
+                # НОВОЕ 28.08 (СРОЧНО, по прямому запросу пользователя — найдено:
+                # реальный требуемый спред может быть ВЫШЕ отображаемого выше
+                # "честного" порога, если min_absolute_profit_usd + маленький
+                # sell_reserve_lots делают абсолютный доллар-фильтр более
+                # строгим ограничением, чем процентный. Раньше это было НЕВИДИМО
+                # в /stats — сигналы молча отклонялись без объяснения. Теперь
+                # считаем и явно показываем РЕАЛЬНЫЙ эффективный требуемый спред.
+                f"{_format_effective_threshold_line()}"
             )
             return
 
