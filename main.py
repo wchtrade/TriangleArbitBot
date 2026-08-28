@@ -1931,6 +1931,56 @@ async def confirm_mexc_ioc_executed_qty(session, symbol: str, order_id) -> float
         return 0.0
 
 
+async def get_kucoin_order_fill_details(session, order_id: str) -> Optional[dict]:
+    """НОВОЕ 28.08 (по прямому запросу пользователя — 'бери цены и комиссии
+    из реальной истории ордеров, не из расчётов'): отдельный запрос статуса
+    уже исполненного ордера, чтобы получить РЕАЛЬНУЮ среднюю цену
+    исполнения (dealFunds/dealSize) и РЕАЛЬНО списанную комиссию (fee) —
+    напрямую от биржи, а не оценку, посчитанную нами до исполнения."""
+    endpoint = f"/api/v1/orders/{order_id}"
+    ts = str(int(time.time() * 1000))
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "GET", endpoint, "")
+    headers = {"KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+               "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2"}
+    try:
+        async with session.get(f"https://api.kucoin.com{endpoint}", headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=5)) as r:
+            data = await r.json()
+            d = data.get("data", {})
+            deal_size = float(d.get("dealSize", 0) or 0)
+            deal_funds = float(d.get("dealFunds", 0) or 0)
+            fee = float(d.get("fee", 0) or 0)
+            if deal_size > 0:
+                avg_price = deal_funds / deal_size
+                return {"avg_price": avg_price, "deal_funds": deal_funds,
+                        "deal_size": deal_size, "fee_usdt": fee}
+    except Exception as e:
+        logger.error(f"KuCoin order fill details {order_id}: {e}")
+    return None
+
+
+async def get_mexc_order_fill_details(session, symbol: str, order_id) -> Optional[dict]:
+    """НОВОЕ 28.08: аналогично для MEXC — реальная средняя цена исполнения
+    и комиссия напрямую из ответа биржи на статус ордера."""
+    ts = int(time.time() * 1000)
+    params = {"symbol": f"{symbol}{QUOTE}", "orderId": order_id, "timestamp": ts, "recvWindow": 5000}
+    params["signature"] = sign_binance(params, MEXC_SECRET)
+    headers = {"X-MEXC-APIKEY": MEXC_KEY, "Content-Type": "application/json"}
+    try:
+        async with session.get("https://api.mexc.com/api/v3/order", params=params,
+                                headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as r:
+            data = await r.json()
+            executed_qty = float(data.get("executedQty", 0) or 0)
+            cummulative_quote_qty = float(data.get("cummulativeQuoteQty", 0) or 0)
+            if executed_qty > 0:
+                avg_price = cummulative_quote_qty / executed_qty
+                return {"avg_price": avg_price, "deal_funds": cummulative_quote_qty,
+                        "deal_size": executed_qty, "fee_usdt": None}
+    except Exception as e:
+        logger.error(f"MEXC order fill details {order_id}: {e}")
+    return None
+
+
 async def wait_for_kucoin_fill(session, order_id: str, timeout: float = 6.0) -> Optional[float]:
     # ИЗМЕНЕНО 22.08 (по факту логов реальных сделок): было 3.0 сек — этого
     # оказалось недостаточно для надёжного подтверждения статуса лимитных
@@ -3199,8 +3249,29 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
     # реактивной продажи излишка (top_up_usdt_via_coin_sale).
     _last_real_buy_price[(buy_ex, symbol)] = opp["buy_price"]
 
+    # НОВОЕ 28.08 (по прямому запросу пользователя — "бери цены и комиссии
+    # из реальной истории ордеров, не из расчётов"): дополнительно
+    # запрашиваем РЕАЛЬНЫЕ детали исполнения обеих ног напрямую у биржи —
+    # это НЕ влияет на решения бота (та логика уже отработала выше), это
+    # только для ЧЕСТНОГО отображения в карточке после сделки. Если
+    # запрос не удался — просто не покажем эти детали, ничего не ломаем.
+    real_buy_fill = None
+    real_sell_fill = None
+    try:
+        if buy_ex == "KuCoin":
+            buy_order_id = buy_result.get("data", {}).get("orderId")
+            if buy_order_id:
+                real_buy_fill = await get_kucoin_order_fill_details(session, buy_order_id)
+        if sell_ex == "MEXC" and sell_result:
+            sell_order_id = sell_result.get("orderId")
+            if sell_order_id:
+                real_sell_fill = await get_mexc_order_fill_details(session, symbol, sell_order_id)
+    except Exception as e:
+        logger.error(f"Не удалось получить реальные детали исполнения (не критично): {e}")
+
     return {"success": True, "buy_result": buy_result, "sell_result": sell_result, "vol": vol,
-             "confirmed_qty": confirmed_qty, "real_topup_cost_usdt": round(cycle_topup_cost[0], 4)}
+             "confirmed_qty": confirmed_qty, "real_topup_cost_usdt": round(cycle_topup_cost[0], 4),
+             "real_buy_fill": real_buy_fill, "real_sell_fill": real_sell_fill}
 
 
 # =====================================================================
@@ -4416,6 +4487,50 @@ async def execute_trade(session, opp: dict) -> dict:
                                 f"нужен ручной разбор, прежде чем продолжать `/go`.")
 
                     if CHAT_ID:
+                        # НОВОЕ 28.08 (по прямому запросу пользователя — "нужно
+                        # видеть реальность процесса на каждой бирже, что
+                        # произошло и по какому курсу"): раньше карточка
+                        # показывала только ОБЩИЙ баланс до/после, без разбивки
+                        # по биржам — из-за этого было невозможно понять, где
+                        # именно "утекли" деньги (в самой сделке или в чём-то
+                        # параллельном). Теперь строим построчную разбивку
+                        # KuCoin/MEXC отдельно, с реальными курсами и
+                        # комиссиями каждой ноги.
+                        per_ex_lines = []
+                        for ex_name in ["KuCoin", "MEXC"]:
+                            before_val = capital_before.get("per_exchange", {}).get(ex_name)
+                            after_val = capital_after.get("per_exchange", {}).get(ex_name)
+                            if before_val is not None and after_val is not None:
+                                ex_delta = round(after_val - before_val, 6)
+                                per_ex_lines.append(
+                                    f"   {ex_name}: ${before_val:.6f} → ${after_val:.6f} "
+                                    f"({ex_delta:+.6f})"
+                                )
+                        per_exchange_block = "\n".join(per_ex_lines)
+
+                        buy_fee_amt = round(real_result.get("vol", opp["vol"])
+                                             * FEES.get(opp["buy_ex"], 0.1) / 100, 4)
+                        sell_fee_amt = round(real_result.get("vol", opp["vol"])
+                                              * FEES.get(opp["sell_ex"], 0.1) / 100, 4)
+
+                        # НОВОЕ 28.08 (по прямому запросу пользователя — реальные
+                        # цены/комиссии из истории ордеров биржи, не расчёт):
+                        # если удалось получить реальные детали — используем ИХ,
+                        # с явной пометкой "реально"; если нет — честно
+                        # показываем расчётные с пометкой "оценка".
+                        real_buy_fill = real_result.get("real_buy_fill")
+                        real_sell_fill = real_result.get("real_sell_fill")
+                        if real_buy_fill:
+                            buy_price_line = (f"`{real_buy_fill['avg_price']:.8f}` "
+                                                f"(реально, комиссия ${real_buy_fill.get('fee_usdt', 0):.4f})")
+                        else:
+                            buy_price_line = f"`{opp['buy_price']}` (оценка, комиссия ~${buy_fee_amt})"
+                        if real_sell_fill:
+                            sell_price_line = (f"`{real_sell_fill['avg_price']:.8f}` "
+                                                 f"(реально, комиссия не раскрыта MEXC отдельно)")
+                        else:
+                            sell_price_line = f"`{opp['sell_price']}` (оценка, комиссия ~${sell_fee_amt})"
+
                         await send_tg(session,
                             f"📐 *ФАКТИЧЕСКИЙ результат цикла* (реальный баланс до/после, "
                             f"не оценка):\n"
@@ -4423,7 +4538,12 @@ async def execute_trade(session, opp: dict) -> dict:
                             f"   Фактически: `{factual_delta:+.4f} USDT`\n"
                             f"   (оценка в карточке была: `{pretrade_card_estimate:+.4f}` — "
                             f"разница `{round(factual_delta - pretrade_card_estimate, 4):+.4f}`)"
-                            f"{cost_source_note}{vol_shrink_note}")
+                            f"{cost_source_note}{vol_shrink_note}\n\n"
+                            f"📊 *Разбивка по биржам (реальный баланс каждой):*\n"
+                            f"{per_exchange_block}\n\n"
+                            f"💱 *Курсы и комиссии этой сделки:*\n"
+                            f"   Купить на KuCoin: {buy_price_line}\n"
+                            f"   Продать на MEXC: {sell_price_line}")
         if not real_result.get("success"):
             # НОВОЕ 25.08: если сделка не удалась — снимок "после" не нужен,
             # но lock ВСЁ РАВНО был захвачен выше и должен быть освобождён
