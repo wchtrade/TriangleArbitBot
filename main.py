@@ -1377,7 +1377,18 @@ def compute_dynamic_min_profit_pct(buy_ex: str, sell_ex: str) -> float:
     amortized_rebalance = spread_crossing_pct / lots
     safety_margin = config.get("threshold_safety_margin_pct", 0.05)
     erosion_buffer = get_avg_execution_erosion_pct() * config.get("erosion_pct_weight", 0.5)
-    return round(buy_fee + sell_fee + amortized_rebalance + safety_margin + erosion_buffer, 4)
+    raw_threshold = buy_fee + sell_fee + amortized_rebalance + safety_margin + erosion_buffer
+
+    # НОВОЕ 28.08 (СРОЧНО, по прямому запросу пользователя — порог снова
+    # убежал до 4.88%, хотя crossingcost был ограничен потолком 4.5%):
+    # найдено, что erosion_buffer — ОТДЕЛЬНЫЙ, независимый механизм
+    # (execution_erosion_history), который тоже растёт от плохих сделок,
+    # но не был ограничен потолком (ограничивали только crossingcost).
+    # Теперь ставим ОБЩИЙ потолок на ИТОГОВЫЙ порог целиком — неважно,
+    # какая именно составляющая его подняла, порог не может превысить
+    # этот предел никогда.
+    overall_ceiling = config.get("max_total_threshold_pct", 5.0)
+    return round(min(raw_threshold, overall_ceiling), 4)
 
 
 def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob: Dict,
@@ -5607,6 +5618,32 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Потолок автокалибровки: {val}%")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setcrossingceiling 4.5`")
+
+    elif cmd == "/setmaxthreshold":
+        # НОВОЕ 28.08 (СРОЧНО, по прямому запросу пользователя — порог
+        # снова убежал до 4.88%, хотя crossingcost был ограничен потолком
+        # отдельно). Это ЕДИНЫЙ потолок на ИТОГОВЫЙ честный порог целиком —
+        # неважно, какая составляющая (crossingcost, эрозия, комиссии)
+        # его подняла, итог никогда не превысит это значение.
+        if len(parts) < 2:
+            val = config.get("max_total_threshold_pct", 5.0)
+            await send_tg(session,
+                f"Текущий ОБЩИЙ потолок честного порога: {val}%\n\n"
+                f"Это финальная защита от 'убегания' порога в нереалистичную "
+                f"зону — работает НЕЗАВИСИМО от того, какая именно "
+                f"составляющая (crossingcost, эрозия) его подняла.\n\n"
+                f"Пример: `/setmaxthreshold 5.0`"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0.5 or val > 15:
+                await send_tg(session, "❌ Разумный диапазон: 0.5-15%.")
+                return
+            config["max_total_threshold_pct"] = val
+            await send_tg(session, f"✅ Общий потолок честного порога: {val}%")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setmaxthreshold 5.0`")
 
     elif cmd == "/seterosionweight":
         # НОВОЕ 23.08: доля процентного эрозийного буфера, остающаяся в
