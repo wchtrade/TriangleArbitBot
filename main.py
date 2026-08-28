@@ -4322,13 +4322,27 @@ async def execute_trade(session, opp: dict) -> dict:
                         avg_gap = sum(gap_history[-CALIBRATION_WINDOW:]) / CALIBRATION_WINDOW
                         if avg_gap < 0:  # систематически хуже оценки — поднимаем crossingcost
                             old_cc = config.get("empirical_spread_crossing_pct", 0.34)
-                            new_cc = round(old_cc + abs(avg_gap), 2)
+                            # ИСПРАВЛЕНО 28.08 (СРОЧНО, по прямому запросу пользователя
+                            # — "0 сделок за 12 часов при живом спреде 2.56%"): раньше
+                            # калибровка добавляла ВЕСЬ средний разрыв целиком, каждые
+                            # 3 сделки, БЕЗ верхнего предела — за несколько циклов
+                            # честный порог мог убежать до нереалистичных 6.6%+, хотя
+                            # реальный рынок регулярно даёт только 2-4%. Теперь: (1)
+                            # добавляем только ПОЛОВИНУ разрыва за раз (более плавно,
+                            # не резко), (2) есть настраиваемый ПОТОЛОК
+                            # (max_crossing_cost_pct, по умолчанию 4.5%) — калибровка
+                            # не может увести порог выше разумного уровня, каким бы
+                            # ни было прошлое расхождение.
+                            step = abs(avg_gap) * config.get("calibration_step_weight", 0.5)
+                            ceiling = config.get("max_crossing_cost_pct", 4.5)
+                            new_cc = min(round(old_cc + step, 2), ceiling)
                             config["empirical_spread_crossing_pct"] = new_cc
                             if CHAT_ID:
+                                ceiling_note = " (упёрлись в потолок)" if new_cc == ceiling else ""
                                 await send_tg(session,
                                     f"🎛 *Автокалибровка*: последние {CALIBRATION_WINDOW} сделки в среднем "
                                     f"на {avg_gap:.2f}% хуже оценки — crossingcost поднят с "
-                                    f"{old_cc}% до {new_cc}%. Честный порог автоматически станет строже.")
+                                    f"{old_cc}% до {new_cc}%{ceiling_note}. Честный порог станет строже.")
                             gap_history.clear()
 
                     # НОВОЕ 17.08: автопауза, если ДАЖЕ ПОСЛЕ калибровки продолжаем
@@ -5562,6 +5576,31 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Допустимый запас на продаже: {val}%")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setsellslippage 0.1`")
+
+    elif cmd == "/setcrossingceiling":
+        # НОВОЕ 28.08 (СРОЧНО, по прямому запросу пользователя — "0 сделок
+        # за 12 часов при живом спреде 2.56%"): автокалибровка раньше не
+        # имела потолка и могла увести честный порог до нереалистичных
+        # значений (было 6.63%, хотя реальный рынок ONE обычно даёт 2-4%).
+        if len(parts) < 2:
+            val = config.get("max_crossing_cost_pct", 4.5)
+            await send_tg(session,
+                f"Текущий потолок автокалибровки crossingcost: {val}%\n\n"
+                f"Автокалибровка НИКОГДА не поднимет crossingcost выше этого "
+                f"значения, независимо от того, насколько плохими были прошлые "
+                f"сделки — защита от 'убегания' порога в нереалистичную зону.\n\n"
+                f"Пример: `/setcrossingceiling 4.5`"
+            )
+            return
+        try:
+            val = float(parts[1])
+            if val < 0.5 or val > 15:
+                await send_tg(session, "❌ Разумный диапазон: 0.5-15%.")
+                return
+            config["max_crossing_cost_pct"] = val
+            await send_tg(session, f"✅ Потолок автокалибровки: {val}%")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setcrossingceiling 4.5`")
 
     elif cmd == "/seterosionweight":
         # НОВОЕ 23.08: доля процентного эрозийного буфера, остающаяся в
