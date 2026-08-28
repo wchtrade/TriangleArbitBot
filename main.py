@@ -3619,9 +3619,17 @@ async def get_total_real_capital(session, fixed_prices: Optional[Dict[Tuple[str,
                 value = qty * price
                 ex_total += value
                 misc_assets_value[f"{ex}:{asset}"] = round(value, 4)
-        per_exchange[ex] = round(ex_total, 2)
+        # ИЗМЕНЕНО 28.08 (СРОЧНО, по прямому запросу пользователя — найдено:
+        # округление до 2 знаков ($0.01) СКРЫВАЛО реальную величину
+        # факт-результата каждой сделки. Любое реальное значение между
+        # -$0.005 и -$0.015 отображалось как ОДИНАКОВОЕ "-0.0100" —
+        # создавая ложное впечатление идеально фиксированной стоимости.
+        # Теперь округляем до 6 знаков — реальная точность бирж (обычно
+        # $0.000001-0.01), чтобы наконец увидеть НАСТОЯЩИЕ цифры разрыва
+        # между оценкой и фактом, а не искажённые округлением.
+        per_exchange[ex] = round(ex_total, 6)
         total += ex_total
-    return {"total": round(total, 2), "per_exchange": per_exchange,
+    return {"total": round(total, 6), "per_exchange": per_exchange,
             "misc_assets_value": misc_assets_value, "prices_used": prices_used}
 
 
