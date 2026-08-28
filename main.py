@@ -3725,7 +3725,18 @@ async def real_exchange_rebalance_plan(session, ex: str) -> Optional[dict]:
     # резерва продажи, настраивается через /setsellreserve.
     sell_lots = config.get("sell_reserve_lots", lots)
     coin_target_usd = real_lot * sell_lots
-    usdt_target = real_lot * lots
+    # НОВОЕ 28.08 (по прямому запросу пользователя — "KuCoin несёт
+    # основную тяжесть 'прокрутки', дай возможность задать разные суммы
+    # для каждой биржи"): раньше usdt_target ВСЕГДА считался симметрично
+    # (real_lot × общий lots) для любой биржи-покупателя. Найдено на
+    # практике (реальная карточка с разбивкой по биржам 28.08): KuCoin
+    # теряет на прокрутке USDT↔монета в ~7 раз больше, чем MEXC теряет на
+    # своей стороне — потому что KuCoin докупает USDT чаще (меньший
+    # относительный буфер). Теперь per_exchange_usdt_buffer_usd позволяет
+    # задать ТОЧНУЮ сумму буфера USDT именно для этой биржи (в обход
+    # общего lots), через /setexbuffer БИРЖА СУММА.
+    per_ex_override = config.get("per_exchange_usdt_buffer_usd", {}).get(ex)
+    usdt_target = per_ex_override if per_ex_override is not None else real_lot * lots
 
     def is_seller_for(sym: str) -> bool:
         return ex in {s for _, s in pairs_for_symbol(sym)}
@@ -5757,6 +5768,43 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Допустимый запас на продаже: {val}%")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setsellslippage 0.1`")
+
+    elif cmd == "/setexbuffer":
+        # НОВОЕ 28.08 (по прямому запросу пользователя — асимметричное
+        # распределение резервов между биржами): задаёт ТОЧНУЮ сумму
+        # буфера USDT для КОНКРЕТНОЙ биржи, в обход общего
+        # rebalance_target_lots. Найдено по реальной карточке с разбивкой:
+        # KuCoin теряет на прокрутке USDT↔монета в ~7 раз больше MEXC —
+        # логично отдать KuCoin БОЛЬШУЮ долю капитала, а MEXC оставить
+        # минимум (там нужен только резерв монеты, не крупный буфер USDT).
+        if len(parts) < 3:
+            overrides = config.get("per_exchange_usdt_buffer_usd", {})
+            lines = "\n".join(f"   {ex}: ${amt}" for ex, amt in overrides.items()) or "   (нет override, все биржи используют общий /setrebalance)"
+            await send_tg(session,
+                f"Текущие индивидуальные буферы USDT по биржам:\n{lines}\n\n"
+                f"Пример: `/setexbuffer KuCoin 11.2` — задать KuCoin буфер "
+                f"$11.2, независимо от общего /setrebalance.\n"
+                f"`/setexbuffer KuCoin off` — убрать override, вернуться "
+                f"к общей настройке для этой биржи."
+            )
+            return
+        ex_name = parts[1]
+        if ex_name not in ["Binance", "KuCoin", "HTX", "MEXC"]:
+            await send_tg(session, "❌ Биржа должна быть одной из: Binance, KuCoin, HTX, MEXC")
+            return
+        if parts[2].lower() == "off":
+            config.setdefault("per_exchange_usdt_buffer_usd", {}).pop(ex_name, None)
+            await send_tg(session, f"✅ Override для {ex_name} убран — снова использует общий /setrebalance")
+            return
+        try:
+            val = float(parts[2])
+            if val < 0 or val > 1000:
+                await send_tg(session, "❌ Разумный диапазон: 0-1000.")
+                return
+            config.setdefault("per_exchange_usdt_buffer_usd", {})[ex_name] = val
+            await send_tg(session, f"✅ Буфер USDT для {ex_name}: ${val} (независимо от общего /setrebalance)")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setexbuffer KuCoin 11.2`")
 
     elif cmd == "/setcrossingceiling":
         # НОВОЕ 28.08 (СРОЧНО, по прямому запросу пользователя — "0 сделок
