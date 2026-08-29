@@ -5841,15 +5841,21 @@ async def handle_command(session, text, chat_id):
             return
         avg = sum(history) / len(history)
         history_str = ", ".join(f"{h:+.4f}" for h in history)
+        # ИСПРАВЛЕНО 29.08 (СРОЧНО, по прямому запросу пользователя — команда
+        # вообще не отвечала): текст содержал "min_absolute_profit_usd" —
+        # подчёркивания в этом слове Telegram интерпретирует как разметку
+        # курсива (Markdown), и при нечётном/несбалансированном сочетании
+        # это ломает отправку сообщения целиком, БЕЗ видимой ошибки
+        # пользователю. Убрали технический термин с подчёркиваниями.
         await send_tg(session,
             f"📊 *Динамическая калибровка (реальный факт)*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Последние {len(history)} 'чистых' сделок (объём ≥90%): {history_str}\n"
+            f"Последние {len(history)} чистых сделок (объём не менее 90%): {history_str}\n"
             f"Средний факт: ${avg:+.4f}\n\n"
-            f"Текущая поправка к min_absolute_profit_usd: {'+' if adj>0 else ''}{adj}\n"
+            f"Текущая поправка к минимальному порогу прибыли: {'+' if adj>0 else ''}{adj}\n"
             f"({'требуем больше — сделки в среднем убыточны' if adj>0 else 'без поправки — сделки в среднем не убыточны'})\n\n"
-            f"Эта поправка ДВУНАПРАВЛЕННАЯ: если сделки станут прибыльными, "
-            f"поправка сама уйдёт в 0, требование снизится автоматически."
+            f"Эта поправка двунаправленная: если сделки станут прибыльными, "
+            f"поправка сама уйдёт в ноль, требование снизится автоматически."
         )
 
     elif cmd == "/setexbuffer":
@@ -7686,6 +7692,10 @@ async def main():
         logger.error("ARB_BOT_TOKEN не установлен!")
         return
     logger.info("DepthArbBot стартует — WebSocket-стаканы на всех трёх биржах")
+    logger.info("=" * 60)
+    logger.info("🔖 ВЕРСИЯ КОДА: 2026-08-29-v3 (с /realcalib, /setexbuffer, "
+                 "/setmaxthreshold, /setcrossingceiling)")
+    logger.info("=" * 60)
     connector = aiohttp.TCPConnector(ssl=True)  # SSL включён, не отключаем проверку сертификатов
     async with aiohttp.ClientSession(connector=connector) as session:
         for sym in SYMBOLS:
