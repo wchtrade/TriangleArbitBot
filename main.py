@@ -494,6 +494,17 @@ _last_real_buy_price: Dict[Tuple[str, str], float] = {}
 # не спамить одной и той же ошибкой в Telegram каждые несколько секунд.
 _last_topup_failure_notification: Dict[Tuple[str, str], float] = {}
 
+# НОВОЕ 28.08 (по прямому запросу пользователя — "динамическая плавающая
+# ставка, автоматически отрабатывающая"): вместо ручной подкрутки
+# crossingcost/erosion (которые мы весь день крутили руками, находя всё
+# новые скрытые составляющие) — ПРЯМАЯ, двунаправленная калибровка на
+# основе РЕАЛЬНОГО факт-результата каждой сделки (не оценок, не
+# промежуточных моделей). Если сделки в среднем убыточны — требование
+# растёт; если сделки в среднем прибыльны — требование САМО снижается
+# (чего старый механизм вообще не умел — он только рос).
+real_factual_history: List[float] = []
+REAL_FACTUAL_HISTORY_MAXLEN = 5
+
 # НОВОЕ 25.08 (по прямому запросу пользователя, найдено по логам Railway
 # с точными временными метками): reserve_watchdog_loop — ФОНОВЫЙ цикл,
 # который может сработать В ЛЮБОЙ момент, независимо от того, идёт ли
@@ -1346,6 +1357,25 @@ async def scan_triangles(session) -> List[dict]:
 # АРБИТРАЖ — расчёт на основе реальной глубины
 # =====================================================================
 
+def get_real_dynamic_adjustment_usd() -> float:
+    """НОВОЕ 28.08 (по прямому запросу пользователя): считает НАСТОЯЩУЮ,
+    ДВУНАПРАВЛЕННУЮ поправку к требуемой прибыли — на основе реального,
+    а не оценочного факт-результата последних сделок (только тех, где
+    объём не был сильно усечён — иначе шум от усечения искажает картину).
+    Если сделки в среднем в минусе — возвращает ПОЛОЖИТЕЛЬНОЕ число
+    (требуем больше прибыли компенсировать это). Если сделки в среднем
+    в плюсе — возвращает ОТРИЦАТЕЛЬНОЕ или ноль (требование САМО падает,
+    в отличие от старой calibration, которая умела только расти)."""
+    if not real_factual_history:
+        return 0.0
+    avg_factual = sum(real_factual_history) / len(real_factual_history)
+    # Если средний факт отрицателен (например, -0.01) — требуем на эту
+    # сумму БОЛЬШЕ прибыли с запасом x1.3, чтобы не просто выйти в ноль,
+    # а иметь небольшой реальный буфер сверху.
+    safety_multiplier = 1.3
+    return round(-avg_factual * safety_multiplier, 4) if avg_factual < 0 else 0.0
+
+
 def _format_effective_threshold_line() -> str:
     """НОВОЕ 28.08 (СРОЧНО, по прямому запросу пользователя — найдено:
     реальный требуемый спред для прохождения min_absolute_profit_usd
@@ -1361,7 +1391,10 @@ def _format_effective_threshold_line() -> str:
     lots = max(config.get("sell_reserve_lots", 3), 1)
     buy_fee = FEES.get("KuCoin", 0.1) / 100
     sell_fee = FEES.get("MEXC", 0.1) / 100
-    min_abs = config.get("min_absolute_profit_usd", 0.15)
+    # НОВОЕ 28.08: учитываем новую динамическую поправку на основе
+    # реального факта (get_real_dynamic_adjustment_usd), а не только
+    # статичный min_absolute_profit_usd.
+    min_abs = config.get("min_absolute_profit_usd", 0.15) + get_real_dynamic_adjustment_usd()
     amortized_cost = lot * (buy_fee + sell_fee) + lot * crossing_pct / 100 / lots
     required_net_for_abs = (min_abs + amortized_cost) / lot * 100 if lot else 0
     dynamic_min = compute_dynamic_min_profit_pct("KuCoin", "MEXC")
@@ -1511,7 +1544,16 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
         stats["strict_honest_negative_rejected"] = stats.get("strict_honest_negative_rejected", 0) + 1
         return None
 
-    min_abs = config.get("min_absolute_profit_usd", 0.15)
+    # НОВОЕ 28.08 (по прямому запросу пользователя — "динамическая
+    # плавающая ставка, знающая сколько нужно потратить, чтобы отработать
+    # автоматически"): добавляем ПРЯМУЮ, основанную на реальном факте
+    # поправку — независимо от crossingcost/erosion (те остаются как
+    # базовая защита), это ДОПОЛНИТЕЛЬНОЕ, более точное требование,
+    # реагирующее на то, что РЕАЛЬНО происходило в последних сделках, а
+    # не на промежуточные оценки. Двунаправленная: растёт при убытках,
+    # САМА снижается при прибыли (чего не умел старый механизм).
+    real_dynamic_adj = get_real_dynamic_adjustment_usd()
+    min_abs = config.get("min_absolute_profit_usd", 0.15) + real_dynamic_adj
     if honest_pretrade_profit_usd < min_abs:
         stats["absolute_profit_too_low_rejected"] = stats.get("absolute_profit_too_low_rejected", 0) + 1
         return None
@@ -4436,6 +4478,17 @@ async def execute_trade(session, opp: dict) -> dict:
                     stats["factual_trades_count"] = stats.get("factual_trades_count", 0) + 1
                     diff_from_estimate = round(factual_delta - honest_cycle_profit, 4)
 
+                    # НОВОЕ 28.08 (по прямому запросу пользователя — динамическая
+                    # двунаправленная калибровка на РЕАЛЬНОМ факте): пишем в
+                    # историю, ТОЛЬКО если объём не был сильно усечён (>=90% от
+                    # запрошенного) — иначе усечение само по себе исказит
+                    # картину, смешивая две разные причины отклонений.
+                    actual_vol_for_history = real_result.get("vol") or opp["vol"]
+                    if opp["vol"] > 0 and (actual_vol_for_history / opp["vol"]) >= 0.9:
+                        real_factual_history.append(factual_delta)
+                        if len(real_factual_history) > REAL_FACTUAL_HISTORY_MAXLEN:
+                            real_factual_history.pop(0)
+
                     # НОВОЕ 18.08: записываем реальную эрозию исполнения (разница
                     # между % на сигнале и фактически реализованным %) — питает
                     # get_avg_execution_erosion_pct(), которая теперь напрямую
@@ -5768,6 +5821,36 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Допустимый запас на продаже: {val}%")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setsellslippage 0.1`")
+
+    elif cmd == "/realcalib":
+        # НОВОЕ 28.08 (по прямому запросу пользователя — "динамическая
+        # плавающая ставка, знающая сколько нужно потратить, чтобы
+        # отработать автоматически"): показывает текущее состояние НОВОЙ
+        # двунаправленной калибровки на основе РЕАЛЬНОГО факта (не
+        # оценок) — сколько сделок в истории, средний факт, и какую
+        # поправку это даёт к требуемой прибыли прямо сейчас.
+        history = real_factual_history
+        adj = get_real_dynamic_adjustment_usd()
+        if not history:
+            await send_tg(session,
+                "📊 *Динамическая калибровка (реальный факт)*\n\n"
+                "Пока нет данных — нужна хотя бы 1 сделка с объёмом "
+                "не менее 90% от запрошенного лота.\n"
+                "Поправка сейчас: $0.00 (не влияет на порог)."
+            )
+            return
+        avg = sum(history) / len(history)
+        history_str = ", ".join(f"{h:+.4f}" for h in history)
+        await send_tg(session,
+            f"📊 *Динамическая калибровка (реальный факт)*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Последние {len(history)} 'чистых' сделок (объём ≥90%): {history_str}\n"
+            f"Средний факт: ${avg:+.4f}\n\n"
+            f"Текущая поправка к min_absolute_profit_usd: {'+' if adj>0 else ''}{adj}\n"
+            f"({'требуем больше — сделки в среднем убыточны' if adj>0 else 'без поправки — сделки в среднем не убыточны'})\n\n"
+            f"Эта поправка ДВУНАПРАВЛЕННАЯ: если сделки станут прибыльными, "
+            f"поправка сама уйдёт в 0, требование снизится автоматически."
+        )
 
     elif cmd == "/setexbuffer":
         # НОВОЕ 28.08 (по прямому запросу пользователя — асимметричное
