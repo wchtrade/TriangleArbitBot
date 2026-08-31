@@ -1401,8 +1401,12 @@ def _format_effective_threshold_line() -> str:
     effective = max(dynamic_min, required_net_for_abs)
     note = ""
     if required_net_for_abs > dynamic_min:
+        # ИСПРАВЛЕНО 29.08 (по прямому запросу пользователя — найдена
+        # "уродливая" цифра вида $0.038099999999999995, типичная ошибка
+        # плавающей точки без округления при выводе). Округляем до 4
+        # знаков перед показом пользователю.
         note = (f" ⚠️ РЕАЛЬНО нужен спред от {effective:.2f}% — доллар-фильтр "
-                 f"(${min_abs}) требует больше, чем показывает 'честный' порог "
+                 f"(${round(min_abs, 4)}) требует больше, чем показывает честный порог "
                  f"выше, из-за маленького sell_reserve_lots={lots}!")
     return f"📐 Реальный эффективный требуемый спред: {effective:.2f}%{note}"
 
@@ -2865,7 +2869,220 @@ async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: floa
     return bool(result)
 
 
-async def execute_real_arbitrage(session, opp: dict) -> dict:
+# ═══════════════════════════════════════════════════════════════════
+# НОВОЕ 29.08 (по прямому запросу пользователя, после фундаментальной
+# находки: монета НИКОГДА физически не перемещается между биржами в
+# текущей архитектуре — "спред" между KuCoin и MEXC является ЧИСТО
+# ТЕОРЕТИЧЕСКИМ расчётом и никогда не реализуется как реальные деньги.
+# Единственная РЕАЛЬНАЯ прибыль/убыток берётся из случайного движения
+# цены между докупками резерва, а не из самого спреда. Реальный перевод
+# монеты — купить на KuCoin → вывести на MEXC → продать реально
+# полученное количество — единственный способ РЕАЛИЗОВАТЬ спред как
+# настоящие деньги.
+#
+# ⚠️ КРИТИЧНАЯ НАХОДКА БЕЗОПАСНОСТИ (29.08, из документации): у MEXC
+# зафиксирован ПОДТВЕРЖДЁННЫЙ баг в API — эндпоинт получения адреса для
+# депозита иногда возвращает адрес НЕ ТОЙ СЕТИ, что может привести к
+# БЕЗВОЗВРАТНОЙ потере денег при автоматическом переводе. Поэтому:
+# адрес депозита MEXC НИКОГДА не используется автоматически без явного,
+# ОДНОКРАТНОГО ручного подтверждения пользователем через /confirmtransferaddr.
+# ═══════════════════════════════════════════════════════════════════
+
+config["use_real_transfer_mode"] = False  # по умолчанию ВЫКЛЮЧЕНО — новая, ещё не
+    # проверенная в бою архитектура. Включается явно через /setrealtransfer on
+    # ТОЛЬКО после ручного подтверждения адреса.
+config["confirmed_mexc_deposit_address"] = None  # заполняется ТОЛЬКО через
+    # /confirmtransferaddr, никогда не автоматически
+config["confirmed_mexc_deposit_network"] = None
+config["confirmed_mexc_deposit_memo"] = None
+config["transfer_withdrawal_timeout_sec"] = 120  # максимум ожидания перевода
+config["transfer_min_confirmations_buffer_sec"] = 5  # доп. запас после статуса SUCCESS
+
+
+async def get_mexc_deposit_addresses_all_networks(session, coin: str) -> List[dict]:
+    """НОВОЕ 29.08: получает ВСЕ доступные сети для депозита монеты на MEXC —
+    возвращает список, НЕ выбирая автоматически 'правильную' сеть, чтобы
+    пользователь мог ВРУЧНУЮ сверить адрес с приложением MEXC перед тем, как
+    доверить ему реальные деньги (см. КРИТИЧНУЮ НАХОДКУ БЕЗОПАСНОСТИ выше)."""
+    ts = int(time.time() * 1000)
+    params = {"coin": coin, "timestamp": ts, "recvWindow": 5000}
+    params["signature"] = sign_binance(params, MEXC_SECRET)
+    headers = {"X-MEXC-APIKEY": MEXC_KEY, "Content-Type": "application/json"}
+    try:
+        async with session.get("https://api.mexc.com/api/v3/capital/deposit/address",
+                                params=params, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if isinstance(data, list):
+                return data
+            logger.error(f"MEXC deposit address unexpected response: {data}")
+            return []
+    except Exception as e:
+        logger.error(f"MEXC deposit address fetch exception: {e}")
+        return []
+
+
+async def withdraw_from_kucoin(session, currency: str, amount: float, address: str,
+                                 chain: str, memo: Optional[str] = None) -> Optional[dict]:
+    """НОВОЕ 29.08: реальный вывод монеты с KuCoin на внешний адрес (в данном
+    случае — на подтверждённый вручную адрес депозита MEXC). Использует
+    официальный эндпоинт /api/v3/withdrawals (актуальная версия API)."""
+    endpoint = "/api/v3/withdrawals"
+    ts = str(int(time.time() * 1000))
+    body = {
+        "currency": currency, "toAddress": address, "amount": str(amount),
+        "withdrawType": "ADDRESS", "chain": chain,
+    }
+    if memo:
+        body["memo"] = memo
+    import json as _json
+    body_str = _json.dumps(body)
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "POST", endpoint, body_str)
+    headers = {
+        "KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.post(f"https://api.kucoin.com{endpoint}", headers=headers,
+                                  data=body_str, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if data.get("code") != "200000":
+                logger.error(f"KuCoin withdrawal failed: {data}")
+                return None
+            logger.info(f"✅ KuCoin withdrawal отправлен: {data}")
+            return data.get("data")
+    except Exception as e:
+        logger.error(f"KuCoin withdrawal exception: {e}")
+        return None
+
+
+async def get_kucoin_withdrawal_status(session, withdrawal_id: str) -> Optional[dict]:
+    """НОВОЕ 29.08: проверка статуса конкретного вывода — используется для
+    ожидания подтверждения ПЕРЕД тем, как считать перевод завершённым."""
+    endpoint = f"/api/v3/withdrawals/{withdrawal_id}"
+    ts = str(int(time.time() * 1000))
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "GET", endpoint, "")
+    headers = {"KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+               "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2"}
+    try:
+        async with session.get(f"https://api.kucoin.com{endpoint}", headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            return data.get("data")
+    except Exception as e:
+        logger.error(f"KuCoin withdrawal status exception: {e}")
+        return None
+
+
+async def wait_for_transfer_complete(session, withdrawal_id: str, symbol: str,
+                                       mexc_balance_before: float,
+                                       timeout: float = 120.0) -> Optional[float]:
+    """НОВОЕ 29.08: ждёт РЕАЛЬНОГО подтверждения перевода ДВУМЯ способами
+    одновременно — (1) статус вывода на KuCoin стал SUCCESS, (2) баланс
+    монеты на MEXC РЕАЛЬНО вырос. Возвращает фактически полученное
+    количество монеты (может отличаться от отправленного из-за комиссии
+    сети, которая иногда удерживается в самой монете, а не в USDT)."""
+    deadline = time.time() + timeout
+    kucoin_confirmed = False
+    while time.time() < deadline:
+        if not kucoin_confirmed:
+            status = await get_kucoin_withdrawal_status(session, withdrawal_id)
+            if status and status.get("status") == "SUCCESS":
+                kucoin_confirmed = True
+                logger.info(f"✅ KuCoin withdrawal {withdrawal_id} подтверждён (SUCCESS)")
+            elif status and status.get("status") == "FAILURE":
+                logger.error(f"❌ KuCoin withdrawal {withdrawal_id} провалился: {status}")
+                return None
+        if kucoin_confirmed:
+            balances = await get_real_balances(session, "MEXC")
+            if balances:
+                current = balances.get(symbol, 0.0)
+                received = current - mexc_balance_before
+                if received > 0.000001:
+                    logger.info(f"✅ Депозит на MEXC подтверждён: получено {received} {symbol}")
+                    return received
+        await asyncio.sleep(2.0)
+    logger.error(f"⏱ Таймаут ожидания перевода {withdrawal_id} ({timeout} сек)")
+    return None
+
+
+# НОВОЕ 29.08 (по прямому запросу пользователя, пункт 3-4 плана): полный
+# круг арбитража должен ЗАКАНЧИВАТЬСЯ автоматическим возвратом USDT с MEXC
+# на KuCoin — иначе USDT будет накапливаться на MEXC, а KuCoin со временем
+# истощится и не сможет покупать. Используем сеть Polygon — комиссия
+# вывода на MEXC ~$0.01-0.007, KuCoin официально поддерживает приём USDT
+# именно на Polygon POS Network (подтверждено объявлением биржи).
+
+async def get_kucoin_deposit_address(session, currency: str, chain: str) -> Optional[dict]:
+    """НОВОЕ 29.08: получает адрес депозита на KuCoin для конкретной сети —
+    нужен для возврата USDT с MEXC обратно на KuCoin."""
+    endpoint = f"/api/v3/deposit-addresses?currency={currency}&chain={chain}"
+    ts = str(int(time.time() * 1000))
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "GET", endpoint, "")
+    headers = {"KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+               "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2"}
+    try:
+        async with session.get(f"https://api.kucoin.com{endpoint}", headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            items = data.get("data")
+            if items:
+                return items[0] if isinstance(items, list) else items
+            logger.error(f"KuCoin deposit address {currency}/{chain}: {data}")
+    except Exception as e:
+        logger.error(f"KuCoin deposit address exception: {e}")
+    return None
+
+
+async def withdraw_usdt_from_mexc(session, amount: float, address: str,
+                                    network: str, memo: Optional[str] = None) -> Optional[dict]:
+    """НОВОЕ 29.08: реальный вывод USDT с MEXC на подтверждённый адрес
+    KuCoin — завершающий шаг полного круга, возвращающий капитал туда,
+    откуда он начинался (KuCoin, в форме USDT — как и требовалось)."""
+    ts = int(time.time() * 1000)
+    params = {"coin": "USDT", "address": address, "amount": amount,
+               "network": network, "timestamp": ts, "recvWindow": 5000}
+    if memo:
+        params["memo"] = memo
+    params["signature"] = sign_binance(params, MEXC_SECRET)
+    headers = {"X-MEXC-APIKEY": MEXC_KEY, "Content-Type": "application/json"}
+    try:
+        async with session.post("https://api.mexc.com/api/v3/capital/withdraw",
+                                  params=params, headers=headers,
+                                  timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if r.status != 200 or "id" not in data:
+                logger.error(f"MEXC USDT withdrawal failed: {data}")
+                return None
+            logger.info(f"✅ MEXC USDT withdrawal отправлен: {data}")
+            return data
+    except Exception as e:
+        logger.error(f"MEXC USDT withdrawal exception: {e}")
+        return None
+
+
+async def wait_for_usdt_return_complete(session, mexc_withdrawal_id: str,
+                                          kucoin_usdt_before: float,
+                                          timeout: float = 120.0) -> Optional[float]:
+    """НОВОЕ 29.08: ждёт подтверждения возврата USDT на KuCoin — тем же
+    двойным способом (статус вывода на MEXC + реальный рост баланса на
+    KuCoin), что и для прямого перевода ONE."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        balances = await get_real_balances(session, "KuCoin")
+        if balances:
+            current = balances.get("USDT", 0.0)
+            received = current - kucoin_usdt_before
+            if received > 0.001:
+                logger.info(f"✅ Возврат USDT на KuCoin подтверждён: получено ${received:.4f}")
+                return received
+        await asyncio.sleep(2.0)
+    logger.error(f"⏱ Таймаут ожидания возврата USDT на KuCoin ({timeout} сек)")
+    return None
+
+
+
     """Исполняет РЕАЛЬНУЮ сделку с ЖЁСТКИМ лимитом на объём.
     Возвращает результат с полями success/error/emergency_close для логирования.
     КРИТИЧНО: если вторая нога не исполнилась — пытаемся аварийно закрыть
@@ -3317,13 +3534,158 @@ async def execute_real_arbitrage(session, opp: dict) -> dict:
 
 
 # =====================================================================
-# РЕАЛЬНЫЙ АВТО-РЕБАЛАНС (по вашему запросу от 24.07)
+# НОВОЕ 29.08 (по прямому запросу пользователя, после фундаментальной
+# находки про иллюзорный спред) — АЛЬТЕРНАТИВНАЯ архитектура исполнения:
+# реальный физический перевод монеты между биржами, вместо поддержания
+# двух раздельных резервов. Используется ТОЛЬКО когда
+# config["use_real_transfer_mode"] явно включён пользователем через
+# /setrealtransfer on (после обязательного /confirmtransferaddr).
 #
-# ВНИМАНИЕ: как и весь Этап 6, этот код не тестировался на живом API.
-# Комиссия и небольшое проскальзывание за каждую ногу — неизбежная и
-# честная цена ребаланса реальными деньгами, порядка 0.1-0.2% за ногу
-# (Binance/KuCoin) или 0.2% (HTX), т.е. ~0.2-0.4% за цикл продажа+покупка.
+# ⚠️ Эта функция ОТДЕЛЬНА от execute_real_arbitrage (старой модели) —
+# намеренно НЕ трогает отлаженный, годами проверенный код старой модели.
 # =====================================================================
+
+async def execute_real_arbitrage_with_transfer(session, opp: dict) -> dict:
+    """Новая модель: купить на buy_ex → ВЫВЕСТИ реально на sell_ex →
+    дождаться подтверждённого зачисления → продать РЕАЛЬНО полученное
+    количество. Это единственный способ РЕАЛИЗОВАТЬ спред как настоящие
+    деньги, а не как теоретический расчёт (см. находку 29.08).
+
+    ВАЖНО — ЧЕСТНО О РИСКАХ: пока перевод в пути (обычно 5-60 сек для
+    быстрых сетей вроде Harmony ONE), деньги НЕ доступны ни для торговли,
+    ни для аварийного закрытия — если перевод зависнет или сеть будет
+    перегружена, средства окажутся временно недоступны до его завершения.
+    Это НОВЫЙ тип риска, которого не было в старой модели."""
+    if not is_real_trading_allowed():
+        return {"success": False, "error": "real_trading_not_unlocked"}
+
+    address = config.get("confirmed_mexc_deposit_address")
+    network = config.get("confirmed_mexc_deposit_network")
+    memo = config.get("confirmed_mexc_deposit_memo")
+    if not address or not network:
+        return {"success": False, "error": "transfer_address_not_confirmed: "
+                                             "используй /confirmtransferaddr сначала"}
+
+    vol = min(opp["vol"], config["max_real_order_usdt"])
+    symbol, buy_ex, sell_ex = opp["symbol"], opp["buy_ex"], opp["sell_ex"]
+
+    if buy_ex != "KuCoin" or sell_ex != "MEXC":
+        return {"success": False, "error": f"transfer_mode_only_supports_KuCoin_to_MEXC, "
+                                             f"got {buy_ex}->{sell_ex}"}
+
+    # --- ШАГ 1: покупка на KuCoin (используем уже готовую, проверенную логику) ---
+    if config.get("use_limit_ioc_orders", True) and opp.get("buy_price"):
+        buy_result = await place_order_kucoin_limit_ioc(
+            session, symbol, "buy", opp["buy_price"], vol / opp["buy_price"])
+    else:
+        buy_result = await place_order_kucoin(session, symbol, "buy", vol, use_funds=True)
+
+    if not buy_result:
+        return {"success": False, "error": "buy_leg_failed_on_KuCoin_transfer_mode"}
+
+    confirmed_qty = await confirm_fill_and_get_qty(session, buy_ex, buy_result)
+    if not confirmed_qty or confirmed_qty <= 0:
+        return {"success": False, "error": "buy_leg_not_confirmed_filled_transfer_mode: "
+                                             "деньги не потрачены на вторую ногу, монета "
+                                             "куплена и осталась на KuCoin"}
+
+    logger.info(f"✅ Куплено {confirmed_qty} {symbol} на KuCoin, готовим реальный перевод на MEXC")
+
+    # --- ШАГ 2: снимок баланса MEXC ДО перевода (чтобы честно измерить, сколько реально пришло) ---
+    mexc_balances_before = await get_real_balances(session, "MEXC")
+    if mexc_balances_before is None:
+        return {"success": False, "error": "cannot_read_mexc_balance_before_transfer: "
+                                             f"монета {confirmed_qty} {symbol} осталась на KuCoin"}
+    mexc_coin_before = mexc_balances_before.get(symbol, 0.0)
+
+    # --- ШАГ 3: РЕАЛЬНЫЙ вывод с KuCoin на подтверждённый адрес MEXC ---
+    # Небольшой запас (0.999) на случай, если сеть/биржа удерживает комиссию
+    # в самой монете, а не отдельно — не пытаемся вывести чуть больше, чем есть.
+    withdraw_qty = round(confirmed_qty * 0.999, 6)
+    withdrawal = await withdraw_from_kucoin(session, symbol, withdraw_qty, address, network, memo)
+    if not withdrawal:
+        return {"success": False, "error": "withdrawal_failed: "
+                                             f"монета {confirmed_qty} {symbol} осталась на KuCoin, "
+                                             f"деньги НЕ потеряны, нужен ручной /rebalance",
+                "stuck_on_kucoin_qty": confirmed_qty}
+
+    withdrawal_id = withdrawal.get("withdrawalId") or withdrawal.get("id")
+    logger.info(f"📤 Вывод отправлен: {withdraw_qty} {symbol} на {address} "
+                 f"(сеть {network}), withdrawal_id={withdrawal_id}")
+
+    # --- ШАГ 4: ждём РЕАЛЬНОГО подтверждения перевода ---
+    timeout = config.get("transfer_withdrawal_timeout_sec", 120)
+    received_qty = await wait_for_transfer_complete(
+        session, withdrawal_id, symbol, mexc_coin_before, timeout=timeout)
+
+    if received_qty is None:
+        # КРИТИЧНО: деньги сейчас "в пути" — не на KuCoin (уже списаны),
+        # не подтверждены на MEXC. Это НОВЫЙ, реальный риск данной модели.
+        return {"success": False, "error": "transfer_timeout_funds_in_transit: "
+                                             f"вывод {withdraw_qty} {symbol} отправлен "
+                                             f"(withdrawal_id={withdrawal_id}), но не "
+                                             f"подтверждён за {timeout} сек — ПРОВЕРЬ ВРУЧНУЮ "
+                                             f"историю выводов KuCoin и историю депозитов MEXC!",
+                "withdrawal_id": withdrawal_id}
+
+    logger.info(f"✅ Перевод подтверждён: получено {received_qty} {symbol} на MEXC")
+
+    # --- ШАГ 5: продажа РЕАЛЬНО полученного количества на MEXC ---
+    slippage_pct = config.get("sell_limit_slippage_pct", 0.05)
+    sell_limit_price = opp["sell_price"] * (1 - slippage_pct / 100)
+    sell_result = await place_order_mexc_limit_ioc(session, symbol, "SELL",
+                                                      sell_limit_price, received_qty)
+    if not sell_result:
+        return {"success": False, "error": "sell_leg_failed_after_real_transfer: "
+                                             f"{received_qty} {symbol} РЕАЛЬНО на MEXC, "
+                                             f"но продажа не удалась — деньги НЕ потеряны, "
+                                             f"нужна ручная продажа или /rebalance",
+                "coin_on_mexc_qty": received_qty}
+
+    order_id = sell_result.get("orderId")
+    executed_qty = await confirm_mexc_ioc_executed_qty(session, symbol, order_id) if order_id else 0.0
+    fill_ratio = (executed_qty / received_qty) if received_qty > 0 else 0.0
+    if fill_ratio < 0.95:
+        return {"success": False, "error": f"sell_leg_partial_after_transfer: исполнено "
+                                             f"только {fill_ratio*100:.1f}% ({executed_qty} из "
+                                             f"{received_qty} {symbol}) — остаток РЕАЛЬНО на MEXC, "
+                                             f"нужна ручная допродажа",
+                "coin_on_mexc_qty": received_qty - executed_qty}
+
+    # --- ШАГ 6 (НОВОЕ 29.08, пункт 4 плана пользователя): АВТОМАТИЧЕСКИЙ
+    # возврат USDT с MEXC на KuCoin — круг ДОЛЖЕН завершаться там же, где
+    # начался, чтобы KuCoin не истощался со временем. Это делает КАЖДУЮ
+    # сделку самодостаточным, полным циклом, а не половиной операции. ---
+    usdt_addr = config.get("confirmed_kucoin_usdt_address")
+    usdt_network = config.get("confirmed_kucoin_usdt_network")
+    return_result = {"return_attempted": False}
+    if usdt_addr and usdt_network:
+        mexc_usdt_balances = await get_real_balances(session, "MEXC")
+        mexc_usdt_after_sell = (mexc_usdt_balances or {}).get("USDT", 0.0)
+        kucoin_usdt_balances = await get_real_balances(session, "KuCoin")
+        kucoin_usdt_before_return = (kucoin_usdt_balances or {}).get("USDT", 0.0)
+        # Оставляем небольшой запас на MEXC на случай будущих комиссий,
+        # не выводим АБСОЛЮТНО всё до нуля.
+        amount_to_return = round(mexc_usdt_after_sell * 0.98, 4)
+        if amount_to_return > 1.0:  # не пытаемся вывести микроскопические суммы
+            usdt_withdrawal = await withdraw_usdt_from_mexc(
+                session, amount_to_return, usdt_addr, usdt_network,
+                config.get("confirmed_kucoin_usdt_memo"))
+            if usdt_withdrawal:
+                usdt_received = await wait_for_usdt_return_complete(
+                    session, usdt_withdrawal.get("id"), kucoin_usdt_before_return,
+                    timeout=config.get("transfer_withdrawal_timeout_sec", 120))
+                return_result = {"return_attempted": True, "return_success": usdt_received is not None,
+                                   "usdt_returned": usdt_received}
+            else:
+                return_result = {"return_attempted": True, "return_success": False,
+                                   "error": "usdt_withdrawal_from_mexc_failed"}
+
+    return {"success": True, "vol": vol, "confirmed_qty": confirmed_qty,
+             "received_qty": received_qty, "executed_sell_qty": executed_qty,
+             "withdrawal_id": withdrawal_id, "real_transfer_mode": True,
+             **return_result}
+
 
 async def get_real_balances_binance(session) -> Optional[Dict[str, float]]:
     if is_backed_off("Binance"):
@@ -4347,7 +4709,13 @@ async def execute_trade(session, opp: dict) -> dict:
         # Освобождается ниже — либо после снимка "после" (успех), либо
         # сразу же (неудача, снимок "после" не нужен).
         await _capital_measurement_lock.acquire()
-        real_result = await execute_real_arbitrage(session, opp)
+        # НОВОЕ 29.08 (по прямому запросу пользователя): переключение между
+        # старой моделью (раздельные резервы) и новой (реальный перевод
+        # монеты между биржами) — по флагу use_real_transfer_mode.
+        if config.get("use_real_transfer_mode", False):
+            real_result = await execute_real_arbitrage_with_transfer(session, opp)
+        else:
+            real_result = await execute_real_arbitrage(session, opp)
         # НОВОЕ 10.08 (раунд 2): раньше диагностика шла только в Railway-логи
         # (logger.info) — тишина в Telegram при этом сохранялась, а до
         # логов Railway на практике трудно добраться быстро. Теперь то же
@@ -4365,7 +4733,61 @@ async def execute_trade(session, opp: dict) -> dict:
         logger.info(f"🔍 ДИАГНОСТИКА execute_real_arbitrage: success={real_result.get('success')} "
                      f"error={real_result.get('error')} symbol={opp.get('symbol')} "
                      f"buy_ex={opp.get('buy_ex')} sell_ex={opp.get('sell_ex')}")
-        if real_result.get("success"):
+
+        # НОВОЕ 29.08 (по прямому запросу пользователя, пункт 6 плана):
+        # ОТДЕЛЬНАЯ, честная обработка результата именно для НОВОГО режима
+        # реального перевода — не смешивается со сложной логикой старой
+        # модели (докупки, амортизация и т.п.), которых в новом режиме
+        # просто не существует. Измеряем РЕАЛЬНЫЙ, полный итог круга и
+        # автоматически останавливаем торговлю, если он оказался в минусе.
+        if real_result.get("real_transfer_mode"):
+            try:
+                capital_after = None
+                if capital_before is not None:
+                    await asyncio.sleep(config.get("factual_delta_delay_sec", 2.5))
+                    capital_after = await get_total_real_capital(session)
+            finally:
+                if _capital_measurement_lock.locked():
+                    _capital_measurement_lock.release()
+
+            if capital_after is not None and capital_before is not None:
+                factual_delta = round(capital_after["total"] - capital_before["total"], 4)
+                kucoin_before = capital_before.get("per_exchange", {}).get("KuCoin")
+                kucoin_after = capital_after.get("per_exchange", {}).get("KuCoin")
+                kucoin_usdt_growth = (round(kucoin_after - kucoin_before, 4)
+                                       if kucoin_before is not None and kucoin_after is not None else None)
+
+                if CHAT_ID:
+                    return_note = ""
+                    if real_result.get("return_attempted"):
+                        if real_result.get("return_success"):
+                            return_note = f"\n✅ USDT возвращён на KuCoin: ${real_result.get('usdt_returned'):.4f}"
+                        else:
+                            return_note = "\n⚠️ Возврат USDT на KuCoin НЕ подтверждён — проверь вручную!"
+                    await send_tg(session,
+                        f"🔄 *ПОЛНЫЙ КРУГ ЗАВЕРШЁН* (реальный перевод, не оценка)\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"Общий итог (весь капитал): {factual_delta:+.4f} USDT\n"
+                        f"Рост USDT именно на KuCoin: "
+                        f"{f'{kucoin_usdt_growth:+.4f}' if kucoin_usdt_growth is not None else 'н/д'}"
+                        f"{return_note}"
+                    )
+
+                # ГЛАВНОЕ ПРАВИЛО пользователя (пункт 4-6 плана): "положительный
+                # результат — это когда на KuCoin РАСТЁТ величина USDT в реальных
+                # деньгах". Если рост отрицательный или неизвестен — пауза.
+                if kucoin_usdt_growth is None or kucoin_usdt_growth <= 0:
+                    config["paused"] = True
+                    if CHAT_ID:
+                        await send_tg(session,
+                            f"🛑 *КРУГ ДАЛ УБЫТОК ИЛИ НЕ ИЗМЕРЕН — ТОРГОВЛЯ ОСТАНОВЛЕНА*\n\n"
+                            f"Рост USDT на KuCoin: "
+                            f"{f'{kucoin_usdt_growth:+.4f}' if kucoin_usdt_growth is not None else 'не удалось измерить'}\n"
+                            f"Это единственный критерий успеха (по твоему правилу) — "
+                            f"деньги должны реально прирастать на KuCoin, не в теории.\n\n"
+                            f"Проверь `/realbalance` и логи Railway, прежде чем `/go`."
+                        )
+        elif real_result.get("success"):
             # НОВОЕ 08.08: раньше единственная метрика P&L была "Реальный
             # баланс" целиком — а это ОБЩАЯ рыночная стоимость портфеля,
             # включая переоценку резерва монеты по текущей цене. Колебание
@@ -5821,6 +6243,174 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Допустимый запас на продаже: {val}%")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setsellslippage 0.1`")
+
+    elif cmd == "/showmexcaddresses":
+        # НОВОЕ 29.08 (КРИТИЧНО ВАЖНО ДЛЯ БЕЗОПАСНОСТИ): показывает ВСЕ
+        # доступные сети для депозита на MEXC — пользователь должен сам
+        # СВЕРИТЬ это с приложением MEXC (не доверять слепо API), из-за
+        # ПОДТВЕРЖДЁННОГО документацией бага, когда MEXC иногда отдаёт
+        # адрес НЕ ТОЙ сети. Никогда не используется автоматически.
+        if len(parts) < 2:
+            await send_tg(session, "❌ Укажи монету: `/showmexcaddresses ONE`")
+            return
+        coin = parts[1].upper()
+        addrs = await get_mexc_deposit_addresses_all_networks(session, coin)
+        if not addrs:
+            await send_tg(session, f"❌ Не удалось получить адреса для {coin} — "
+                                     f"проверь права API-ключа (нужен SPOT_WITHDRAW_READ).")
+            return
+        lines = "\n".join(
+            f"  Сеть: {a.get('network')} | Адрес: `{a.get('address')}` | "
+            f"Memo: `{a.get('memo') or 'нет'}`"
+            for a in addrs
+        )
+        await send_tg(session,
+            f"📥 *Доступные адреса депозита {coin} на MEXC:*\n\n{lines}\n\n"
+            f"⚠️ *ОБЯЗАТЕЛЬНО* сверь каждый адрес вручную в приложении MEXC "
+            f"(Assets → Deposit → {coin}), прежде чем подтверждать — есть "
+            f"подтверждённый баг API, иногда отдающий адрес не той сети.\n\n"
+            f"Когда сверил и уверен — подтверди: "
+            f"`/confirmtransferaddr {coin} СЕТЬ АДРЕС [MEMO]`"
+        )
+
+    elif cmd == "/confirmtransferaddr":
+        # НОВОЕ 29.08 (КРИТИЧНО): единственный способ зафиксировать адрес
+        # для реальных переводов — ТОЛЬКО вручную, после того как
+        # пользователь сам сверил его в приложении MEXC. Бот НИКОГДА не
+        # выбирает и не использует адрес автоматически без этого шага.
+        if len(parts) < 4:
+            await send_tg(session,
+                "❌ Пример: `/confirmtransferaddr ONE Harmony inj1u2...` "
+                "(добавь memo четвёртым параметром, если сеть его требует)"
+            )
+            return
+        coin, network, address = parts[1].upper(), parts[2], parts[3]
+        memo = parts[4] if len(parts) > 4 else None
+        config["confirmed_mexc_deposit_address"] = address
+        config["confirmed_mexc_deposit_network"] = network
+        config["confirmed_mexc_deposit_memo"] = memo
+        await send_tg(session,
+            f"✅ Адрес для реальных переводов {coin} ЗАФИКСИРОВАН:\n"
+            f"   Сеть: {network}\n"
+            f"   Адрес: `{address}`\n"
+            f"   Memo: `{memo or 'нет'}`\n\n"
+            f"⚠️ Это ещё НЕ включает режим реального перевода — используй "
+            f"`/setrealtransfer on`, когда будешь готов протестировать "
+            f"(рекомендуется сначала на минимальной сумме)."
+        )
+
+    elif cmd == "/initcyclebalance":
+        # НОВОЕ 29.08 (пункт 1 плана пользователя): продаёт ВСЮ монету на
+        # KuCoin в USDT и докупает ONE на MEXC вместо простаивающего USDT,
+        # готовя биржи к новой архитектуре (KuCoin — только USDT, MEXC —
+        # только ONE). Делает это ЧЕРЕЗ обычные рыночные ордера,
+        # безопасно, с явным отчётом что было продано/куплено.
+        await send_tg(session, "📡 Читаю балансы и готовлю биржи к новой архитектуре...")
+        actions = []
+        kucoin_balances = await get_real_balances(session, "KuCoin")
+        if kucoin_balances:
+            for sym in list(SYMBOLS):
+                qty = kucoin_balances.get(sym, 0.0)
+                if qty > 0:
+                    sell_qty = await round_quantity_for_exchange(session, "KuCoin", sym, qty)
+                    if sell_qty > 0:
+                        result = await place_order_kucoin(session, sym, "sell", sell_qty, use_funds=False)
+                        actions.append(f"KuCoin: продано {sell_qty} {sym} → USDT "
+                                        f"({'✅' if result else '❌'})")
+        mexc_balances = await get_real_balances(session, "MEXC")
+        if mexc_balances:
+            usdt_on_mexc = mexc_balances.get("USDT", 0.0)
+            if usdt_on_mexc > 1.0 and SYMBOLS:
+                buy_amount = round(usdt_on_mexc * 0.98, 2)
+                result = await place_order_mexc(session, SYMBOLS[0], "BUY", buy_amount)
+                actions.append(f"MEXC: куплено ONE на ~${buy_amount} "
+                                f"({'✅' if result else '❌'})")
+        if actions:
+            await send_tg(session, "📋 *Выполнено:*\n" + "\n".join(actions))
+        else:
+            await send_tg(session, "ℹ️ Действий не потребовалось — балансы уже в нужной форме.")
+
+    elif cmd == "/showkucoinusdtaddr":
+        # НОВОЕ 29.08 (пункт 3-4 плана): показывает адрес депозита USDT на
+        # KuCoin для конкретной сети (по умолчанию Polygon — совместима с
+        # дешёвым выводом MEXC $0.007-0.01). Та же логика безопасности,
+        # что и для ONE — ОБЯЗАТЕЛЬНАЯ ручная сверка перед использованием.
+        chain = parts[1] if len(parts) > 1 else "polygon"
+        addr_data = await get_kucoin_deposit_address(session, "USDT", chain)
+        if not addr_data:
+            await send_tg(session, f"❌ Не удалось получить адрес USDT/{chain} на KuCoin. "
+                                     f"Попробуй другую сеть: `/showkucoinusdtaddr bsc` или "
+                                     f"`/showkucoinusdtaddr trx`")
+            return
+        await send_tg(session,
+            f"📥 *Адрес депозита USDT на KuCoin (сеть {chain}):*\n\n"
+            f"Адрес: `{addr_data.get('address')}`\n"
+            f"Memo: `{addr_data.get('memo') or 'нет'}`\n\n"
+            f"⚠️ *ОБЯЗАТЕЛЬНО* сверь вручную в приложении KuCoin "
+            f"(Assets → Deposit → USDT → сеть {chain}), прежде чем подтверждать.\n\n"
+            f"Когда сверил — подтверди: "
+            f"`/confirmusdtaddr {chain} <адрес> [memo]`"
+        )
+
+    elif cmd == "/confirmusdtaddr":
+        # НОВОЕ 29.08 (КРИТИЧНО): фиксирует адрес USDT на KuCoin для
+        # автоматического возврата — ТОЛЬКО после ручной сверки, та же
+        # защита, что и для адреса ONE на MEXC.
+        if len(parts) < 3:
+            await send_tg(session,
+                "❌ Пример: `/confirmusdtaddr polygon 0xAbC... ` "
+                "(memo четвёртым параметром, если сеть требует)"
+            )
+            return
+        network, address = parts[1], parts[2]
+        memo = parts[3] if len(parts) > 3 else None
+        config["confirmed_kucoin_usdt_address"] = address
+        config["confirmed_kucoin_usdt_network"] = network
+        config["confirmed_kucoin_usdt_memo"] = memo
+        await send_tg(session,
+            f"✅ Адрес возврата USDT на KuCoin ЗАФИКСИРОВАН:\n"
+            f"   Сеть: {network}\n"
+            f"   Адрес: `{address}`\n"
+            f"   Memo: `{memo or 'нет'}`\n\n"
+            f"Теперь полный круг (KuCoin→MEXC→KuCoin) будет завершаться "
+            f"автоматически при каждой сделке."
+        )
+
+    elif cmd == "/setrealtransfer":
+        # НОВОЕ 29.08 (КРИТИЧНО): включает/выключает НОВУЮ архитектуру
+        # с реальным физическим переводом монеты между биржами вместо
+        # старой модели с двумя раздельными резервами. ТРЕБУЕТ, чтобы
+        # адрес был предварительно подтверждён через /confirmtransferaddr.
+        if len(parts) < 2:
+            cur = config.get("use_real_transfer_mode", False)
+            addr = config.get("confirmed_mexc_deposit_address")
+            await send_tg(session,
+                f"Режим реального перевода: {'✅ ВКЛЮЧЕН' if cur else '⛔ выключен'}\n"
+                f"Подтверждённый адрес: {addr or 'НЕ задан — сначала /confirmtransferaddr'}\n\n"
+                f"Пример: `/setrealtransfer on` или `/setrealtransfer off`"
+            )
+            return
+        val = parts[1].lower()
+        if val in ("on", "1", "true", "вкл"):
+            if not config.get("confirmed_mexc_deposit_address"):
+                await send_tg(session,
+                    "❌ Сначала подтверди адрес: `/showmexcaddresses ONE`, "
+                    "сверь вручную с приложением MEXC, затем "
+                    "`/confirmtransferaddr ONE СЕТЬ АДРЕС`"
+                )
+                return
+            config["use_real_transfer_mode"] = True
+            await send_tg(session,
+                "✅ Режим реального перевода ВКЛЮЧЁН. Каждая сделка теперь: "
+                "купить на KuCoin → ВЫВЕСТИ на подтверждённый адрес MEXC → "
+                "дождаться реального зачисления → продать. "
+                "⚠️ Рекомендуется первую сделку внимательно отследить вручную."
+            )
+        elif val in ("off", "0", "false", "выкл"):
+            config["use_real_transfer_mode"] = False
+            await send_tg(session, "✅ Режим реального перевода выключен — вернулись к старой модели резервов.")
+        else:
+            await send_tg(session, "❌ Пример: `/setrealtransfer on`")
 
     elif cmd == "/realcalib":
         # НОВОЕ 28.08 (по прямому запросу пользователя — "динамическая
