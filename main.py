@@ -2899,11 +2899,15 @@ config["transfer_withdrawal_timeout_sec"] = 120  # максимум ожидан
 config["transfer_min_confirmations_buffer_sec"] = 5  # доп. запас после статуса SUCCESS
 
 
-async def get_mexc_deposit_addresses_all_networks(session, coin: str) -> List[dict]:
+async def get_mexc_deposit_addresses_all_networks(session, coin: str) -> Tuple[List[dict], Optional[str]]:
     """НОВОЕ 29.08: получает ВСЕ доступные сети для депозита монеты на MEXC —
     возвращает список, НЕ выбирая автоматически 'правильную' сеть, чтобы
     пользователь мог ВРУЧНУЮ сверить адрес с приложением MEXC перед тем, как
-    доверить ему реальные деньги (см. КРИТИЧНУЮ НАХОДКУ БЕЗОПАСНОСТИ выше)."""
+    доверить ему реальные деньги (см. КРИТИЧНУЮ НАХОДКУ БЕЗОПАСНОСТИ выше).
+
+    ИСПРАВЛЕНО 31.08 (по прямому запросу пользователя — сообщение об ошибке
+    показывало ПРЕДПОЛОЖЕНИЕ о причине, не реальный ответ биржи): теперь
+    возвращает и сырой текст ошибки от MEXC вторым элементом кортежа."""
     ts = int(time.time() * 1000)
     params = {"coin": coin, "timestamp": ts, "recvWindow": 5000}
     params["signature"] = sign_binance(params, MEXC_SECRET)
@@ -2914,12 +2918,12 @@ async def get_mexc_deposit_addresses_all_networks(session, coin: str) -> List[di
                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
             data = await r.json()
             if isinstance(data, list):
-                return data
+                return data, None
             logger.error(f"MEXC deposit address unexpected response: {data}")
-            return []
+            return [], str(data)
     except Exception as e:
         logger.error(f"MEXC deposit address fetch exception: {e}")
-        return []
+        return [], str(e)
 
 
 async def withdraw_from_kucoin(session, currency: str, amount: float, address: str,
@@ -6254,10 +6258,10 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Укажи монету: `/showmexcaddresses ONE`")
             return
         coin = parts[1].upper()
-        addrs = await get_mexc_deposit_addresses_all_networks(session, coin)
+        addrs, error_detail = await get_mexc_deposit_addresses_all_networks(session, coin)
         if not addrs:
-            await send_tg(session, f"❌ Не удалось получить адреса для {coin} — "
-                                     f"проверь права API-ключа (нужен SPOT_WITHDRAW_READ).")
+            await send_tg(session, f"❌ Не удалось получить адреса для {coin}.\n\n"
+                                     f"Реальный ответ биржи: `{error_detail or 'нет данных'}`")
             return
         lines = "\n".join(
             f"  Сеть: {a.get('network')} | Адрес: `{a.get('address')}` | "
