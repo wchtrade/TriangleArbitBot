@@ -6334,6 +6334,28 @@ async def handle_command(session, text, chat_id):
         else:
             await send_tg(session, "ℹ️ Действий не потребовалось — балансы уже в нужной форме.")
 
+    elif cmd == "/myip":
+        # НОВОЕ 31.08 (по прямому запросу пользователя — KuCoin требует
+        # привязку API-ключа к конкретному IP для разрешения на вывод):
+        # показывает РЕАЛЬНЫЙ внешний IP сервера Railway, с которого идут
+        # запросы к биржам — это нужно указать при настройке ключа.
+        try:
+            async with session.get("https://api.ipify.org?format=json",
+                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+                ip = data.get("ip", "не удалось определить")
+                await send_tg(session,
+                    f"🌐 *Внешний IP этого сервера:* `{ip}`\n\n"
+                    f"Именно этот IP нужно указать при настройке разрешения "
+                    f"на вывод в API-ключе KuCoin/MEXC.\n\n"
+                    f"⚠️ Важно: на Railway (бесплатный/стандартный тариф) IP "
+                    f"может МЕНЯТЬСЯ при каждом передеплое или перезапуске — "
+                    f"если ключ вдруг перестанет работать после следующего "
+                    f"деплоя, сначала проверь `/myip` ещё раз."
+                )
+        except Exception as e:
+            await send_tg(session, f"❌ Не удалось определить IP: {e}")
+
     elif cmd == "/showkucoinusdtaddr":
         # НОВОЕ 29.08 (пункт 3-4 плана): показывает адрес депозита USDT на
         # KuCoin для конкретной сети (по умолчанию Polygon — совместима с
