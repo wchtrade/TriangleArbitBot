@@ -3018,9 +3018,12 @@ async def wait_for_transfer_complete(session, withdrawal_id: str, symbol: str,
 # вывода на MEXC ~$0.01-0.007, KuCoin официально поддерживает приём USDT
 # именно на Polygon POS Network (подтверждено объявлением биржи).
 
-async def get_kucoin_deposit_address(session, currency: str, chain: str) -> Optional[dict]:
+async def get_kucoin_deposit_address(session, currency: str, chain: str) -> Tuple[Optional[dict], Optional[str]]:
     """НОВОЕ 29.08: получает адрес депозита на KuCoin для конкретной сети —
-    нужен для возврата USDT с MEXC обратно на KuCoin."""
+    нужен для возврата USDT с MEXC обратно на KuCoin.
+
+    ИСПРАВЛЕНО 31.08 (по прямому запросу пользователя — команда молчала о
+    реальной причине ошибки): теперь возвращает и сырой ответ биржи."""
     endpoint = f"/api/v3/deposit-addresses?currency={currency}&chain={chain}"
     ts = str(int(time.time() * 1000))
     signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "GET", endpoint, "")
@@ -3032,11 +3035,12 @@ async def get_kucoin_deposit_address(session, currency: str, chain: str) -> Opti
             data = await r.json()
             items = data.get("data")
             if items:
-                return items[0] if isinstance(items, list) else items
+                return (items[0] if isinstance(items, list) else items), None
             logger.error(f"KuCoin deposit address {currency}/{chain}: {data}")
+            return None, str(data)
     except Exception as e:
         logger.error(f"KuCoin deposit address exception: {e}")
-    return None
+        return None, str(e)
 
 
 async def withdraw_usdt_from_mexc(session, amount: float, address: str,
@@ -6362,9 +6366,10 @@ async def handle_command(session, text, chat_id):
         # дешёвым выводом MEXC $0.007-0.01). Та же логика безопасности,
         # что и для ONE — ОБЯЗАТЕЛЬНАЯ ручная сверка перед использованием.
         chain = parts[1] if len(parts) > 1 else "polygon"
-        addr_data = await get_kucoin_deposit_address(session, "USDT", chain)
+        addr_data, error_detail = await get_kucoin_deposit_address(session, "USDT", chain)
         if not addr_data:
-            await send_tg(session, f"❌ Не удалось получить адрес USDT/{chain} на KuCoin. "
+            await send_tg(session, f"❌ Не удалось получить адрес USDT/{chain} на KuCoin.\n\n"
+                                     f"Реальный ответ биржи: `{error_detail or 'нет данных'}`\n\n"
                                      f"Попробуй другую сеть: `/showkucoinusdtaddr bsc` или "
                                      f"`/showkucoinusdtaddr trx`")
             return
