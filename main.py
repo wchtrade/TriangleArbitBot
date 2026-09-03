@@ -2922,8 +2922,9 @@ async def get_mexc_deposit_addresses_all_networks(session, coin: str) -> Tuple[L
             logger.error(f"MEXC deposit address unexpected response: {data}")
             return [], str(data)
     except Exception as e:
-        logger.error(f"MEXC deposit address fetch exception: {e}")
-        return [], str(e)
+        logger.error(f"MEXC deposit address fetch exception: {type(e).__name__}: {e}")
+        error_text = str(e) or f"{type(e).__name__} (без текста ошибки — проверь логи Railway)"
+        return [], error_text
 
 
 async def withdraw_from_kucoin(session, currency: str, amount: float, address: str,
