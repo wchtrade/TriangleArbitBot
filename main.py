@@ -3043,6 +3043,41 @@ async def get_kucoin_deposit_address(session, currency: str, chain: str) -> Tupl
         return None, str(e)
 
 
+async def kucoin_inner_transfer(session, currency: str, amount: float,
+                                  from_acc: str, to_acc: str) -> Optional[dict]:
+    """НОВОЕ 31.08 (по прямому запросу пользователя — найдена важная
+    практическая проблема: депозит через блокчейн на KuCoin попадает на
+    MAIN аккаунт, а торговля идёт с TRADE аккаунта — деньги НЕ переходят
+    между ними автоматически). Официальный эндпоинт
+    /api/v2/accounts/inner-transfer, бесплатный внутри одной биржи."""
+    endpoint = "/api/v2/accounts/inner-transfer"
+    ts = str(int(time.time() * 1000))
+    body = {
+        "clientOid": str(uuid.uuid4()), "currency": currency,
+        "amount": str(amount), "from": from_acc, "to": to_acc,
+    }
+    import json as _json
+    body_str = _json.dumps(body)
+    signature, passphrase_signed = sign_kucoin(KUCOIN_SECRET, KUCOIN_PASS, ts, "POST", endpoint, body_str)
+    headers = {
+        "KC-API-KEY": KUCOIN_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": passphrase_signed, "KC-API-KEY-VERSION": "2",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.post(f"https://api.kucoin.com{endpoint}", headers=headers,
+                                  data=body_str, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if data.get("code") != "200000":
+                logger.error(f"KuCoin inner transfer failed: {data}")
+                return None
+            logger.info(f"✅ KuCoin inner transfer {from_acc}→{to_acc}: {amount} {currency}")
+            return data.get("data")
+    except Exception as e:
+        logger.error(f"KuCoin inner transfer exception: {e}")
+        return None
+
+
 async def withdraw_usdt_from_mexc(session, amount: float, address: str,
                                     network: str, memo: Optional[str] = None) -> Optional[dict]:
     """НОВОЕ 29.08: реальный вывод USDT с MEXC на подтверждённый адрес
@@ -3683,8 +3718,18 @@ async def execute_real_arbitrage_with_transfer(session, opp: dict) -> dict:
                 usdt_received = await wait_for_usdt_return_complete(
                     session, usdt_withdrawal.get("id"), kucoin_usdt_before_return,
                     timeout=config.get("transfer_withdrawal_timeout_sec", 120))
+                inner_transfer_ok = None
+                if usdt_received:
+                    # НОВОЕ 31.08 (по прямому запросу пользователя — критично
+                    # важный практический шаг): депозит через блокчейн попадает
+                    # на MAIN аккаунт KuCoin, а торговля идёт с TRADE — без
+                    # этого перевода следующая покупка ONE провалится, "увидев"
+                    # пустой торговый счёт, хотя деньги физически на бирже.
+                    inner_result = await kucoin_inner_transfer(
+                        session, "USDT", round(usdt_received * 0.999, 4), "main", "trade")
+                    inner_transfer_ok = inner_result is not None
                 return_result = {"return_attempted": True, "return_success": usdt_received is not None,
-                                   "usdt_returned": usdt_received}
+                                   "usdt_returned": usdt_received, "inner_transfer_ok": inner_transfer_ok}
             else:
                 return_result = {"return_attempted": True, "return_success": False,
                                    "error": "usdt_withdrawal_from_mexc_failed"}
@@ -4770,6 +4815,18 @@ async def execute_trade(session, opp: dict) -> dict:
                     if real_result.get("return_attempted"):
                         if real_result.get("return_success"):
                             return_note = f"\n✅ USDT возвращён на KuCoin: ${real_result.get('usdt_returned'):.4f}"
+                            # НОВОЕ 31.08 (по прямому запросу пользователя):
+                            # депозит попадает на MAIN аккаунт KuCoin, а
+                            # торговля идёт с TRADE — без внутреннего перевода
+                            # следующая покупка провалится, даже если деньги
+                            # реально на бирже.
+                            if real_result.get("inner_transfer_ok"):
+                                return_note += "\n✅ Переведено на торговый счёт (main→trade)"
+                            elif real_result.get("inner_transfer_ok") is False:
+                                return_note += ("\n🛑 Внутренний перевод main→trade НЕ УДАЛСЯ — "
+                                                  "деньги на KuCoin, но на MAIN счёте, следующая "
+                                                  "покупка провалится! Переведи вручную: Assets → "
+                                                  "Transfer → USDT → Main→Trade.")
                         else:
                             return_note = "\n⚠️ Возврат USDT на KuCoin НЕ подтверждён — проверь вручную!"
                     await send_tg(session,
