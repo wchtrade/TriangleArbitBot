@@ -6308,31 +6308,30 @@ async def handle_command(session, text, chat_id):
         )
 
     elif cmd == "/initcyclebalance":
-        # НОВОЕ 29.08 (пункт 1 плана пользователя): продаёт ВСЮ монету на
-        # KuCoin в USDT и докупает ONE на MEXC вместо простаивающего USDT,
-        # готовя биржи к новой архитектуре (KuCoin — только USDT, MEXC —
-        # только ONE). Делает это ЧЕРЕЗ обычные рыночные ордера,
-        # безопасно, с явным отчётом что было продано/куплено.
-        await send_tg(session, "📡 Читаю балансы и готовлю биржи к новой архитектуре...")
+        # ИСПРАВЛЕНО 31.08 (по прямому запросу пользователя, найдена
+        # ошибка в моей же логике): в НОВОЙ архитектуре (реальный перевод
+        # монеты между биржами) MEXC НЕ должен держать заранее запасённую
+        # монету — она приходит туда только В МОМЕНТ перевода, продаётся
+        # сразу и не задерживается. ОБЕ биржи должны стремиться держать
+        # ВЕСЬ капитал в USDT, готовым к следующему циклу — именно так,
+        # как и должно быть в правильной, "чистой" версии этой схемы.
+        await send_tg(session, "📡 Читаю балансы и готовлю биржи к новой архитектуре "
+                                 "(обе биржи → весь капитал в USDT)...")
         actions = []
-        kucoin_balances = await get_real_balances(session, "KuCoin")
-        if kucoin_balances:
-            for sym in list(SYMBOLS):
-                qty = kucoin_balances.get(sym, 0.0)
-                if qty > 0:
-                    sell_qty = await round_quantity_for_exchange(session, "KuCoin", sym, qty)
-                    if sell_qty > 0:
-                        result = await place_order_kucoin(session, sym, "sell", sell_qty, use_funds=False)
-                        actions.append(f"KuCoin: продано {sell_qty} {sym} → USDT "
-                                        f"({'✅' if result else '❌'})")
-        mexc_balances = await get_real_balances(session, "MEXC")
-        if mexc_balances:
-            usdt_on_mexc = mexc_balances.get("USDT", 0.0)
-            if usdt_on_mexc > 1.0 and SYMBOLS:
-                buy_amount = round(usdt_on_mexc * 0.98, 2)
-                result = await place_order_mexc(session, SYMBOLS[0], "BUY", buy_amount)
-                actions.append(f"MEXC: куплено ONE на ~${buy_amount} "
-                                f"({'✅' if result else '❌'})")
+        for ex in ["KuCoin", "MEXC"]:
+            balances = await get_real_balances(session, ex)
+            if balances:
+                for sym in list(SYMBOLS):
+                    qty = balances.get(sym, 0.0)
+                    if qty > 0:
+                        sell_qty = await round_quantity_for_exchange(session, ex, sym, qty)
+                        if sell_qty > 0:
+                            if ex == "KuCoin":
+                                result = await place_order_kucoin(session, sym, "sell", sell_qty, use_funds=False)
+                            else:
+                                result = await place_order_mexc(session, sym, "SELL", sell_qty)
+                            actions.append(f"{ex}: продано {sell_qty} {sym} → USDT "
+                                            f"({'✅' if result else '❌'})")
         if actions:
             await send_tg(session, "📋 *Выполнено:*\n" + "\n".join(actions))
         else:
