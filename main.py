@@ -8371,8 +8371,7 @@ async def main():
         return
     logger.info("DepthArbBot стартует — WebSocket-стаканы на всех трёх биржах")
     logger.info("=" * 60)
-    logger.info("🔖 ВЕРСИЯ КОДА: 2026-08-29-v3 (с /realcalib, /setexbuffer, "
-                 "/setmaxthreshold, /setcrossingceiling)")
+    logger.info("🔖 ВЕРСИЯ КОДА: 2026-09-03-v4 (исправлен показ ошибки MEXC deposit address)")
     logger.info("=" * 60)
     connector = aiohttp.TCPConnector(ssl=True)  # SSL включён, не отключаем проверку сертификатов
     async with aiohttp.ClientSession(connector=connector) as session:
