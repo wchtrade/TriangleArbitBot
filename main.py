@@ -409,26 +409,39 @@ pnl_history: List[Tuple[float, float]] = []  # (timestamp, pnl_real)
 # невозможно, но ОПИСАТЕЛЬНЫЙ тренд за последние часы — можно. Это НЕ
 # предсказание будущего, а честный взгляд назад: росла или падала цена
 # за последние 24 часа. Хранит точки за последние 24 часа, вычищает старые.
-price_history: List[Tuple[float, float]] = []  # (timestamp, mid_price)
+price_history: List[Tuple[float, float]] = []  # (timestamp, mid_price) — DEPRECATED, оставлено
+    # для обратной совместимости старого кода, реально больше не используется
+# ИСПРАВЛЕНО 04.09 (КРИТИЧНО, по прямому запросу пользователя — найден
+# серьёзный баг: с добавлением нескольких монет ОДНА общая price_history
+# мешала в кучу цены РАЗНЫХ монет (EGLD ~4.5, RUNE и ILV совсем другого
+# масштаба) — предохранитель волатильности считал "движение" между ценами
+# РАЗНЫХ активов, получая абсурдные числа вроде 16266% за 15 минут.
+# Теперь — отдельная история цены для КАЖДОЙ монеты.
+price_history_by_symbol: Dict[str, List[Tuple[float, float]]] = {}
 
 
-def record_price_and_get_trend() -> Optional[dict]:
-    """Записывает текущую цену IOST (среднюю между best bid/ask на бирже
-    продажи), вычищает точки старше 24 часов, возвращает честное описание
-    тренда: было — сейчас — % изменения. НЕ предсказывает, куда пойдёт
-    цена дальше — только показывает, что происходило до сих пор."""
-    if not price_history:
+def record_price_and_get_trend(symbol: Optional[str] = None) -> Optional[dict]:
+    """Записывает текущую цену КОНКРЕТНОЙ монеты, вычищает точки старше 24
+    часов, возвращает честное описание тренда: было — сейчас — % изменения.
+    НЕ предсказывает, куда пойдёт цена дальше — только показывает, что
+    происходило до сих пор. Если symbol не указан — использует первую
+    монету из SYMBOLS (обратная совместимость)."""
+    sym = symbol or (SYMBOLS[0] if SYMBOLS else None)
+    if not sym:
+        return None
+    hist = price_history_by_symbol.get(sym, [])
+    if not hist:
         return None
     now_ts = time.time()
     cutoff = now_ts - 86400
-    while price_history and price_history[0][0] < cutoff:
-        price_history.pop(0)
-    if len(price_history) < 2:
+    while hist and hist[0][0] < cutoff:
+        hist.pop(0)
+    if len(hist) < 2:
         return None
-    oldest_price = price_history[0][1]
-    newest_price = price_history[-1][1]
+    oldest_price = hist[0][1]
+    newest_price = hist[-1][1]
     change_pct = (newest_price - oldest_price) / oldest_price * 100
-    hours_span = (price_history[-1][0] - price_history[0][0]) / 3600
+    hours_span = (hist[-1][0] - hist[0][0]) / 3600
     return {
         "oldest": oldest_price, "newest": newest_price,
         "change_pct": round(change_pct, 3), "hours_span": round(hours_span, 1),
@@ -1676,7 +1689,7 @@ async def scan_all(session) -> Tuple[List[dict], List[str]]:
             # за 15 минут фоновым предохранителем, который реагирует
             # только постфактум.
             if sob.get("bids"):
-                price_history.append((time.time(), sob["bids"][0][0]))
+                price_history_by_symbol.setdefault(sym, []).append((time.time(), sob["bids"][0][0]))
             opp = calc_arb_real(sym, buy_ex, bob, sell_ex, sob, scan_lot)
             if opp:
                 signals.append(opp)
@@ -5662,8 +5675,8 @@ async def handle_command(session, text, chat_id):
                     if SYMBOLS:
                         price_now = await get_valuation_price(session, "MEXC", SYMBOLS[0])
                         if price_now:
-                            price_history.append((time.time(), price_now))
-                            trend = record_price_and_get_trend()
+                            price_history_by_symbol.setdefault(SYMBOLS[0], []).append((time.time(), price_now))
+                            trend = record_price_and_get_trend(SYMBOLS[0])
                             if trend:
                                 icon = "📈" if trend["change_pct"] > 0 else "📉" if trend["change_pct"] < 0 else "➡️"
                                 trend_line = (
@@ -6112,6 +6125,32 @@ async def handle_command(session, text, chat_id):
                                         f"цены больше {val}% за 15 минут.")
         except ValueError:
             await send_tg(session, "❌ Пример: `/setmaxvolatility 3`")
+
+    elif cmd == "/setautoresume":
+        # НОВОЕ 04.09 (по прямому запросу пользователя — "можно чтобы сам
+        # включался после волатильности"): опциональное автовозобновление
+        # торговли после того, как предохранитель волатильности сам её
+        # остановил. НЕ трогает ручную паузу (/pause) — только паузу,
+        # поставленную именно этим предохранителем.
+        if len(parts) < 2:
+            cur = config.get("auto_resume_after_volatility", False)
+            await send_tg(session,
+                f"Автовозобновление после волатильности: {'✅ ВКЛЮЧЕНО' if cur else '⛔ выключено'}\n\n"
+                f"Если включено — бот САМ снимет паузу, как только волатильность "
+                f"успокоится (не трогает ручную /pause).\n\n"
+                f"Пример: `/setautoresume on` или `/setautoresume off`"
+            )
+            return
+        val = parts[1].lower()
+        if val in ("on", "1", "true", "вкл"):
+            config["auto_resume_after_volatility"] = True
+            await send_tg(session, "✅ Автовозобновление ВКЛЮЧЕНО — бот сам снимет паузу "
+                                     "после успокоения волатильности.")
+        elif val in ("off", "0", "false", "выкл"):
+            config["auto_resume_after_volatility"] = False
+            await send_tg(session, "✅ Автовозобновление выключено — как раньше, нужен ручной /go.")
+        else:
+            await send_tg(session, "❌ Пример: `/setautoresume on`")
 
     elif cmd == "/setwatchdoginterval":
         # НОВОЕ 17.08: как часто reserve_watchdog_loop заранее проверяет и
@@ -8239,22 +8278,34 @@ async def profit_target_lock_loop(session):
         await asyncio.sleep(300)
 
 
-def get_recent_price_volatility_pct(minutes: int = 15) -> Optional[float]:
-    """НОВОЕ 16.08: считает МАКСИМАЛЬНОЕ движение цены (в любую сторону)
-    за последние N минут из уже существующей price_history — та же
-    инфраструктура, что и честный индикатор тренда в /stats. Возвращает
-    None, если данных ещё недостаточно (например, только что запустились)."""
-    if len(price_history) < 2:
+def get_recent_price_volatility_pct(minutes: int = 15, symbol: Optional[str] = None) -> Optional[float]:
+    """ИСПРАВЛЕНО 04.09 (КРИТИЧНО, по прямому запросу пользователя — найден
+    баг: раньше все монеты писали в ОДНУ общую price_history, предохранитель
+    считал 'движение' между ценами РАЗНЫХ активов, получая абсурдные числа
+    вроде 16266%). Теперь считает волатильность КОНКРЕТНОЙ монеты (если
+    указана) или МАКСИМАЛЬНУЮ среди ВСЕХ отслеживаемых монет (если нет) —
+    консервативный подход, чтобы не пропустить реальный скачок ни одной
+    из них."""
+    symbols_to_check = [symbol] if symbol else list(price_history_by_symbol.keys())
+    if not symbols_to_check:
         return None
     now_ts = time.time()
     cutoff = now_ts - minutes * 60
-    recent = [p for ts, p in price_history if ts >= cutoff]
-    if len(recent) < 2:
-        return None
-    lo, hi = min(recent), max(recent)
-    if lo <= 0:
-        return None
-    return round((hi - lo) / lo * 100, 3)
+    max_volatility = None
+    for sym in symbols_to_check:
+        hist = price_history_by_symbol.get(sym, [])
+        if len(hist) < 2:
+            continue
+        recent = [p for ts, p in hist if ts >= cutoff]
+        if len(recent) < 2:
+            continue
+        lo, hi = min(recent), max(recent)
+        if lo <= 0:
+            continue
+        vol = round((hi - lo) / lo * 100, 3)
+        if max_volatility is None or vol > max_volatility:
+            max_volatility = vol
+    return max_volatility
 
 
 async def volatility_guard_loop(session):
@@ -8274,13 +8325,13 @@ async def volatility_guard_loop(session):
         try:
             pct_threshold = config.get("max_volatility_pct_15min", 0)
             if pct_threshold > 0 and not config["simulation_mode"]:
-                # НОВОЕ 16.08: записываем цену САМИ, не полагаясь на то,
-                # что пользователь вызовет /stats — иначе предохранитель
-                # был бы слеп, пока никто не смотрит в чат.
-                if SYMBOLS:
-                    price_now = await get_valuation_price(session, "MEXC", SYMBOLS[0])
+                # ИСПРАВЛЕНО 04.09 (КРИТИЧНО): записываем цену КАЖДОЙ
+                # отслеживаемой монеты в ЕЁ СОБСТВЕННУЮ историю, не в общую —
+                # иначе волатильность считалась между ценами разных активов.
+                for sym in list(SYMBOLS):
+                    price_now = await get_valuation_price(session, "MEXC", sym)
                     if price_now:
-                        price_history.append((time.time(), price_now))
+                        price_history_by_symbol.setdefault(sym, []).append((time.time(), price_now))
                 vol = get_recent_price_volatility_pct(15)
                 if vol is not None:
                     if vol > pct_threshold:
@@ -8303,11 +8354,28 @@ async def volatility_guard_loop(session):
                                     f"Настройка порога: `/setmaxvolatility` (сейчас {pct_threshold}%)")
                     else:
                         if already_warned and CHAT_ID:
-                            await send_tg(session,
-                                f"✅ *Волатильность успокоилась*: {vol}% за 15 минут "
-                                f"(было выше {pct_threshold}%).\n\n"
-                                f"Можно рассмотреть `/go`, если готовы возобновить торговлю — "
-                                f"решение за вами, автоматически бот не возобновляет.")
+                            # НОВОЕ 04.09 (по прямому запросу пользователя —
+                            # "можно чтобы сам включался после волатильности"):
+                            # опциональное автовозобновление, по умолчанию
+                            # ВЫКЛЮЧЕНО (настраивается /setautoresume).
+                            auto_resume = config.get("auto_resume_after_volatility", False)
+                            # Возобновляем ТОЛЬКО если паузу поставил именно
+                            # этот предохранитель, а не пользователь вручную —
+                            # иначе можем случайно снять ручную паузу.
+                            if auto_resume and config["paused"] and not was_already_paused:
+                                config["paused"] = False
+                                await send_tg(session,
+                                    f"✅ *Волатильность успокоилась*: {vol}% за 15 минут "
+                                    f"(было выше {pct_threshold}%).\n\n"
+                                    f"🤖 Торговля возобновлена АВТОМАТИЧЕСКИ "
+                                    f"(включено через `/setautoresume on`).")
+                            else:
+                                await send_tg(session,
+                                    f"✅ *Волатильность успокоилась*: {vol}% за 15 минут "
+                                    f"(было выше {pct_threshold}%).\n\n"
+                                    f"Можно рассмотреть `/go`, если готовы возобновить торговлю — "
+                                    f"решение за вами, автоматически бот не возобновляет "
+                                    f"(включить: `/setautoresume on`).")
                         already_warned = False
         except Exception as e:
             logger.error(f"Volatility guard loop error: {e}")
@@ -8387,7 +8455,16 @@ async def scan_loop(session):
                                 )
 
                 # Авто-ребаланс — каждые ~30 мин (180 сканов × 10 сек)
-                if stats["scans"] % 180 == 0:
+                # ИСПРАВЛЕНО 04.09 (КРИТИЧНО, по прямому запросу пользователя
+                # — "зачем нужен ребаланс если это старый вариант логики"):
+                # найден ВТОРОЙ, отдельный источник старого авто-ребаланса,
+                # встроенный прямо в scan_loop (не только periodic_rebalance_
+                # loop, который мы уже отключили 04.09 раньше). В новой
+                # архитектуре (реальный перевод) предзаполненные резервы на
+                # MEXC не нужны — этот блок пытался "докупить" монету на MEXC
+                # заранее, что и создавало ложные требования "переведи
+                # $3.27 KuCoin→MEXC", ставя торговлю на паузу без причины.
+                if stats["scans"] % 180 == 0 and not config.get("use_real_transfer_mode", False):
                     if not config["simulation_mode"]:
                         config["paused"] = True
                         result = await real_auto_rebalance_all(session)
