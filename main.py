@@ -2891,10 +2891,12 @@ async def top_up_coin_reserve(session, ex: str, symbol: str, shortfall_qty: floa
 config["use_real_transfer_mode"] = False  # по умолчанию ВЫКЛЮЧЕНО — новая, ещё не
     # проверенная в бою архитектура. Включается явно через /setrealtransfer on
     # ТОЛЬКО после ручного подтверждения адреса.
-config["confirmed_mexc_deposit_address"] = None  # заполняется ТОЛЬКО через
-    # /confirmtransferaddr, никогда не автоматически
-config["confirmed_mexc_deposit_network"] = None
-config["confirmed_mexc_deposit_memo"] = None
+# ИСПРАВЛЕНО 04.09 (по прямому запросу пользователя — "добавить несколько
+# монет одновременно"): раньше адрес хранился ОДНИМ значением на всю
+# систему — при добавлении второй монеты её адрес ЗАТИРАЛ бы адрес первой,
+# ломая уже настроенную торговлю. Теперь — словарь {монета: адрес},
+# каждая монета хранит свой адрес независимо.
+config["confirmed_mexc_deposit_addresses"] = {}  # {symbol: {"address":..., "network":..., "memo":...}}
 config["transfer_withdrawal_timeout_sec"] = 120  # максимум ожидания перевода
 config["transfer_min_confirmations_buffer_sec"] = 5  # доп. запас после статуса SUCCESS
 
@@ -3603,15 +3605,19 @@ async def execute_real_arbitrage_with_transfer(session, opp: dict) -> dict:
     if not is_real_trading_allowed():
         return {"success": False, "error": "real_trading_not_unlocked"}
 
-    address = config.get("confirmed_mexc_deposit_address")
-    network = config.get("confirmed_mexc_deposit_network")
-    memo = config.get("confirmed_mexc_deposit_memo")
-    if not address or not network:
-        return {"success": False, "error": "transfer_address_not_confirmed: "
-                                             "используй /confirmtransferaddr сначала"}
-
     vol = min(opp["vol"], config["max_real_order_usdt"])
     symbol, buy_ex, sell_ex = opp["symbol"], opp["buy_ex"], opp["sell_ex"]
+
+    # ИСПРАВЛЕНО 04.09 (по прямому запросу пользователя — поддержка
+    # нескольких монет одновременно): адрес теперь ищется ПО КОНКРЕТНОЙ
+    # монете (symbol) в словаре, а не как единственное глобальное значение.
+    addr_info = config.get("confirmed_mexc_deposit_addresses", {}).get(symbol)
+    if not addr_info:
+        return {"success": False, "error": f"transfer_address_not_confirmed_for_{symbol}: "
+                                             f"используй /confirmtransferaddr {symbol} сначала"}
+    address = addr_info.get("address")
+    network = addr_info.get("network")
+    memo = addr_info.get("memo")
 
     if buy_ex != "KuCoin" or sell_ex != "MEXC":
         return {"success": False, "error": f"transfer_mode_only_supports_KuCoin_to_MEXC, "
@@ -3626,6 +3632,15 @@ async def execute_real_arbitrage_with_transfer(session, opp: dict) -> dict:
 
     if not buy_result:
         return {"success": False, "error": "buy_leg_failed_on_KuCoin_transfer_mode"}
+
+    # ИСПРАВЛЕНО 04.09 (КРИТИЧНО, по прямому запросу пользователя — найден
+    # баг: реальная покупка произошла, монета физически оказалась на MEXC,
+    # но stats/config["real_trades_today"] не увеличивался — /stats
+    # показывал "0 сделок исполнено", хотя факт был. Инкремент нужен СРАЗУ
+    # после подтверждённой покупки, не только в самом конце функции — иначе
+    # при обрыве цикла на любом следующем шаге (перевод/продажа/возврат)
+    # счётчик снова не отразит реально произошедшую покупку.
+    config["real_trades_today"] += 1
 
     confirmed_qty = await confirm_fill_and_get_qty(session, buy_ex, buy_result)
     if not confirmed_qty or confirmed_qty <= 0:
@@ -6322,8 +6337,21 @@ async def handle_command(session, text, chat_id):
         coin = parts[1].upper()
         addrs, error_detail = await get_mexc_deposit_addresses_all_networks(session, coin)
         if not addrs:
-            await send_tg(session, f"❌ Не удалось получить адреса для {coin}.\n\n"
-                                     f"Реальный ответ биржи: `{error_detail or 'нет данных'}`")
+            # ИСПРАВЛЕНО 03.09 (по прямому запросу пользователя, найдена
+            # причина "нет данных" — MEXC отвечает ПУСТЫМ СПИСКОМ, не
+            # ошибкой, если для этой монеты ещё НИ РАЗУ не создавался
+            # адрес депозита на этом аккаунте — та же ситуация, что была
+            # с BSC на KuCoin. Различаем это от настоящей ошибки.
+            if error_detail is None:
+                await send_tg(session,
+                    f"ℹ️ У MEXC пока нет ни одного адреса для {coin} на этом аккаунте "
+                    f"(не ошибка — просто ещё не создавался).\n\n"
+                    f"Зайди в приложение MEXC → Assets → Deposit → {coin}, выбери сеть — "
+                    f"это создаст адрес. Затем повтори эту команду."
+                )
+            else:
+                await send_tg(session, f"❌ Не удалось получить адреса для {coin}.\n\n"
+                                         f"Реальный ответ биржи: `{error_detail}`")
             return
         lines = "\n".join(
             f"  Сеть: {a.get('network')} | Адрес: `{a.get('address')}` | "
@@ -6352,14 +6380,16 @@ async def handle_command(session, text, chat_id):
             return
         coin, network, address = parts[1].upper(), parts[2], parts[3]
         memo = parts[4] if len(parts) > 4 else None
-        config["confirmed_mexc_deposit_address"] = address
-        config["confirmed_mexc_deposit_network"] = network
-        config["confirmed_mexc_deposit_memo"] = memo
+        config.setdefault("confirmed_mexc_deposit_addresses", {})[coin] = {
+            "address": address, "network": network, "memo": memo,
+        }
+        confirmed_coins = ", ".join(config["confirmed_mexc_deposit_addresses"].keys())
         await send_tg(session,
             f"✅ Адрес для реальных переводов {coin} ЗАФИКСИРОВАН:\n"
             f"   Сеть: {network}\n"
             f"   Адрес: `{address}`\n"
             f"   Memo: `{memo or 'нет'}`\n\n"
+            f"Всего подтверждённых монет для перевода: {confirmed_coins}\n\n"
             f"⚠️ Это ещё НЕ включает режим реального перевода — используй "
             f"`/setrealtransfer on`, когда будешь готов протестировать "
             f"(рекомендуется сначала на минимальной сумме)."
@@ -6471,20 +6501,21 @@ async def handle_command(session, text, chat_id):
         # адрес был предварительно подтверждён через /confirmtransferaddr.
         if len(parts) < 2:
             cur = config.get("use_real_transfer_mode", False)
-            addr = config.get("confirmed_mexc_deposit_address")
+            confirmed = config.get("confirmed_mexc_deposit_addresses", {})
+            coins_str = ", ".join(confirmed.keys()) if confirmed else "НЕ задан — сначала /confirmtransferaddr"
             await send_tg(session,
                 f"Режим реального перевода: {'✅ ВКЛЮЧЕН' if cur else '⛔ выключен'}\n"
-                f"Подтверждённый адрес: {addr or 'НЕ задан — сначала /confirmtransferaddr'}\n\n"
+                f"Подтверждённые монеты: {coins_str}\n\n"
                 f"Пример: `/setrealtransfer on` или `/setrealtransfer off`"
             )
             return
         val = parts[1].lower()
         if val in ("on", "1", "true", "вкл"):
-            if not config.get("confirmed_mexc_deposit_address"):
+            if not config.get("confirmed_mexc_deposit_addresses"):
                 await send_tg(session,
-                    "❌ Сначала подтверди адрес: `/showmexcaddresses ONE`, "
-                    "сверь вручную с приложением MEXC, затем "
-                    "`/confirmtransferaddr ONE СЕТЬ АДРЕС`"
+                    "❌ Сначала подтверди хотя бы одну монету: "
+                    "`/showmexcaddresses МОНЕТА`, сверь вручную с приложением "
+                    "MEXC, затем `/confirmtransferaddr МОНЕТА СЕТЬ АДРЕС`"
                 )
                 return
             config["use_real_transfer_mode"] = True
@@ -7691,7 +7722,10 @@ async def periodic_rebalance_loop(session):
     await asyncio.sleep(300)  # даём боту 5 минут на старте устаканиться, прежде чем первый прогон
     while True:
         hours = config.get("periodic_rebalance_hours", 0)
-        if hours <= 0:
+        if hours <= 0 or config.get("use_real_transfer_mode", False):
+            # ИСПРАВЛЕНО 04.09: полный ребаланс между "резервами" бирж не
+            # нужен в новой архитектуре — обе биржи и так стремятся держать
+            # весь капитал в USDT между циклами, ребалансировать нечего.
             await asyncio.sleep(600)
             continue
         try:
@@ -7762,6 +7796,16 @@ async def reserve_watchdog_loop(session):
             # config["watchdog_fully_halted"] — включается командой
             # /haltwatchdog, полностью останавливает ЭТОТ цикл (не только
             # торговлю), пока пользователь не закончит ручные операции.
+            # ИСПРАВЛЕНО 04.09 (по прямому запросу пользователя — "убери все
+            # не нужные функции от старой схемы"): при реальном переводе
+            # монеты между биржами (use_real_transfer_mode) резерв больше
+            # НЕ поддерживается заранее — монета появляется на MEXC только
+            # В МОМЕНТ перевода. Старая докупка резерва здесь бессмысленна
+            # и может даже мешать (продавать/покупать монету, которая
+            # больше не должна храниться заранее).
+            if config.get("use_real_transfer_mode", False):
+                await asyncio.sleep(interval)
+                continue
             if not config["simulation_mode"] and not config.get("watchdog_fully_halted", False):
                 # НОВОЕ 25.08 (по прямому запросу пользователя, найдено по
                 # логам с точными метками времени): раньше watchdog мог
@@ -8001,6 +8045,12 @@ async def profit_lock_loop(session):
     await asyncio.sleep(180)  # 3 минуты на старте, чтобы бот успел прочитать первый баланс
     while True:
         try:
+            # ИСПРАВЛЕНО 04.09: в новой архитектуре (реальный перевод)
+            # монета никогда не должна задерживаться на MEXC дольше одного
+            # цикла — "курсовой плюс на резерве" здесь неприменимое понятие.
+            if config.get("use_real_transfer_mode", False):
+                await asyncio.sleep(config.get("profit_lock_interval_sec", 300))
+                continue
             if not config["simulation_mode"] and not config["paused"]:
                 # НОВОЕ 25.08 (по прямому запросу пользователя, продолжение
                 # находки про reserve_watchdog_loop): profit_lock_loop —
