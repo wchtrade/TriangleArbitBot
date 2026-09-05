@@ -7600,7 +7600,19 @@ async def handle_command(session, text, chat_id):
         msg = f"📊 *ВСЕ ПАРЫ (реальная глубина) — {datetime.now().strftime('%H:%M:%S')}*\n"
         msg += f"Бирж: {', '.join(active)}\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         if not all_opps:
-            msg += "Нет данных (либо стакана не хватает на объём — см. /depthcheck)"
+            # ИСПРАВЛЕНО 05.09 (по прямому запросу пользователя — сообщение
+            # вводило в заблуждение: "нет данных" звучало как техническая
+            # ошибка, хотя calc_arb_real честно отбрасывает любую пару со
+            # спредом <= 0 ДО расчёта процентов. Различаем два разных
+            # случая явно.
+            any_books_found = any(ex_map.get(buy_ex, {}).get(sym) and ex_map.get(sell_ex, {}).get(sym)
+                                    for sym in SYMBOLS for buy_ex, sell_ex in pairs_for_symbol(sym))
+            if any_books_found:
+                msg += ("ℹ️ Стаканы получены нормально, но ни одна монета сейчас НЕ даёт "
+                        "положительного спреда KuCoin→MEXC вообще (даже до вычета комиссий) — "
+                        "честная рыночная тишина, не техническая проблема.")
+            else:
+                msg += "❌ Не удалось получить стаканы ни по одной монете — см. /depthcheck"
         for i, o in enumerate(all_opps, 1):
             icon = "🟢" if o["net_pct"] >= saved else "🔴"
             msg += f"{icon} *{i}. {o['symbol']}* {o['buy_ex']}→{o['sell_ex']}\n   Чистая: `{o['net_pct']}%`\n\n"
