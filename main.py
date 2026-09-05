@@ -7941,6 +7941,13 @@ async def idle_usdt_alert_loop(session):
     while True:
         interval = config.get("idle_usdt_alert_interval_sec", 3600)
         try:
+            # ИСПРАВЛЕНО 04.09 (по прямому запросу пользователя — "зачем
+            # это?"): в новой архитектуре USDT на MEXC между циклами — это
+            # НОРМА, не "простаивающие" деньги, ждущие ручного перевода.
+            # Автоматический возврат USDT встроен в саму сделку.
+            if config.get("use_real_transfer_mode", False):
+                await asyncio.sleep(interval)
+                continue
             if not config["simulation_mode"]:
                 threshold = config.get("idle_usdt_alert_threshold_usdt", 2.0)
                 # Собираем дефициты USDT по покупающим биржам — чтобы
