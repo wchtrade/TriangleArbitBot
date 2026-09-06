@@ -4764,7 +4764,13 @@ async def execute_trade(session, opp: dict) -> dict:
     # двигаться, пока бот исполняет обе ноги, и спред на карточке уже не
     # будет соответствовать реальности к моменту сделки.
     if not config["simulation_mode"]:
-        pre_trade_vol = get_recent_price_volatility_pct(1)
+        # ИСПРАВЛЕНО 05.09 (КРИТИЧНО, по прямому запросу пользователя —
+        # найден серьёзный баг: с 10 отслеживаемыми монетами эта проверка
+        # БЕЗ указания конкретной монеты брала МАКСИМАЛЬНУЮ волатильность
+        # среди ВСЕХ монет — если хотя бы ОДНА резко двигалась, это
+        # блокировало сделки по ВСЕМ ОСТАЛЬНЫМ, полностью спокойным
+        # монетам. Теперь проверяем волатильность ИМЕННО этой монеты.
+        pre_trade_vol = get_recent_price_volatility_pct(1, symbol=opp.get("symbol"))
         pre_trade_threshold = config.get("pre_trade_max_volatility_pct_1min", 0.5)
         if pre_trade_vol is not None and pre_trade_threshold > 0 and pre_trade_vol > pre_trade_threshold:
             logger.info(f"⏭ Пропуск попытки: волатильность за 1 мин {pre_trade_vol}% "
