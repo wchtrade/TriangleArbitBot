@@ -1168,7 +1168,15 @@ async def get_24h_volume(session) -> Dict[str, float]:
             logger.error(f"Volume fetch {sym}: {e}")
             return sym, None
 
-    results = await asyncio.gather(*[fetch_one(s) for s in SYMBOLS], return_exceptions=True)
+    # ИСПРАВЛЕНО 07.09 (по прямому запросу пользователя — найдены 165
+    # сбоев объёма за один день): раньше запрашивался объём с Binance для
+    # ВСЕХ монет, включая те 10, что торгуются по маршруту KuCoin→MEXC и
+    # ВООБЩЕ не используют Binance — лишние запросы могли провоцировать
+    # rate-limit биржи, который потом мешал и реально нужным запросам
+    # (например, для FIL на маршруте MEXC→Binance).
+    symbols_needing_binance = [s for s in SYMBOLS
+                                 if any(ex == "Binance" for pair in pairs_for_symbol(s) for ex in pair)]
+    results = await asyncio.gather(*[fetch_one(s) for s in symbols_needing_binance], return_exceptions=True)
     for res in results:
         if isinstance(res, Exception):
             stats["volume_fetch_fail"] = stats.get("volume_fetch_fail", 0) + 1
@@ -1630,13 +1638,22 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
 
 
 async def fetch_all_orderbooks(session) -> Tuple[Dict, Dict, Dict, Dict, List[str]]:
+    # ИСПРАВЛЕНО 07.09 (по прямому запросу пользователя — найдены 165
+    # сбоев объёма, вероятная причина — избыточные запросы): раньше
+    # запрашивался стакан у ВСЕХ 4 бирж для КАЖДОЙ монеты, даже если её
+    # маршрут использует только 2 из них. При 11 монетах это 44 запроса
+    # каждые 3 секунды, включая множество ненужных к Binance — что могло
+    # провоцировать rate-limit, мешающий и реально нужным запросам (для
+    # FIL на маршруте MEXC→Binance). Теперь запрашиваем только те биржи,
+    # которые ДЕЙСТВИТЕЛЬНО нужны хотя бы одному маршруту этой монеты.
+    fn_map = {"Binance": get_orderbook_binance, "KuCoin": get_orderbook_kucoin,
+               "HTX": get_orderbook_htx, "MEXC": get_orderbook_mexc_rest}
     tasks = {}
-    for ex, fn in [("Binance", get_orderbook_binance),
-                    ("KuCoin", get_orderbook_kucoin),
-                    ("HTX", get_orderbook_htx),
-                    ("MEXC", get_orderbook_mexc_rest)]:
-        for sym in SYMBOLS:
-            tasks[(ex, sym)] = fn(session, sym)
+    for sym in SYMBOLS:
+        needed_exchanges = {ex for pair in pairs_for_symbol(sym) for ex in pair}
+        for ex in needed_exchanges:
+            if ex in fn_map:
+                tasks[(ex, sym)] = fn_map[ex](session, sym)
 
     keys = list(tasks.keys())
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -8728,9 +8745,20 @@ async def volatility_guard_loop(session):
                                     f"полную остановку всей торговли, как раньше.")
                     else:
                         if already_warned and CHAT_ID:
-                            was_already_paused = False
+                            hard_pause_enabled = config.get("volatility_hard_pause", False)
                             auto_resume = config.get("auto_resume_after_volatility", False)
-                            if auto_resume and config["paused"] and not was_already_paused:
+                            if not hard_pause_enabled:
+                                # ИСПРАВЛЕНО 07.09 (по прямому запросу
+                                # пользователя — сообщение вводило в
+                                # заблуждение, предлагая /go, хотя торговля
+                                # НИКОГДА не останавливалась при выключенной
+                                # жёсткой паузе): честное сообщение, без
+                                # намёка на несуществующую паузу.
+                                await send_tg(session,
+                                    f"✅ Волатильность успокоилась: {vol}% за 15 минут "
+                                    f"(было выше {pct_threshold}%). Торговля и не "
+                                    f"останавливалась — жёсткая пауза выключена.")
+                            elif auto_resume and config["paused"]:
                                 config["paused"] = False
                                 await send_tg(session,
                                     f"✅ *Волатильность успокоилась*: {vol}% за 15 минут "
