@@ -60,8 +60,13 @@ PAIR_OVERRIDES: Dict[str, List[Tuple[str, str]]] = {}
 def pairs_for_symbol(sym: str) -> List[Tuple[str, str]]:
     return PAIR_OVERRIDES.get(sym, DEFAULT_PAIRS)
 
-FEES = {"Binance": 0.10, "KuCoin": 0.10, "MEXC": 0.10}
-MIN_ORDER_VALUE_USD = {"Binance": 5.0, "KuCoin": 1.0, "MEXC": 1.0}
+# Binance ИСКЛЮЧЕНА из активной схемы (недоступна из региона пользователя,
+# 08.09.2026). Функции подписи/ордеров/WS для неё оставлены в файле как
+# мёртвый код — на случай, если регион снова изменится и потребуется
+# вернуть, не переписывая с нуля. Но она НИГДЕ не вызывается: убрана из
+# ORDERBOOK_FN, get_real_balances, get_total_real_capital, автозапуска WS.
+FEES = {"KuCoin": 0.10, "MEXC": 0.10}
+MIN_ORDER_VALUE_USD = {"KuCoin": 1.0, "MEXC": 1.0}
 
 config = {
     "simulation_mode": True,
@@ -566,7 +571,8 @@ async def get_orderbook_kucoin(session, symbol: str) -> Optional[Dict]:
     return await get_orderbook_kucoin_rest(session, symbol)
 
 
-ORDERBOOK_FN = {"Binance": get_orderbook_binance, "KuCoin": get_orderbook_kucoin, "MEXC": get_orderbook_mexc_rest}
+# Binance исключена — см. комментарий у FEES выше.
+ORDERBOOK_FN = {"KuCoin": get_orderbook_kucoin, "MEXC": get_orderbook_mexc_rest}
 
 
 # =====================================================================
@@ -1214,9 +1220,8 @@ async def get_real_balances_mexc(session) -> Optional[Dict[str, float]]:
 
 
 async def get_real_balances(session, ex: str) -> Optional[Dict[str, float]]:
-    if ex == "Binance":
-        return await get_real_balances_binance(session)
-    elif ex == "KuCoin":
+    # Binance исключена — см. комментарий у FEES.
+    if ex == "KuCoin":
         return await get_real_balances_kucoin(session)
     elif ex == "MEXC":
         return await get_real_balances_mexc(session)
@@ -1234,7 +1239,7 @@ async def get_total_real_capital(session, fixed_prices: Optional[Dict] = None) -
     per_exchange = {}
     total = 0.0
     prices_used = {}
-    for ex in ["Binance", "KuCoin", "MEXC"]:
+    for ex in ["KuCoin", "MEXC"]:  # Binance исключена — см. комментарий у FEES
         if ex == "MEXC" and not MEXC_KEY:
             continue
         balances = await get_real_balances(session, ex)
@@ -2009,7 +2014,6 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"⚠️ {sym} уже в списке.")
             return
         SYMBOLS.append(sym)
-        start_binance_ws_book(session, sym)
         start_kucoin_ws_book(session, sym)
         await send_tg(session, f"✅ Добавлено: {sym}\nСписок: {', '.join(SYMBOLS)}")
 
@@ -2025,7 +2029,6 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Нельзя удалить последнюю монету.")
             return
         SYMBOLS.remove(sym)
-        stop_binance_ws_book(sym)
         stop_kucoin_ws_book(sym)
         await send_tg(session, f"✅ Удалено: {sym}\nСписок: {', '.join(SYMBOLS)}")
 
@@ -2043,7 +2046,6 @@ async def handle_command(session, text, chat_id):
         PAIR_OVERRIDES[sym] = [(buy_ex, sell_ex)]
         if sym not in SYMBOLS:
             SYMBOLS.append(sym)
-            start_binance_ws_book(session, sym)
             start_kucoin_ws_book(session, sym)
         await send_tg(session, f"✅ Маршрут {sym}: {buy_ex} → {sell_ex}")
 
@@ -2205,8 +2207,7 @@ async def main():
     connector = aiohttp.TCPConnector(ssl=True)
     async with aiohttp.ClientSession(connector=connector) as session:
         for sym in SYMBOLS:
-            start_binance_ws_book(session, sym)
-            start_kucoin_ws_book(session, sym)
+            start_kucoin_ws_book(session, sym)  # Binance исключена, см. FEES
         await asyncio.gather(
             polling_loop(session), scan_loop(session),
             reserve_watchdog_loop(session), drawdown_guard_loop(session),
