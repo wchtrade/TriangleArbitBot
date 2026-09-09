@@ -4344,7 +4344,17 @@ async def get_total_real_capital(session, fixed_prices: Optional[Dict[Tuple[str,
         balances = await get_real_balances(session, ex)
         if balances is None:
             if ex == "MEXC":
-                continue  # не валим весь расчёт из-за временного сбоя MEXC
+                # ИСПРАВЛЕНО 09.09 (КРИТИЧНО, по прямому запросу пользователя
+                # — найден реальный инцидент: временный сбой чтения MEXC
+                # заставил предохранитель от убытка решить, что потеряно
+                # 48.9% капитала, хотя реальный баланс был в порядке).
+                # "Тихий continue" был безопасен для /stats (там просто не
+                # покажется одна строка), но ОПАСЕН для любого расчёта
+                # общего капитала (drawdown_guard, /setrealstart и т.п.) —
+                # там частичный итог выглядит как настоящая, катастрофическая
+                # потеря. Теперь возвращаем None (честно "не удалось
+                # посчитать"), а не тихо продолжаем без MEXC.
+                return None
             return None
         ex_total = balances.get("USDT", 0.0)
         for sym in SYMBOLS:
