@@ -1515,10 +1515,12 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
     # используют ОДНУ И ТУ ЖЕ (амортизированную) модель стоимости — согласованно,
     # без задваивания.
     naive_profit_usd = trade_usdt * net / 100
-    lots_for_cost = max(config.get("sell_reserve_lots", 3), 1)
-    amortized_rebalance_cost_est = (trade_usdt * (buy_fee + sell_fee)
-                                     + trade_usdt * config.get("empirical_spread_crossing_pct", 0.34)
-                                     / 100 / lots_for_cost)
+    # ИСПРАВЛЕНО 09.09 (КРИТИЧНО): та же старая концепция amortized_rebalance
+    # (÷sell_reserve_lots) — не существует в новой архитектуре. Используем
+    # реальную, фиксированную стоимость перевода вместо несуществующей
+    # амортизации резерва.
+    typical_transfer_fees_usd = config.get("typical_transfer_fees_usd", 0.03)
+    amortized_rebalance_cost_est = trade_usdt * (buy_fee + sell_fee) + typical_transfer_fees_usd
     honest_pretrade_profit_usd = round(naive_profit_usd - amortized_rebalance_cost_est, 4)
 
     # НОВОЕ 25.08 (по прямому запросу пользователя — "как сделать +, а не
@@ -1542,9 +1544,18 @@ def calc_arb_real(symbol: str, buy_ex: str, buy_ob: Dict, sell_ex: str, sell_ob:
     # по умолчанию 1.0 = как было). Например, 0.5 — требовать покрыть
     # только половину полной стоимости, отдав вторую половину на волю
     # абсолютного/процентного порога выше.
+    # ИСПРАВЛЕНО 09.09 (КРИТИЧНО, по прямому запросу пользователя — "давай
+    # критично проверим код"): найден СКРЫТЫЙ гейт, использующий старую
+    # концепцию empirical_spread_crossing_pct (дефолт 3.34%, стоимость
+    # 'пересечения спреда при докупке резерва' — понятие, которого в
+    # новой архитектуре реального перевода НЕ СУЩЕСТВУЕТ вообще). Из-за
+    # этого реальный требуемый спред был ~3.5%, хотя /stats честно
+    # показывал 1.1-1.4% — сигналы МОЛЧА отклонялись этим забытым гейтом
+    # весь день. Теперь использует ту же реальную, фиксированную стоимость
+    # перевода, что и остальные пороги — согласованно, без скрытых различий.
     strict_gate_cost_weight = config.get("strict_gate_cost_weight", 1.0)
-    full_crossing_cost_est = trade_usdt * config.get("empirical_spread_crossing_pct", 0.34) / 100
-    full_rebalance_cost_est = trade_usdt * (buy_fee + sell_fee) + full_crossing_cost_est
+    typical_transfer_fees_usd = config.get("typical_transfer_fees_usd", 0.03)
+    full_rebalance_cost_est = trade_usdt * (buy_fee + sell_fee) + typical_transfer_fees_usd
     strict_honest_profit_usd = round(naive_profit_usd - full_rebalance_cost_est * strict_gate_cost_weight, 4)
     if strict_honest_profit_usd < 0:
         stats["strict_honest_negative_rejected"] = stats.get("strict_honest_negative_rejected", 0) + 1
@@ -5103,7 +5114,11 @@ async def execute_trade(session, opp: dict) -> dict:
             vol_ratio = actual_vol / opp["vol"] if opp["vol"] else 1.0
             actual_profit_usdt = round(opp["profit_usdt"] * vol_ratio, 4)
 
-            spread_crossing_est = actual_vol * config.get("empirical_spread_crossing_pct", 0.34) / 100
+            # ИСПРАВЛЕНО 09.09 (по прямому запросу пользователя — критичная
+            # проверка кода): убрана старая концепция 'пересечения спреда
+            # при докупке резерва' — в новой архитектуре реального перевода
+            # используем реальную, фиксированную стоимость перевода.
+            spread_crossing_est = config.get("typical_transfer_fees_usd", 0.03)
             fees_only = actual_vol * (FEES.get(opp["buy_ex"], 0.1) + FEES.get(opp["sell_ex"], 0.1)) / 100
 
             # НОВОЕ 25.08 (по прямому запросу пользователя — "почему оценка
@@ -5581,10 +5596,11 @@ def format_signal(opp: dict) -> str:
         # 0.1778% ребаланс "съедал" почти половину показанной прибыли —
         # не убыток, но карточка вводила в заблуждение, выглядя вдвое
         # прибыльнее, чем цикл сделка+ребаланс даёт по факту.
-        # НОВОЕ 16.08: та же поправка, что и в execute_trade — добавляем
-        # оценку пересечения спреда (настраивается /setcrossingcost),
-        # не только комиссии.
-        spread_crossing_est = opp["vol"] * config.get("empirical_spread_crossing_pct", 0.34) / 100
+        # ИСПРАВЛЕНО 09.09 (по прямому запросу пользователя — критичная
+        # проверка кода): убрана старая концепция 'пересечения спреда
+        # при докупке резерва' — используем реальную, фиксированную
+        # стоимость перевода новой архитектуры.
+        spread_crossing_est = config.get("typical_transfer_fees_usd", 0.03)
         rebalance_cost = round(opp["vol"] * (FEES.get(opp["buy_ex"], 0.1) +
                                               FEES.get(opp["sell_ex"], 0.1)) / 100
                                 + spread_crossing_est, 4)
