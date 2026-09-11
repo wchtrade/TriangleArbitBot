@@ -6897,12 +6897,18 @@ async def handle_command(session, text, chat_id):
                     return
                 lines = "\n".join(
                     f"  chainId=`{c.get('chainId')}` | chainName={c.get('chainName')} | "
-                    f"withdrawEnabled={c.get('isWithdrawEnabled')} | minWithdraw={c.get('withdrawalMinSize')}"
+                    f"withdrawEnabled={c.get('isWithdrawEnabled')} | minWithdraw={c.get('withdrawalMinSize')} | "
+                    f"⚠️КОМИССИЯ={c.get('withdrawalMinFee')}"
                     for c in chains
                 )
                 await send_tg(session, f"⛓ *Точные коды сетей для вывода {coin} на KuCoin:*\n\n{lines}\n\n"
                                          f"⚠️ Для параметра chain в выводе используй именно chainId "
-                                         f"(обычно строчными буквами), не chainName!")
+                                         f"(обычно строчными буквами), не chainName!\n\n"
+                                         f"🔴 *ОБЯЗАТЕЛЬНО* сверь КОМИССИЮ здесь с тем, что реально "
+                                         f"показывает страница вывода в приложении — комиссия "
+                                         f"может быть в самой монете, что при дорогой монете "
+                                         f"означает большую сумму в USD (как случилось с EGLD "
+                                         f"11.09 — комиссия 0.24 EGLD ≈ \\$1.13, а не \\$0.03).")
         except Exception as e:
             await send_tg(session, f"❌ Ошибка запроса: {e}")
 
