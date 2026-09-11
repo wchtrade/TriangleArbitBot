@@ -6863,11 +6863,13 @@ async def handle_command(session, text, chat_id):
                     await send_tg(session, f"❌ Не нашёл сетей для {coin}: `{data}`")
                     return
                 lines = "\n".join(
-                    f"  chain=`{c.get('chainName')}` | withdrawEnabled={c.get('isWithdrawEnabled')} | "
-                    f"minWithdraw={c.get('withdrawalMinSize')}"
+                    f"  chainId=`{c.get('chainId')}` | chainName={c.get('chainName')} | "
+                    f"withdrawEnabled={c.get('isWithdrawEnabled')} | minWithdraw={c.get('withdrawalMinSize')}"
                     for c in chains
                 )
-                await send_tg(session, f"⛓ *Точные коды сетей для вывода {coin} на KuCoin:*\n\n{lines}")
+                await send_tg(session, f"⛓ *Точные коды сетей для вывода {coin} на KuCoin:*\n\n{lines}\n\n"
+                                         f"⚠️ Для параметра chain в выводе используй именно chainId "
+                                         f"(обычно строчными буквами), не chainName!")
         except Exception as e:
             await send_tg(session, f"❌ Ошибка запроса: {e}")
 
