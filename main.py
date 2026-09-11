@@ -1291,6 +1291,34 @@ async def get_orderbook_pair_binance(session, pair_symbol: str) -> Optional[Dict
         return None
 
 
+async def get_orderbook_pair_kucoin(session, base: str, quote: str) -> Optional[Dict]:
+    """НОВОЕ 11.09 (по прямому запросу пользователя — треугольный арбитраж
+    БЕЗ межбиржевых переводов, чтобы избежать комиссий сети, найденных
+    сегодня как главное препятствие). Обобщённая версия для KuCoin —
+    принимает произвольную пару (напр. base='ETH', quote='BTC' → 'ETH-BTC'),
+    не только COIN-USDT, как основная get_orderbook_kucoin."""
+    if is_backed_off("KuCoin"):
+        return None
+    url = "https://api.kucoin.com/api/v1/market/orderbook/level2_20"
+    params = {"symbol": f"{base}-{quote}"}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=6)) as r:
+            if r.status in (429, 418):
+                trigger_backoff("KuCoin", r.status, r.headers.get("Retry-After"))
+                return None
+            if r.status != 200:
+                return None
+            data = (await r.json()).get("data", {})
+            bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
+            asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+            if not bids or not asks:
+                return None
+            return {"bids": bids, "asks": asks}
+    except Exception as e:
+        logger.error(f"KuCoin pair depth {base}-{quote}: {e}")
+        return None
+
+
 # =====================================================================
 # ЭТАП 4: ТРЕУГОЛЬНЫЙ АРБИТРАЖ (внутри одной биржи, Binance)
 #   Путь A: USDT -> COIN -> BTC -> USDT
@@ -1365,13 +1393,76 @@ async def calc_triangle(session, symbol: str, start_usdt: float) -> Optional[dic
     return best
 
 
+async def calc_triangle_kucoin(session, symbol: str, start_usdt: float) -> Optional[dict]:
+    """НОВОЕ 11.09 (по прямому запросу пользователя — треугольный арбитраж
+    на KuCoin, специально чтобы избежать межбиржевых переводов и найденных
+    сегодня высоких комиссий сети). Та же логика, что и calc_triangle
+    (Binance), просто через get_orderbook_pair_kucoin."""
+    ob_coin_usdt = await get_orderbook_pair_kucoin(session, symbol, QUOTE)
+    ob_coin_btc = await get_orderbook_pair_kucoin(session, symbol, BRIDGE)
+    ob_btc_usdt = await get_orderbook_pair_kucoin(session, BRIDGE, QUOTE)
+
+    if not ob_coin_usdt or not ob_coin_btc or not ob_btc_usdt:
+        return None
+
+    fee = FEES.get("KuCoin", 0.1) / 100
+    results = []
+
+    leg1 = walk_the_book(ob_coin_usdt["asks"], start_usdt)
+    if leg1 and leg1["fully_filled"]:
+        coins_after_fee = leg1["coins"] * (1 - fee)
+        leg2 = walk_the_book_sell(ob_coin_btc["bids"], coins_after_fee)
+        if leg2 and leg2["fully_filled"]:
+            btc_after_fee = leg2["quote_out"] * (1 - fee)
+            leg3 = walk_the_book_sell(ob_btc_usdt["bids"], btc_after_fee)
+            if leg3 and leg3["fully_filled"]:
+                final_usdt = leg3["quote_out"] * (1 - fee)
+                profit = final_usdt - start_usdt
+                net_pct = profit / start_usdt * 100
+                results.append({
+                    "path": f"USDT→{symbol}→{BRIDGE}→USDT", "exchange": "KuCoin",
+                    "final_usdt": round(final_usdt, 4), "profit_usdt": round(profit, 4),
+                    "net_pct": round(net_pct, 4),
+                    "levels": [leg1["levels_used"], leg2["levels_used"], leg3["levels_used"]],
+                })
+
+    leg1b = walk_the_book(ob_btc_usdt["asks"], start_usdt)
+    if leg1b and leg1b["fully_filled"]:
+        btc_after_fee = leg1b["coins"] * (1 - fee)
+        leg2b = walk_the_book(ob_coin_btc["asks"], btc_after_fee)
+        if leg2b and leg2b["fully_filled"]:
+            coins_after_fee = leg2b["coins"] * (1 - fee)
+            leg3b = walk_the_book_sell(ob_coin_usdt["bids"], coins_after_fee)
+            if leg3b and leg3b["fully_filled"]:
+                final_usdt = leg3b["quote_out"] * (1 - fee)
+                profit = final_usdt - start_usdt
+                net_pct = profit / start_usdt * 100
+                results.append({
+                    "path": f"USDT→{BRIDGE}→{symbol}→USDT", "exchange": "KuCoin",
+                    "final_usdt": round(final_usdt, 4), "profit_usdt": round(profit, 4),
+                    "net_pct": round(net_pct, 4),
+                    "levels": [leg1b["levels_used"], leg2b["levels_used"], leg3b["levels_used"]],
+                })
+
+    if not results:
+        return None
+    best = max(results, key=lambda x: x["net_pct"])
+    if best["net_pct"] < config["min_profit_pct"]:
+        return None
+    best["symbol"] = symbol
+    best["time"] = datetime.now().strftime("%H:%M:%S")
+    return best
+
+
 async def scan_triangles(session) -> List[dict]:
     if not config["triangular_enabled"]:
         return []
     found = []
     for sym in TRIANGLE_SYMBOLS:
         try:
-            res = await calc_triangle(session, sym, config["trade_usdt"])
+            # ИЗМЕНЕНО 11.09 (по прямому запросу пользователя — переключились
+            # на KuCoin для треугольного арбитража вместо Binance).
+            res = await calc_triangle_kucoin(session, sym, config["trade_usdt"])
             if res:
                 found.append(res)
         except Exception as e:
