@@ -8100,17 +8100,21 @@ async def handle_command(session, text, chat_id):
                 "Добавьте хотя бы одну: `/addtriangle ETH`\n"
                 "Это отдельный список, не влияет на реальную торговлю.")
             return
-        await send_tg(session, f"🔺 Сканирую треугольный арбитраж на Binance "
+        # ИСПРАВЛЕНО 11.09 (по прямому запросу пользователя — переключились
+        # на KuCoin для треугольного арбитража, но текст сообщения остался
+        # со старым, жёстко зашитым "Binance" — сама логика уже была
+        # переключена в scan_triangles/calc_triangle_kucoin, просто текст забыли).
+        await send_tg(session, f"🔺 Сканирую треугольный арбитраж на KuCoin "
                                  f"({', '.join(TRIANGLE_SYMBOLS)})...")
         results = await scan_triangles(session)
         if not results:
             await send_tg(session,
                 f"😔 Нет треугольных возможностей выше порога {config['min_profit_pct']}%.\n"
-                f"(Либо пары COIN/{BRIDGE} не существуют для ваших монет на Binance — "
+                f"(Либо пары COIN/{BRIDGE} не существуют для ваших монет на KuCoin — "
                 f"это нормально для части альткоинов.)"
             )
         else:
-            msg = "🔺 *ТРЕУГОЛЬНЫЙ АРБИТРАЖ (Binance)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            msg = "🔺 *ТРЕУГОЛЬНЫЙ АРБИТРАЖ (KuCoin)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
             for r in results[:5]:
                 msg += (f"*{r['symbol']}* via {r['path']}\n"
                         f"   Чистая: `{r['net_pct']}%` | Профит: `{r['profit_usdt']} USDT`\n"
