@@ -3081,11 +3081,16 @@ async def withdraw_from_kucoin(session, currency: str, amount: float, address: s
             data = await r.json()
             if data.get("code") != "200000":
                 logger.error(f"KuCoin withdrawal failed: {data}")
+                # ИСПРАВЛЕНО 11.09 (по прямому запросу пользователя — найдено
+                # при первом реальном тесте: причина отказа вывода никогда не
+                # доходила до пользователя, только общая маска "withdrawal_failed").
+                _remember_error("KuCoin", data.get("msg", data))
                 return None
             logger.info(f"✅ KuCoin withdrawal отправлен: {data}")
             return data.get("data")
     except Exception as e:
         logger.error(f"KuCoin withdrawal exception: {e}")
+        _remember_error("KuCoin", e)
         return None
 
 
@@ -3909,9 +3914,13 @@ async def execute_real_arbitrage_with_transfer(session, opp: dict) -> dict:
     withdraw_qty = round(confirmed_qty * 0.999, 6)
     withdrawal = await WITHDRAW_FUNCS[buy_ex](withdraw_qty)
     if not withdrawal:
+        # ИСПРАВЛЕНО 11.09 (по прямому запросу пользователя — та же
+        # проблема, что и с buy_leg: сообщение не показывало реальную
+        # причину отказа биржи, только общую маску).
+        real_error = _last_exchange_error.get(buy_ex, "нет деталей от биржи — см. логи Railway")
         return {"success": False, "error": f"withdrawal_failed: "
                                              f"монета {confirmed_qty} {symbol} осталась на {buy_ex}, "
-                                             f"деньги НЕ потеряны, нужен ручной /rebalance",
+                                             f"деньги НЕ потеряны. Причина: {real_error}",
                 "stuck_on_buy_ex_qty": confirmed_qty}
 
     withdrawal_id = withdrawal.get("withdrawalId") or withdrawal.get("id")
