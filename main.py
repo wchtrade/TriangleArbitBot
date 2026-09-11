@@ -8139,6 +8139,36 @@ async def handle_command(session, text, chat_id):
             except Exception:
                 pass
 
+    elif cmd == "/settransferfees":
+        # НОВОЕ 11.09 (по прямому запросу пользователя — "давай форсируем
+        # тестовую сделку, чтобы проверить механизм в принципе"): позволяет
+        # временно занизить/изменить оценку типичной стоимости перевода
+        # (по умолчанию $0.03), напрямую влияя на итоговый порог.
+        if len(parts) < 2:
+            val = config.get("typical_transfer_fees_usd", 0.03)
+            await send_tg(session, f"Текущая оценка комиссии перевода: ${val}\n"
+                                     f"Пример: `/settransferfees 0.01`")
+            return
+        try:
+            val = float(parts[1])
+            config["typical_transfer_fees_usd"] = val
+            await send_tg(session, f"✅ Оценка комиссии перевода: ${val}")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/settransferfees 0.01`")
+
+    elif cmd == "/setsafetymargin":
+        if len(parts) < 2:
+            val = config.get("threshold_safety_margin_pct", 0.05)
+            await send_tg(session, f"Текущий запас безопасности порога: {val}%\n"
+                                     f"Пример: `/setsafetymargin 0`")
+            return
+        try:
+            val = float(parts[1])
+            config["threshold_safety_margin_pct"] = val
+            await send_tg(session, f"✅ Запас безопасности порога: {val}%")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setsafetymargin 0`")
+
     elif cmd == "/setstop":
         if len(parts) > 1:
             try:
