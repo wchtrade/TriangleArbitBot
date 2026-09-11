@@ -1859,6 +1859,30 @@ async def get_kucoin_base_increment(session, symbol: str) -> float:
     return 1.0
 
 
+_kucoin_price_increment_cache: Dict[str, float] = {}
+
+
+async def get_kucoin_price_increment(session, symbol: str) -> float:
+    """НОВОЕ 11.09 (по прямому запросу пользователя — критичное исправление):
+    шаг цены (priceIncrement) на KuCoin — аналог tickSize у MEXC. Без
+    округления под это значение биржа может тихо отклонять лимитный ордер
+    с 'некрасивой' ценой (10+ значащих цифр после запятой)."""
+    if symbol in _kucoin_price_increment_cache:
+        return _kucoin_price_increment_cache[symbol]
+    try:
+        async with session.get("https://api.kucoin.com/api/v2/symbols",
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            for s in data.get("data", []):
+                if s.get("symbol") == f"{symbol}-{QUOTE}":
+                    inc = float(s["priceIncrement"])
+                    _kucoin_price_increment_cache[symbol] = inc
+                    return inc
+    except Exception as e:
+        logger.error(f"KuCoin price increment fetch {symbol}: {e}")
+    return 0.000001
+
+
 async def get_htx_amount_precision(session, symbol: str) -> int:
     if symbol in _htx_precision_cache:
         return _htx_precision_cache[symbol]
@@ -2305,10 +2329,22 @@ async def place_order_kucoin_limit_ioc(session, symbol: str, side: str,
                                          price: float, size: float) -> Optional[dict]:
     """Лимитный IOC-ордер на KuCoin. price — предельная цена (для BUY —
     не хуже этой, для SELL — не хуже этой), size — количество МОНЕТЫ
-    (не USDT, в отличие от market-версии) — должно быть уже округлено
-    под шаг лота биржи (round_quantity_for_exchange) ДО вызова."""
+    (не USDT, в отличие от market-версии).
+
+    ИСПРАВЛЕНО 11.09 (КРИТИЧНО, по прямому запросу пользователя — найден
+    реальный баг при первом же прямом тесте новой архитектуры: в отличие
+    от MEXC-версии этой же функции, здесь НИКОГДА не округлялись цена и
+    количество под реальные правила биржи (baseIncrement) — "сырые" числа
+    с плавающей точкой могли ТИХО отклоняться KuCoin, объясняя провал на
+    самом первом шаге покупки. Теперь округляем так же, как для MEXC."""
     if is_backed_off("KuCoin"):
         logger.error("KuCoin в бэкоффе — лимитный ордер НЕ отправлен")
+        return None
+    price_tick = await get_kucoin_price_increment(session, symbol)
+    price = _round_price_to_tick(price, price_tick)
+    size = await round_quantity_for_exchange(session, "KuCoin", symbol, size)
+    if size <= 0:
+        logger.error(f"KuCoin limit-IOC: количество округлилось до нуля для {symbol}")
         return None
     endpoint = "/api/v1/orders"
     url = f"https://api.kucoin.com{endpoint}"
@@ -3842,7 +3878,12 @@ async def execute_real_arbitrage_with_transfer(session, opp: dict) -> dict:
             if buy_ex == "KuCoin" else None
 
     if not buy_result:
-        return {"success": False, "error": f"buy_leg_failed_on_{buy_ex}_transfer_mode"}
+        # ИСПРАВЛЕНО 11.09 (по прямому запросу пользователя — тестовая
+        # сделка провалилась с общей маской без деталей): показываем
+        # реальный текст ошибки биржи, сохранённый через _remember_error
+        # внутри place_order_kucoin_limit_ioc/place_order_mexc_limit_ioc.
+        real_error = _last_exchange_error.get(buy_ex, "нет деталей от биржи")
+        return {"success": False, "error": f"buy_leg_failed_on_{buy_ex}_transfer_mode: {real_error}"}
 
     # ИСПРАВЛЕНО 04.09 (КРИТИЧНО): инкремент СРАЗУ после подтверждённой
     # покупки, не только в конце функции — иначе при обрыве цикла на любом
