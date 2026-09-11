@@ -3876,8 +3876,17 @@ async def execute_real_arbitrage_with_transfer(session, opp: dict) -> dict:
                                              f"продажи на {list(SELL_IOC_FUNCS)}"}
 
     # --- ШАГ 1: покупка на buy_ex ---
+    # ИСПРАВЛЕНО 11.09 (КРИТИЧНО, по прямому запросу пользователя — найден
+    # реальный баг при тесте: buy_price использовался БЕЗ запаса, в отличие
+    # от sell_price (там уже был sell_limit_slippage_pct). IOC-ордер по
+    # ТОЧНОЙ цене топа стакана легко даёт НУЛЕВОЕ исполнение при малейшем
+    # тике цены между запросом котировки и отправкой ордера — это могло
+    # объяснять провалы покупки даже при реальном, валидном сигнале весь
+    # это время, не только в тесте. Добавляем симметричный запас.
     if config.get("use_limit_ioc_orders", True) and opp.get("buy_price"):
-        buy_result = await BUY_IOC_FUNCS[buy_ex](opp["buy_price"], vol / opp["buy_price"])
+        buy_slippage_pct = config.get("buy_limit_slippage_pct", 0.05)
+        buy_limit_price = opp["buy_price"] * (1 + buy_slippage_pct / 100)
+        buy_result = await BUY_IOC_FUNCS[buy_ex](buy_limit_price, vol / opp["buy_price"])
     else:
         buy_result = await place_order_kucoin(session, symbol, "buy", vol, use_funds=True) \
             if buy_ex == "KuCoin" else None
