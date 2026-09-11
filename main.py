@@ -3920,12 +3920,27 @@ async def execute_real_arbitrage_with_transfer(session, opp: dict) -> dict:
     sell_ex_coin_before = sell_ex_balances_before.get(symbol, 0.0)
 
     # --- ШАГ 3: РЕАЛЬНЫЙ вывод с buy_ex на подтверждённый адрес sell_ex ---
-    # ИСПРАВЛЕНО 11.09 (по прямому запросу пользователя — найдено при
-    # тесте: "account.available.amount" — запас 0.999 (0.1%) оказался
-    # РОВНО равен типичной комиссии KuCoin (0.1%), без места на округление.
-    # Увеличиваем запас до 0.995 (0.5%) — достаточно, чтобы гарантированно
-    # не упереться в реально доступный остаток после списания комиссии.
     withdraw_qty = round(confirmed_qty * 0.995, 6)
+
+    # ИСПРАВЛЕНО 11.09 (КРИТИЧНО, по прямому запросу пользователя — найдена
+    # РЕАЛЬНАЯ причина "account.available.amount" (код 400100 = недостаточно
+    # баланса, подтверждено официальной документацией KuCoin): купленная
+    # монета исполняется на TRADE-счету, а эндпоинт вывода KuCoin проверяет
+    # баланс MAIN-счёта — это ЗЕРКАЛЬНАЯ версия проблемы, которую мы уже
+    # решали для USDT (там депозит попадал на MAIN, торговля шла с TRADE,
+    # нужен был inner_transfer main→trade). Здесь — наоборот: нужен
+    # inner_transfer TRADE→MAIN для купленной монеты ПЕРЕД попыткой вывода.
+    if buy_ex == "KuCoin":
+        inner_result = await kucoin_inner_transfer(session, symbol, withdraw_qty, "trade", "main")
+        if not inner_result:
+            return {"success": False, "error": f"kucoin_inner_transfer_trade_to_main_failed: "
+                                                 f"монета {confirmed_qty} {symbol} осталась на "
+                                                 f"TRADE-счету KuCoin, деньги НЕ потеряны, "
+                                                 f"нужен ручной перевод Assets → Transfer → "
+                                                 f"{symbol} → Trade→Main",
+                    "stuck_on_buy_ex_qty": confirmed_qty}
+        await asyncio.sleep(1.0)  # даём бирже время зачислить на MAIN-счёт
+
     withdrawal = await WITHDRAW_FUNCS[buy_ex](withdraw_qty)
     if not withdrawal:
         # ИСПРАВЛЕНО 11.09 (по прямому запросу пользователя — та же
