@@ -1319,6 +1319,32 @@ async def get_orderbook_pair_kucoin(session, base: str, quote: str) -> Optional[
         return None
 
 
+async def get_orderbook_pair_mexc(session, base: str, quote: str) -> Optional[Dict]:
+    """НОВОЕ 11.09 (по прямому запросу пользователя — треугольный арбитраж
+    на MEXC, раз там есть капитал ~$11). Формат идентичен Binance (тот же
+    /api/v3/depth), просто на api.mexc.com."""
+    if is_backed_off("MEXC"):
+        return None
+    url = "https://api.mexc.com/api/v3/depth"
+    params = {"symbol": f"{base}{quote}", "limit": config["depth_limit"]}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=6)) as r:
+            if r.status in (429, 418):
+                trigger_backoff("MEXC", r.status, r.headers.get("Retry-After"))
+                return None
+            if r.status != 200:
+                return None
+            data = await r.json()
+            bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
+            asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+            if not bids or not asks:
+                return None
+            return {"bids": bids, "asks": asks}
+    except Exception as e:
+        logger.error(f"MEXC pair depth {base}{quote}: {e}")
+        return None
+
+
 # =====================================================================
 # ЭТАП 4: ТРЕУГОЛЬНЫЙ АРБИТРАЖ (внутри одной биржи, Binance)
 #   Путь A: USDT -> COIN -> BTC -> USDT
@@ -1454,19 +1480,86 @@ async def calc_triangle_kucoin(session, symbol: str, start_usdt: float) -> Optio
     return best
 
 
+async def calc_triangle_mexc(session, symbol: str, start_usdt: float) -> Optional[dict]:
+    """НОВОЕ 11.09 (по прямому запросу пользователя — треугольник на MEXC,
+    раз там есть реальный капитал ~$11). Та же логика, что и для KuCoin."""
+    ob_coin_usdt = await get_orderbook_pair_mexc(session, symbol, QUOTE)
+    ob_coin_btc = await get_orderbook_pair_mexc(session, symbol, BRIDGE)
+    ob_btc_usdt = await get_orderbook_pair_mexc(session, BRIDGE, QUOTE)
+
+    if not ob_coin_usdt or not ob_coin_btc or not ob_btc_usdt:
+        return None
+
+    fee = FEES.get("MEXC", 0.1) / 100
+    results = []
+
+    leg1 = walk_the_book(ob_coin_usdt["asks"], start_usdt)
+    if leg1 and leg1["fully_filled"]:
+        coins_after_fee = leg1["coins"] * (1 - fee)
+        leg2 = walk_the_book_sell(ob_coin_btc["bids"], coins_after_fee)
+        if leg2 and leg2["fully_filled"]:
+            btc_after_fee = leg2["quote_out"] * (1 - fee)
+            leg3 = walk_the_book_sell(ob_btc_usdt["bids"], btc_after_fee)
+            if leg3 and leg3["fully_filled"]:
+                final_usdt = leg3["quote_out"] * (1 - fee)
+                profit = final_usdt - start_usdt
+                net_pct = profit / start_usdt * 100
+                results.append({
+                    "path": f"USDT→{symbol}→{BRIDGE}→USDT", "exchange": "MEXC",
+                    "final_usdt": round(final_usdt, 4), "profit_usdt": round(profit, 4),
+                    "net_pct": round(net_pct, 4),
+                    "levels": [leg1["levels_used"], leg2["levels_used"], leg3["levels_used"]],
+                })
+
+    leg1b = walk_the_book(ob_btc_usdt["asks"], start_usdt)
+    if leg1b and leg1b["fully_filled"]:
+        btc_after_fee = leg1b["coins"] * (1 - fee)
+        leg2b = walk_the_book(ob_coin_btc["asks"], btc_after_fee)
+        if leg2b and leg2b["fully_filled"]:
+            coins_after_fee = leg2b["coins"] * (1 - fee)
+            leg3b = walk_the_book_sell(ob_coin_usdt["bids"], coins_after_fee)
+            if leg3b and leg3b["fully_filled"]:
+                final_usdt = leg3b["quote_out"] * (1 - fee)
+                profit = final_usdt - start_usdt
+                net_pct = profit / start_usdt * 100
+                results.append({
+                    "path": f"USDT→{BRIDGE}→{symbol}→USDT", "exchange": "MEXC",
+                    "final_usdt": round(final_usdt, 4), "profit_usdt": round(profit, 4),
+                    "net_pct": round(net_pct, 4),
+                    "levels": [leg1b["levels_used"], leg2b["levels_used"], leg3b["levels_used"]],
+                })
+
+    if not results:
+        return None
+    best = max(results, key=lambda x: x["net_pct"])
+    if best["net_pct"] < config["min_profit_pct"]:
+        return None
+    best["symbol"] = symbol
+    best["time"] = datetime.now().strftime("%H:%M:%S")
+    return best
+
+
+config["triangle_exchange"] = "KuCoin"  # НОВОЕ 11.09: какая биржа используется
+    # для треугольного арбитража — переключается командой /settriangleex
+
+
 async def scan_triangles(session) -> List[dict]:
+    # ИЗМЕНЕНО 11.09 (по прямому запросу пользователя — "можно сделать так,
+    # чтобы сразу работало два треугольника?"): раньше проверялась ТОЛЬКО
+    # одна выбранная биржа (triangle_exchange). Теперь проверяем ОБЕ биржи
+    # (KuCoin и MEXC) для каждой монеты одновременно — результат содержит
+    # находки с обеих сразу, отсортированные по прибыльности.
     if not config["triangular_enabled"]:
         return []
     found = []
     for sym in TRIANGLE_SYMBOLS:
-        try:
-            # ИЗМЕНЕНО 11.09 (по прямому запросу пользователя — переключились
-            # на KuCoin для треугольного арбитража вместо Binance).
-            res = await calc_triangle_kucoin(session, sym, config["trade_usdt"])
-            if res:
-                found.append(res)
-        except Exception as e:
-            logger.error(f"Triangle {sym}: {e}")
+        for ex, calc_fn in [("KuCoin", calc_triangle_kucoin), ("MEXC", calc_triangle_mexc)]:
+            try:
+                res = await calc_fn(session, sym, config["trade_usdt"])
+                if res:
+                    found.append(res)
+            except Exception as e:
+                logger.error(f"Triangle {sym}/{ex}: {e}")
     found.sort(key=lambda x: x["net_pct"], reverse=True)
     return found
 
@@ -8093,6 +8186,21 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, f"✅ Удалено из треугольника: {sym}\n"
                                  f"Текущий список: {', '.join(TRIANGLE_SYMBOLS) if TRIANGLE_SYMBOLS else '(пусто)'}")
 
+    elif cmd == "/settriangleex":
+        # НОВОЕ 11.09 (по прямому запросу пользователя — треугольник на
+        # MEXC, раз там есть реальный капитал ~$11, отдельно от KuCoin).
+        if len(parts) < 2:
+            cur = config.get("triangle_exchange", "KuCoin")
+            await send_tg(session, f"Текущая биржа для треугольника: {cur}\n\n"
+                                     f"Пример: `/settriangleex MEXC` или `/settriangleex KuCoin`")
+            return
+        val = parts[1]
+        if val not in ("KuCoin", "MEXC"):
+            await send_tg(session, "❌ Биржа должна быть KuCoin или MEXC")
+            return
+        config["triangle_exchange"] = val
+        await send_tg(session, f"✅ Треугольник теперь считается на {val}")
+
     elif cmd == "/triangle":
         if not TRIANGLE_SYMBOLS:
             await send_tg(session,
@@ -8100,23 +8208,22 @@ async def handle_command(session, text, chat_id):
                 "Добавьте хотя бы одну: `/addtriangle ETH`\n"
                 "Это отдельный список, не влияет на реальную торговлю.")
             return
-        # ИСПРАВЛЕНО 11.09 (по прямому запросу пользователя — переключились
-        # на KuCoin для треугольного арбитража, но текст сообщения остался
-        # со старым, жёстко зашитым "Binance" — сама логика уже была
-        # переключена в scan_triangles/calc_triangle_kucoin, просто текст забыли).
-        await send_tg(session, f"🔺 Сканирую треугольный арбитраж на KuCoin "
+        # ИЗМЕНЕНО 11.09 (по прямому запросу пользователя — теперь сканируются
+        # ОБЕ биржи (KuCoin и MEXC) одновременно, не одна выбранная.
+        await send_tg(session, f"🔺 Сканирую треугольный арбитраж на KuCoin И MEXC "
                                  f"({', '.join(TRIANGLE_SYMBOLS)})...")
         results = await scan_triangles(session)
         if not results:
             await send_tg(session,
-                f"😔 Нет треугольных возможностей выше порога {config['min_profit_pct']}%.\n"
-                f"(Либо пары COIN/{BRIDGE} не существуют для ваших монет на KuCoin — "
+                f"😔 Нет треугольных возможностей выше порога {config['min_profit_pct']}% "
+                f"ни на KuCoin, ни на MEXC.\n"
+                f"(Либо пары COIN/{BRIDGE} не существуют для ваших монет — "
                 f"это нормально для части альткоинов.)"
             )
         else:
-            msg = "🔺 *ТРЕУГОЛЬНЫЙ АРБИТРАЖ (KuCoin)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            for r in results[:5]:
-                msg += (f"*{r['symbol']}* via {r['path']}\n"
+            msg = f"🔺 *ТРЕУГОЛЬНЫЙ АРБИТРАЖ (KuCoin + MEXC)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            for r in results[:8]:
+                msg += (f"*{r['symbol']}* на *{r.get('exchange', '?')}* via {r['path']}\n"
                         f"   Чистая: `{r['net_pct']}%` | Профит: `{r['profit_usdt']} USDT`\n"
                         f"   Уровней задействовано: {r['levels']}\n\n")
             await send_tg(session, msg)
