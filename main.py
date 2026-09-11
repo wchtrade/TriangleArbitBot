@@ -3920,7 +3920,12 @@ async def execute_real_arbitrage_with_transfer(session, opp: dict) -> dict:
     sell_ex_coin_before = sell_ex_balances_before.get(symbol, 0.0)
 
     # --- ШАГ 3: РЕАЛЬНЫЙ вывод с buy_ex на подтверждённый адрес sell_ex ---
-    withdraw_qty = round(confirmed_qty * 0.999, 6)
+    # ИСПРАВЛЕНО 11.09 (по прямому запросу пользователя — найдено при
+    # тесте: "account.available.amount" — запас 0.999 (0.1%) оказался
+    # РОВНО равен типичной комиссии KuCoin (0.1%), без места на округление.
+    # Увеличиваем запас до 0.995 (0.5%) — достаточно, чтобы гарантированно
+    # не упереться в реально доступный остаток после списания комиссии.
+    withdraw_qty = round(confirmed_qty * 0.995, 6)
     withdrawal = await WITHDRAW_FUNCS[buy_ex](withdraw_qty)
     if not withdrawal:
         # ИСПРАВЛЕНО 11.09 (по прямому запросу пользователя — та же
