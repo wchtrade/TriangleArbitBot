@@ -6844,6 +6844,33 @@ async def handle_command(session, text, chat_id):
         except Exception as e:
             await send_tg(session, f"❌ Не удалось определить IP: {e}")
 
+    elif cmd == "/showkucoinchains":
+        # НОВОЕ 11.09 (по прямому запросу пользователя — найдена причина
+        # провала вывода EGLD: "chain:EGLD ... not exist" — код сети,
+        # который мы угадывали по аналогии, оказался неверным. Эта команда
+        # показывает ТОЧНЫЕ, официальные коды сетей для вывода конкретной
+        # монеты прямо из справочника KuCoin — больше не нужно гадать.
+        if len(parts) < 2:
+            await send_tg(session, "❌ Укажи монету: `/showkucoinchains EGLD`")
+            return
+        coin = parts[1].upper()
+        try:
+            async with session.get("https://api.kucoin.com/api/v3/currencies/" + coin,
+                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+                chains = data.get("data", {}).get("chains", [])
+                if not chains:
+                    await send_tg(session, f"❌ Не нашёл сетей для {coin}: `{data}`")
+                    return
+                lines = "\n".join(
+                    f"  chain=`{c.get('chainName')}` | withdrawEnabled={c.get('isWithdrawEnabled')} | "
+                    f"minWithdraw={c.get('withdrawalMinSize')}"
+                    for c in chains
+                )
+                await send_tg(session, f"⛓ *Точные коды сетей для вывода {coin} на KuCoin:*\n\n{lines}")
+        except Exception as e:
+            await send_tg(session, f"❌ Ошибка запроса: {e}")
+
     elif cmd == "/showkucoinusdtaddr":
         # НОВОЕ 29.08 (пункт 3-4 плана): показывает адрес депозита USDT на
         # KuCoin для конкретной сети (по умолчанию Polygon — совместима с
