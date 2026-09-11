@@ -1907,11 +1907,15 @@ async def scan_all(session) -> Tuple[List[dict], List[str]]:
 # =====================================================================
 
 def is_real_trading_allowed() -> bool:
-    """Жёсткий гейт: ОБА условия обязательны, ни одно не заменяет другое."""
+    """Жёсткий гейт: ОБА условия обязательны, ни одно не заменяет другое.
+
+    ИСПРАВЛЕНО 11.09 (по прямому запросу пользователя — найден баг:
+    /mode отказывал, требуя ключи Binance/HTX, хотя реальная торговля уже
+    несколько дней идёт ИСКЛЮЧИТЕЛЬНО через KuCoin↔MEXC — ещё один "хвост"
+    старой архитектуры. Теперь требуются только реально используемые ключи."""
     env_ok = (REAL_TRADING_UNLOCKED == CONFIRM_PHRASE)
     runtime_ok = config["real_confirmed"]
-    keys_ok = all([BINANCE_KEY, BINANCE_SECRET, KUCOIN_KEY, KUCOIN_SECRET,
-                    KUCOIN_PASS, HTX_KEY, HTX_SECRET])
+    keys_ok = all([KUCOIN_KEY, KUCOIN_SECRET, KUCOIN_PASS, MEXC_KEY, MEXC_SECRET])
     return env_ok and runtime_ok and keys_ok
 
 
@@ -7731,7 +7735,7 @@ async def handle_command(session, text, chat_id):
                     "❌ *Реальная торговля заблокирована.*\n\n"
                     "Для включения нужны ВСЕ условия:\n"
                     f"1️⃣ Переменная Railway `REAL_TRADING_UNLOCKED` = `{CONFIRM_PHRASE}`\n"
-                    "2️⃣ Все 7 API-ключей (Binance/KuCoin/HTX) заданы в Railway\n"
+                    "2️⃣ Ключи KuCoin (3 шт) и MEXC (2 шт) заданы в Railway\n"
                     "3️⃣ Команда `/confirmreal " + CONFIRM_PHRASE + "` в этом чате\n\n"
                     f"⚙️ Лимит на ордер в реальном режиме: ${config['max_real_order_usdt']} "
                     f"(жёстко, /setlot его не увеличит)\n"
