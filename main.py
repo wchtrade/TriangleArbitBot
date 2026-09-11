@@ -9117,7 +9117,7 @@ async def main():
         return
     logger.info("DepthArbBot стартует — WebSocket-стаканы на всех трёх биржах")
     logger.info("=" * 60)
-    logger.info("🔖 ВЕРСИЯ КОДА: 2026-09-03-v4 (исправлен показ ошибки MEXC deposit address)")
+    logger.info("🔖 ВЕРСИЯ КОДА: 2026-09-11-v5 (исправлены округление KuCoin IOC, запас на комиссию вывода 0.995, запас на покупку buy_limit_slippage, /testfullcycle)")
     logger.info("=" * 60)
     connector = aiohttp.TCPConnector(ssl=True)  # SSL включён, не отключаем проверку сертификатов
     async with aiohttp.ClientSession(connector=connector) as session:
