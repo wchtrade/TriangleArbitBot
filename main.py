@@ -8139,6 +8139,53 @@ async def handle_command(session, text, chat_id):
             except Exception:
                 pass
 
+    elif cmd == "/testfullcycle":
+        # НОВОЕ 11.09 (по прямому запросу пользователя — "давай форсируем
+        # тестовую сделку, чтобы проверить механизм в принципе"): запускает
+        # ОДИН полный цикл (купить → перевести → продать → вернуть USDT)
+        # НЕЗАВИСИМО от реального спреда — специально для проверки самой
+        # механики перевода между биржами, не для поиска прибыли. Работает
+        # ТОЛЬКО если реальная торговля разблокирована и адрес для этой
+        # монеты подтверждён — те же защиты, что и у обычной сделки.
+        if len(parts) < 2:
+            await send_tg(session,
+                "⚠️ Форсирует ОДИН полный цикл покупка→перевод→продажа→возврат "
+                "НЕЗАВИСИМО от реального спреда (даже если сейчас невыгодно) — "
+                "только для проверки, что сам механизм технически работает.\n\n"
+                "Пример: `/testfullcycle EGLD`"
+            )
+            return
+        if not is_real_trading_allowed():
+            await send_tg(session, "❌ Реальная торговля не разблокирована.")
+            return
+        sym = parts[1].upper()
+        if sym not in SYMBOLS:
+            await send_tg(session, f"❌ {sym} не в списке отслеживаемых монет — сначала `/addcoin {sym}`")
+            return
+        route_key = f"MEXC:{sym}"
+        if route_key not in config.get("confirmed_deposit_addresses", {}):
+            await send_tg(session, f"❌ Адрес для {sym} на MEXC не подтверждён — сначала "
+                                     f"`/showmexcaddresses {sym}` и `/confirmtransferaddr {sym} ...`")
+            return
+        await send_tg(session, f"🧪 Запускаю тестовый полный цикл для {sym} — реальные деньги, "
+                                 f"независимо от спреда...")
+        bob = await get_orderbook_kucoin(session, sym)
+        sob = await get_orderbook_mexc_rest(session, sym)
+        if not bob or not sob:
+            await send_tg(session, "❌ Не удалось получить стакан — тест отменён.")
+            return
+        buy_price = bob["asks"][0][0]
+        sell_price = sob["bids"][0][0]
+        vol = config.get("max_real_order_usdt", 4.0)
+        test_opp = {
+            "symbol": sym, "buy_ex": "KuCoin", "sell_ex": "MEXC",
+            "buy_price": buy_price, "sell_price": sell_price,
+            "vol": vol, "profit_usdt": 0.0,
+            "time": datetime.now().strftime("%H:%M:%S"),
+        }
+        result = await execute_real_arbitrage_with_transfer(session, test_opp)
+        await send_tg(session, f"🧪 *Результат теста:*\n`{result}`")
+
     elif cmd == "/settransferfees":
         # НОВОЕ 11.09 (по прямому запросу пользователя — "давай форсируем
         # тестовую сделку, чтобы проверить механизм в принципе"): позволяет
