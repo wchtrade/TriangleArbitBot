@@ -1,4 +1,4 @@
-import asyncio
+ import asyncio
 import aiohttp
 import logging
 import os
@@ -1553,7 +1553,13 @@ async def execute_triangle_mexc(session, symbol: str, path: str, start_usdt: flo
     if not is_real_trading_allowed():
         return {"success": False, "error": "real_trading_not_unlocked"}
 
-    slippage_pct = config.get("sell_limit_slippage_pct", 0.05)
+    # ИСПРАВЛЕНО 12.09 (по прямому запросу пользователя — первая реальная
+    # попытка провалилась с нулевым исполнением: общий запас 0.05% (тот
+    # же, что для межбиржевой продажи) оказался недостаточен для быстрого
+    # ETH — цена успевает уйти за миллисекунды. Используем отдельный,
+    # более щедрый запас именно для треугольника (по умолчанию 0.15%) —
+    # немного больше цена входа, но заметно выше шанс реального исполнения.
+    slippage_pct = config.get("triangle_slippage_pct", 0.15)
     path_a = path == f"USDT→{symbol}→{BRIDGE}→USDT"
 
     if path_a:
@@ -8231,12 +8237,17 @@ async def handle_command(session, text, chat_id):
                 continue
             usdt = balances.get("USDT", 0.0)
             msg = f"📊 *{ex}*\n   USDT: ${usdt:.4f}\n"
-            for sym in SYMBOLS:
-                qty = balances.get(sym, 0.0)
-                if qty > 0.00001:
-                    price = await get_valuation_price(session, ex, sym)
-                    val = round(qty * price, 4) if price else None
-                    msg += f"   {sym}: {qty} шт" + (f" ≈ ${val}\n" if val else "\n")
+            # ИСПРАВЛЕНО 12.09 (по прямому запросу пользователя — найдено:
+            # раньше показывались ТОЛЬКО монеты из SYMBOLS (список для
+            # межбиржевой торговли) — любой актив от треугольника (ETH,
+            # BTC) был НЕВИДИМ здесь, даже если реально застрял на балансе.
+            # Теперь показываем ЛЮБОЙ ненулевой актив на счету.
+            for asset, qty in balances.items():
+                if asset == "USDT" or qty <= 0.00001:
+                    continue
+                price = await get_valuation_price(session, ex, asset)
+                val = round(qty * price, 4) if price else None
+                msg += f"   {asset}: {qty} шт" + (f" ≈ ${val}\n" if val else " (цена неизвестна)\n")
             frozen = stats.get("frozen_assets_detected", {}).get(ex)
             if frozen:
                 frozen_str = ", ".join(f"{amt} {asset}" for asset, amt in frozen.items())
@@ -8416,6 +8427,22 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Объём для треугольника: ${val}")
         except ValueError:
             await send_tg(session, "❌ Пример: `/settriangleamount 5`")
+
+    elif cmd == "/settriangleslippage":
+        if len(parts) < 2:
+            cur = config.get("triangle_slippage_pct", 0.15)
+            await send_tg(session, f"Текущий запас на цене для треугольника: {cur}%\n\n"
+                                     f"Пример: `/settriangleslippage 0.2`")
+            return
+        try:
+            val = float(parts[1])
+            if val < 0 or val > 2:
+                await send_tg(session, "❌ Разумный диапазон: 0-2%.")
+                return
+            config["triangle_slippage_pct"] = val
+            await send_tg(session, f"✅ Запас на цене для треугольника: {val}%")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/settriangleslippage 0.2`")
 
     elif cmd == "/triangle":
         if not TRIANGLE_SYMBOLS:
