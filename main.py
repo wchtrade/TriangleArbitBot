@@ -1539,6 +1539,80 @@ async def calc_triangle_mexc(session, symbol: str, start_usdt: float) -> Optiona
     return best
 
 
+async def execute_triangle_mexc(session, symbol: str, path: str, start_usdt: float) -> dict:
+    """НОВОЕ 11.09 (по прямому запросу пользователя — реальное исполнение
+    треугольника на MEXC, раз там есть капитал ~$11): три РЕАЛЬНЫХ IOC-
+    ордера подряд на ОДНОЙ бирже — купить монету/BTC → обменять → продать
+    обратно в USDT. НЕТ межбиржевых переводов — та проблема (комиссия
+    сети $0.45-1.13), что убила экономику вчера, здесь не возникает.
+
+    ⚠️ ЧЕСТНО О РИСКЕ: если нога 2 или 3 не исполнится (IOC отменится) —
+    капитал останется в ПРОМЕЖУТОЧНОЙ форме (BTC или монета), не в USDT —
+    это временный, реальный риск, аналогичный тому, что был при переводах,
+    просто без комиссии сети."""
+    if not is_real_trading_allowed():
+        return {"success": False, "error": "real_trading_not_unlocked"}
+
+    slippage_pct = config.get("sell_limit_slippage_pct", 0.05)
+    path_a = path == f"USDT→{symbol}→{BRIDGE}→USDT"
+
+    if path_a:
+        # --- НОГА 1: купить МОНЕТУ за USDT ---
+        ob1 = await get_orderbook_pair_mexc(session, symbol, QUOTE)
+        if not ob1:
+            return {"success": False, "error": "no_orderbook_leg1"}
+        price1 = ob1["asks"][0][0] * (1 + slippage_pct / 100)
+        qty1_est = start_usdt / price1
+        result1 = await place_order_mexc_limit_ioc_pair(session, f"{symbol}{QUOTE}", "BUY", price1, qty1_est)
+        if not result1:
+            return {"success": False, "error": f"leg1_buy_failed: {_last_exchange_error.get('MEXC', 'нет деталей')}"}
+        order_id1 = result1.get("orderId")
+        executed1 = await confirm_mexc_pair_ioc_executed_qty(session, f"{symbol}{QUOTE}", order_id1) if order_id1 else 0.0
+        if executed1 <= 0:
+            return {"success": False, "error": "leg1_zero_fill: деньги не потрачены, цена ушла"}
+
+        # --- НОГА 2: продать МОНЕТУ за BTC ---
+        ob2 = await get_orderbook_pair_mexc(session, symbol, BRIDGE)
+        if not ob2:
+            return {"success": False, "error": f"no_orderbook_leg2: {executed1} {symbol} осталось "
+                                                 f"на MEXC, деньги НЕ потеряны", "stuck_qty": executed1, "stuck_asset": symbol}
+        price2 = ob2["bids"][0][0] * (1 - slippage_pct / 100)
+        result2 = await place_order_mexc_limit_ioc_pair(session, f"{symbol}{BRIDGE}", "SELL", price2, executed1)
+        if not result2:
+            return {"success": False, "error": f"leg2_sell_failed: {executed1} {symbol} осталось на MEXC, "
+                                                 f"деньги НЕ потеряны, нужна ручная продажа",
+                    "stuck_qty": executed1, "stuck_asset": symbol}
+        order_id2 = result2.get("orderId")
+        executed2_btc = await confirm_mexc_pair_ioc_executed_qty(session, f"{symbol}{BRIDGE}", order_id2) if order_id2 else 0.0
+        if executed2_btc <= 0:
+            return {"success": False, "error": f"leg2_zero_fill: {executed1} {symbol} осталось на MEXC "
+                                                 f"(не в BTC), нужна ручная продажа",
+                    "stuck_qty": executed1, "stuck_asset": symbol}
+
+        # --- НОГА 3: продать BTC за USDT ---
+        ob3 = await get_orderbook_pair_mexc(session, BRIDGE, QUOTE)
+        if not ob3:
+            return {"success": False, "error": f"no_orderbook_leg3: {executed2_btc} BTC осталось на MEXC",
+                    "stuck_qty": executed2_btc, "stuck_asset": BRIDGE}
+        price3 = ob3["bids"][0][0] * (1 - slippage_pct / 100)
+        result3 = await place_order_mexc_limit_ioc_pair(session, f"{BRIDGE}{QUOTE}", "SELL", price3, executed2_btc)
+        if not result3:
+            return {"success": False, "error": f"leg3_sell_failed: {executed2_btc} BTC осталось на MEXC, "
+                                                 f"деньги НЕ потеряны, нужна ручная продажа",
+                    "stuck_qty": executed2_btc, "stuck_asset": BRIDGE}
+        order_id3 = result3.get("orderId")
+        executed3_usdt = await confirm_mexc_pair_ioc_executed_qty(session, f"{BRIDGE}{QUOTE}", order_id3) if order_id3 else 0.0
+        if executed3_usdt <= 0:
+            return {"success": False, "error": f"leg3_zero_fill: {executed2_btc} BTC осталось на MEXC",
+                    "stuck_qty": executed2_btc, "stuck_asset": BRIDGE}
+
+        return {"success": True, "start_usdt": start_usdt, "final_usdt": executed3_usdt,
+                 "profit_usdt": round(executed3_usdt - start_usdt, 4), "path": path}
+    else:
+        return {"success": False, "error": "path_B_not_yet_implemented: используйте монету, "
+                                             "где сигнал именно по пути A (USDT→монета→BTC→USDT)"}
+
+
 config["triangle_exchange"] = "KuCoin"  # НОВОЕ 11.09: какая биржа используется
     # для треугольного арбитража — переключается командой /settriangleex
 
@@ -2609,6 +2683,96 @@ async def place_order_mexc_limit_ioc(session, symbol: str, side: str,
         logger.error(f"MEXC limit-IOC order exception: {e}")
         _remember_error("MEXC", e)
         return None
+
+
+_mexc_tick_size_pair_cache: Dict[str, float] = {}
+_mexc_lot_step_pair_cache: Dict[str, float] = {}
+
+
+async def get_mexc_pair_rules(session, pair_symbol: str) -> Tuple[float, float]:
+    """НОВОЕ 11.09 (по прямому запросу пользователя — реальное исполнение
+    треугольного арбитража): обобщённая версия получения tickSize/stepSize
+    для ПРОИЗВОЛЬНОЙ пары (напр. 'ETHBTC'), не только COIN-USDT, как
+    существующие get_mexc_tick_size/get_mexc_lot_step."""
+    if pair_symbol in _mexc_tick_size_pair_cache and pair_symbol in _mexc_lot_step_pair_cache:
+        return _mexc_tick_size_pair_cache[pair_symbol], _mexc_lot_step_pair_cache[pair_symbol]
+    tick, step = 0.00000001, 0.0001  # безопасные дефолты для BTC-пар (мельче, чем у USDT-пар)
+    try:
+        async with session.get("https://api.mexc.com/api/v3/exchangeInfo",
+                                params={"symbol": pair_symbol},
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            for s in data.get("symbols", []):
+                for f in s.get("filters", []):
+                    if f.get("filterType") == "PRICE_FILTER" and "tickSize" in f:
+                        tick = float(f["tickSize"])
+                    if f.get("filterType") == "LOT_SIZE" and "stepSize" in f:
+                        step = float(f["stepSize"])
+    except Exception as e:
+        logger.error(f"MEXC pair rules fetch {pair_symbol}: {e}")
+    _mexc_tick_size_pair_cache[pair_symbol] = tick
+    _mexc_lot_step_pair_cache[pair_symbol] = step
+    return tick, step
+
+
+async def place_order_mexc_limit_ioc_pair(session, pair_symbol: str, side: str,
+                                            price: float, quantity: float) -> Optional[dict]:
+    """НОВОЕ 11.09: обобщённая версия place_order_mexc_limit_ioc — принимает
+    ГОТОВЫЙ символ пары целиком (напр. 'ETHBTC'), а не base+QUOTE. Нужна
+    для треугольного арбитража, где ноги 2 и 3 торгуют НЕ против USDT."""
+    if is_backed_off("MEXC"):
+        logger.error("MEXC в бэкоффе — лимитный ордер НЕ отправлен")
+        return None
+    tick, step = await get_mexc_pair_rules(session, pair_symbol)
+    price = _round_price_to_tick(price, tick)
+    quantity = _round_down_to_step(quantity, step)
+    if quantity <= 0:
+        logger.error(f"MEXC triangle order: количество округлилось до нуля для {pair_symbol}")
+        return None
+    url = "https://api.mexc.com/api/v3/order"
+    ts = int(time.time() * 1000)
+    params = {
+        "symbol": pair_symbol, "side": side, "type": "LIMIT",
+        "timeInForce": "IOC", "quantity": quantity, "price": price,
+        "timestamp": ts, "recvWindow": 5000,
+    }
+    params["signature"] = sign_binance(params, MEXC_SECRET)
+    headers = {"X-MEXC-APIKEY": MEXC_KEY, "Content-Type": "application/json"}
+    try:
+        async with session.post(url, params=params, headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status in (429, 418):
+                trigger_backoff("MEXC", r.status, r.headers.get("Retry-After"))
+                return None
+            data = await r.json()
+            if r.status != 200:
+                logger.error(f"MEXC triangle order failed: {data}")
+                _remember_error("MEXC", data.get("msg", data))
+                return None
+            return data
+    except Exception as e:
+        logger.error(f"MEXC triangle order exception: {e}")
+        _remember_error("MEXC", e)
+        return None
+
+
+async def confirm_mexc_pair_ioc_executed_qty(session, pair_symbol: str, order_id) -> float:
+    """НОВОЕ 11.09: аналог confirm_mexc_ioc_executed_qty для произвольной пары."""
+    ts = int(time.time() * 1000)
+    params = {"symbol": pair_symbol, "orderId": order_id, "timestamp": ts, "recvWindow": 5000}
+    params["signature"] = sign_binance(params, MEXC_SECRET)
+    headers = {"X-MEXC-APIKEY": MEXC_KEY, "Content-Type": "application/json"}
+    try:
+        async with session.get("https://api.mexc.com/api/v3/order", params=params,
+                                headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as r:
+            data = await r.json()
+            try:
+                return float(data.get("executedQty", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    except Exception as e:
+        logger.error(f"MEXC pair order status check exception: {e}")
+        return 0.0
 
 
 async def place_order_binance_limit_ioc(session, symbol: str, side: str,
@@ -8204,6 +8368,29 @@ async def handle_command(session, text, chat_id):
             return
         config["triangle_exchange"] = val
         await send_tg(session, f"✅ Треугольник теперь считается на {val}")
+
+    elif cmd == "/runtriangle":
+        # НОВОЕ 11.09 (по прямому запросу пользователя — "давай сделаем и
+        # пусть попробует поторговать"): РЕАЛЬНОЕ исполнение треугольника
+        # на MEXC — три настоящих ордера подряд, реальные деньги. Пока
+        # реализован ТОЛЬКО путь A (USDT→монета→BTC→USDT), путь B — нет.
+        if len(parts) < 2:
+            await send_tg(session,
+                "⚠️ Запускает РЕАЛЬНОЕ исполнение треугольника на MEXC — "
+                "три настоящих ордера подряд, реальные деньги.\n\n"
+                "Пример: `/runtriangle ETH` (использует текущий /setlot как объём)"
+            )
+            return
+        if not is_real_trading_allowed():
+            await send_tg(session, "❌ Реальная торговля не разблокирована.")
+            return
+        sym = parts[1].upper()
+        start_usdt = config.get("max_real_order_usdt", 10.0)
+        await send_tg(session, f"🔺 Запускаю РЕАЛЬНЫЙ треугольник для {sym} на MEXC "
+                                 f"(объём ${start_usdt})...")
+        path = f"USDT→{sym}→{BRIDGE}→USDT"
+        result = await execute_triangle_mexc(session, sym, path, start_usdt)
+        await send_tg(session, f"🔺 *Результат:*\n`{result}`")
 
     elif cmd == "/triangle":
         if not TRIANGLE_SYMBOLS:
