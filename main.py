@@ -8374,23 +8374,48 @@ async def handle_command(session, text, chat_id):
         # пусть попробует поторговать"): РЕАЛЬНОЕ исполнение треугольника
         # на MEXC — три настоящих ордера подряд, реальные деньги. Пока
         # реализован ТОЛЬКО путь A (USDT→монета→BTC→USDT), путь B — нет.
+        #
+        # ИСПРАВЛЕНО 12.09 (по прямому запросу пользователя — найдено:
+        # раньше объём брался из max_real_order_usdt, который управляется
+        # /setreallot — а та команда считает минимум по СТАРОЙ,
+        # неиспользуемой логике межбиржевого арбитража (Binance/HTX минимум
+        # $10), совершенно не относящейся к треугольнику на MEXC. Теперь
+        # свой, независимый параметр triangle_start_usdt.
         if len(parts) < 2:
+            cur = config.get("triangle_start_usdt", 5.0)
             await send_tg(session,
                 "⚠️ Запускает РЕАЛЬНОЕ исполнение треугольника на MEXC — "
                 "три настоящих ордера подряд, реальные деньги.\n\n"
-                "Пример: `/runtriangle ETH` (использует текущий /setlot как объём)"
+                f"Текущий объём: ${cur} (меняется через `/settriangleamount`)\n\n"
+                "Пример: `/runtriangle ETH`"
             )
             return
         if not is_real_trading_allowed():
             await send_tg(session, "❌ Реальная торговля не разблокирована.")
             return
         sym = parts[1].upper()
-        start_usdt = config.get("max_real_order_usdt", 10.0)
+        start_usdt = config.get("triangle_start_usdt", 5.0)
         await send_tg(session, f"🔺 Запускаю РЕАЛЬНЫЙ треугольник для {sym} на MEXC "
                                  f"(объём ${start_usdt})...")
         path = f"USDT→{sym}→{BRIDGE}→USDT"
         result = await execute_triangle_mexc(session, sym, path, start_usdt)
         await send_tg(session, f"🔺 *Результат:*\n`{result}`")
+
+    elif cmd == "/settriangleamount":
+        if len(parts) < 2:
+            cur = config.get("triangle_start_usdt", 5.0)
+            await send_tg(session, f"Текущий объём для треугольника: ${cur}\n\n"
+                                     f"Пример: `/settriangleamount 5`")
+            return
+        try:
+            val = float(parts[1])
+            if val < 1 or val > 50:
+                await send_tg(session, "❌ Разумный диапазон: 1-50.")
+                return
+            config["triangle_start_usdt"] = val
+            await send_tg(session, f"✅ Объём для треугольника: ${val}")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/settriangleamount 5`")
 
     elif cmd == "/triangle":
         if not TRIANGLE_SYMBOLS:
