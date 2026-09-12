@@ -1568,7 +1568,11 @@ async def execute_triangle_mexc(session, symbol: str, path: str, start_usdt: flo
         if not ob1:
             return {"success": False, "error": "no_orderbook_leg1"}
         price1 = ob1["asks"][0][0] * (1 + slippage_pct / 100)
-        qty1_est = start_usdt / price1
+        # ИСПРАВЛЕНО 12.09 (по прямому запросу пользователя — повторяющаяся
+        # ошибка "Insufficient position" при балансе, формально достаточном
+        # впритык): запас 0.999 оставляет место под комиссию биржи, чтобы
+        # заказ не требовал АБСОЛЮТНО ВСЮ сумму без остатка.
+        qty1_est = start_usdt / price1 * 0.999
         result1 = await place_order_mexc_limit_ioc_pair(session, f"{symbol}{QUOTE}", "BUY", price1, qty1_est)
         if not result1:
             return {"success": False, "error": f"leg1_buy_failed: {_last_exchange_error.get('MEXC', 'нет деталей')}"}
