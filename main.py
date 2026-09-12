@@ -1572,7 +1572,7 @@ async def execute_triangle_mexc(session, symbol: str, path: str, start_usdt: flo
         # ошибка "Insufficient position" при балансе, формально достаточном
         # впритык): запас 0.999 оставляет место под комиссию биржи, чтобы
         # заказ не требовал АБСОЛЮТНО ВСЮ сумму без остатка.
-        qty1_est = start_usdt / price1 * 0.999
+        qty1_est = start_usdt / price1 * 0.98
         result1 = await place_order_mexc_limit_ioc_pair(session, f"{symbol}{QUOTE}", "BUY", price1, qty1_est)
         if not result1:
             return {"success": False, "error": f"leg1_buy_failed: {_last_exchange_error.get('MEXC', 'нет деталей')}"}
@@ -1587,7 +1587,11 @@ async def execute_triangle_mexc(session, symbol: str, path: str, start_usdt: flo
             return {"success": False, "error": f"no_orderbook_leg2: {executed1} {symbol} осталось "
                                                  f"на MEXC, деньги НЕ потеряны", "stuck_qty": executed1, "stuck_asset": symbol}
         price2 = ob2["bids"][0][0] * (1 - slippage_pct / 100)
-        result2 = await place_order_mexc_limit_ioc_pair(session, f"{symbol}{BRIDGE}", "SELL", price2, executed1)
+        # ИСПРАВЛЕНО 12.09 (по прямому запросу пользователя — та же
+        # проблема, что была с EGLD на KuCoin: комиссия удерживается В
+        # ПОЛУЧЕННОЙ монете, реальный остаток чуть меньше executedQty).
+        sell_qty2 = executed1 * 0.98
+        result2 = await place_order_mexc_limit_ioc_pair(session, f"{symbol}{BRIDGE}", "SELL", price2, sell_qty2)
         if not result2:
             return {"success": False, "error": f"leg2_sell_failed: {executed1} {symbol} осталось на MEXC, "
                                                  f"деньги НЕ потеряны, нужна ручная продажа",
@@ -1605,7 +1609,8 @@ async def execute_triangle_mexc(session, symbol: str, path: str, start_usdt: flo
             return {"success": False, "error": f"no_orderbook_leg3: {executed2_btc} BTC осталось на MEXC",
                     "stuck_qty": executed2_btc, "stuck_asset": BRIDGE}
         price3 = ob3["bids"][0][0] * (1 - slippage_pct / 100)
-        result3 = await place_order_mexc_limit_ioc_pair(session, f"{BRIDGE}{QUOTE}", "SELL", price3, executed2_btc)
+        sell_qty3 = executed2_btc * 0.98
+        result3 = await place_order_mexc_limit_ioc_pair(session, f"{BRIDGE}{QUOTE}", "SELL", price3, sell_qty3)
         if not result3:
             return {"success": False, "error": f"leg3_sell_failed: {executed2_btc} BTC осталось на MEXC, "
                                                  f"деньги НЕ потеряны, нужна ручная продажа",
